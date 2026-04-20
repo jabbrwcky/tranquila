@@ -1,0 +1,64 @@
+name: Docker Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+jobs:
+  release:
+    name: Retag & Push Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if commit is tip of main
+        id: on-main
+        run: |
+          git fetch origin main
+          if git merge-base --is-ancestor "${{ github.sha }}" "origin/main" && \
+             git merge-base --is-ancestor "origin/main" "${{ github.sha }}"; then
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=${{ steps.on-main.outputs.latest }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+
+      - name: Pull source image
+        run: |
+          SHORT_SHA="${{ github.sha }}"
+          REPO=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          docker pull "${REPO}:${SHORT_SHA:0:7}"
+          echo "SOURCE=${REPO}:${SHORT_SHA:0:7}" >> "$GITHUB_ENV"
+
+      - name: Retag and push
+        run: |
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            docker tag "$SOURCE" "$tag"
+            docker push "$tag"
+          done <<< "${{ steps.meta.outputs.tags }}"
