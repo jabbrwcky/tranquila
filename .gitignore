@@ -1,0 +1,11 @@
+tranquila
+.envrc
+
+# Go
+*.o
+*.a
+*.so
+.DS_Store
+/dist/
+/vendor/
+dump.rdb
