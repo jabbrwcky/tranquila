@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithy "github.com/aws/smithy-go"
 	"github.com/rs/zerolog/log"
 )
 
@@ -187,6 +188,14 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 func isTransientErr(err error) bool {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
+	}
+	// S3-level codes that indicate a transient server-side disconnect or overload.
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "ClientDisconnected", "RequestTimeout", "SlowDown", "ServiceUnavailable":
+			return true
+		}
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "EOF") ||
