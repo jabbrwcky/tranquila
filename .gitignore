@@ -8,4 +8,4 @@ tranquila
 .DS_Store
 /dist/
 /vendor/
-dump.rdb
+*.rdb
