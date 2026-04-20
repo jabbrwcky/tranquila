@@ -3,23 +3,41 @@ package sync
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/jabbrwcky/tranquila/internal/state"
 	"github.com/jabbrwcky/tranquila/internal/storage"
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"golang.org/x/time/rate"
 )
+
+// BucketConfig holds destination routing and path-prefix configuration for a source bucket.
+type BucketConfig struct {
+	Destination string // destination bucket name
+	SrcPrefix   string // list/filter prefix applied when scanning the source; empty = all objects
+	DstPrefix   string // replaces SrcPrefix in the destination key; empty = keep original key
+}
+
+// destKey returns the destination object key for srcKey, applying prefix replacement when configured.
+func (bc BucketConfig) destKey(srcKey string) string {
+	if bc.SrcPrefix == "" || bc.DstPrefix == "" {
+		return srcKey
+	}
+	return bc.DstPrefix + strings.TrimPrefix(srcKey, bc.SrcPrefix)
+}
 
 type Config struct {
 	Source           *storage.Client
 	Destination      *storage.Client
 	State            *state.Store
 	Meter            metric.Meter
-	SourceBuckets    []string
-	DestBucketPrefix string
+	Buckets          map[string]BucketConfig // src → config; nil = auto-discover all
+	DestBucketPrefix string                  // prefix for auto-discovered destination bucket names
 	Workers          int
 	RateLimit        float64
 }
@@ -73,51 +91,85 @@ func newMetrics(meter metric.Meter) (metrics, error) {
 // Run performs discovery then syncs all pending objects. It blocks until done
 // or ctx is cancelled (graceful shutdown: in-flight transfers finish).
 func (s *Syncer) Run(ctx context.Context) error {
-	buckets, err := s.resolveBuckets(ctx)
+	bucketMap, err := s.resolveBuckets(ctx)
 	if err != nil {
 		return err
 	}
 
-	log.Info().Strs("buckets", buckets).Msg("starting discovery")
-	if err := s.discover(ctx, buckets); err != nil {
+	srcs := make([]string, 0, len(bucketMap))
+	for src := range bucketMap {
+		srcs = append(srcs, src)
+	}
+	log.Info().Strs("buckets", srcs).Msg("starting discovery")
+
+	if err := s.discover(ctx, bucketMap); err != nil {
 		return fmt.Errorf("discovery: %w", err)
 	}
 
 	log.Info().Msg("starting sync")
-	return s.sync(ctx, buckets)
+	return s.sync(ctx, bucketMap)
 }
 
-func (s *Syncer) resolveBuckets(ctx context.Context) ([]string, error) {
-	if len(s.cfg.SourceBuckets) > 0 {
-		return s.cfg.SourceBuckets, nil
+func (s *Syncer) resolveBuckets(ctx context.Context) (map[string]BucketConfig, error) {
+	if len(s.cfg.Buckets) > 0 {
+		return s.cfg.Buckets, nil
 	}
-	buckets, err := s.cfg.Source.ListBuckets(ctx)
+	discovered, err := s.cfg.Source.ListBuckets(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list source buckets: %w", err)
 	}
-	return buckets, nil
+	m := make(map[string]BucketConfig, len(discovered))
+	for _, b := range discovered {
+		m[b] = BucketConfig{Destination: s.cfg.DestBucketPrefix + b}
+	}
+	return m, nil
 }
 
-// discover scans each source bucket, compares objects against stored state,
-// and marks objects as pending when they are new or modified since last sync.
-func (s *Syncer) discover(ctx context.Context, buckets []string) error {
+// discover scans each source bucket in parallel (up to cfg.Workers goroutines),
+// compares objects against stored state, and marks objects as pending when they
+// are new or modified since last sync.
+func (s *Syncer) discover(ctx context.Context, buckets map[string]BucketConfig) error {
 	collectionTime := time.Now().UTC()
 
-	for _, bucket := range buckets {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err := s.discoverBucket(ctx, bucket, collectionTime); err != nil {
-			return fmt.Errorf("discover bucket %s: %w", bucket, err)
+	lim := rate.NewLimiter(rate.Inf, 0)
+	if s.cfg.RateLimit > 0 {
+		lim = rate.NewLimiter(rate.Limit(s.cfg.RateLimit), int(s.cfg.RateLimit)+1)
+	}
+
+	sem := make(chan struct{}, s.cfg.Workers)
+	errc := make(chan error, len(buckets))
+	var wg sync.WaitGroup
+
+	for bucket, bc := range buckets {
+		select {
+		case <-ctx.Done():
+			goto wait
+		case sem <- struct{}{}:
+			wg.Add(1)
+			go func(b string, cfg BucketConfig) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if err := lim.Wait(ctx); err != nil {
+					errc <- err
+					return
+				}
+				if err := s.discoverBucket(ctx, b, cfg.SrcPrefix, collectionTime); err != nil {
+					errc <- fmt.Errorf("discover bucket %s: %w", b, err)
+				}
+			}(bucket, bc)
 		}
 	}
-	return nil
+
+wait:
+	wg.Wait()
+	close(errc)
+	return <-errc
 }
 
-func (s *Syncer) discoverBucket(ctx context.Context, bucket string, collectionTime time.Time) error {
-	logger := log.With().Str("bucket", bucket).Logger()
+func (s *Syncer) discoverBucket(ctx context.Context, bucket, prefix string, collectionTime time.Time) error {
+	logger := log.With().Str("bucket", bucket).Str("prefix", prefix).Logger()
 
-	objects, errc := s.cfg.Source.ListObjects(ctx, bucket)
+	objects, errc := s.cfg.Source.ListObjects(ctx, bucket, prefix)
 	var count, pending int
 
 	for obj := range objects {
@@ -164,7 +216,7 @@ func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Objec
 	return obj.ModifiedAt.After(stored.ModifiedAt), nil
 }
 
-func (s *Syncer) sync(ctx context.Context, buckets []string) error {
+func (s *Syncer) sync(ctx context.Context, buckets map[string]BucketConfig) error {
 	pool := newWorkerPool(ctx, s.cfg.Workers, s.cfg.RateLimit, s.transfer)
 
 	var resultWg sync.WaitGroup
@@ -174,23 +226,22 @@ func (s *Syncer) sync(ctx context.Context, buckets []string) error {
 		s.processResults(ctx, pool.resultsCh())
 	}()
 
-	for _, bucket := range buckets {
+	for srcBucket, bc := range buckets {
 		if ctx.Err() != nil {
 			break
 		}
-		pending, err := s.cfg.State.ScanPending(ctx, bucket)
+		pending, err := s.cfg.State.ScanPending(ctx, srcBucket)
 		if err != nil {
-			log.Error().Err(err).Str("bucket", bucket).Msg("scan pending failed")
+			log.Error().Err(err).Str("bucket", srcBucket).Msg("scan pending failed")
 			continue
 		}
 
-		dstBucket := s.cfg.DestBucketPrefix + bucket
-		if err := s.cfg.Destination.EnsureBucket(ctx, dstBucket); err != nil {
-			log.Error().Err(err).Str("bucket", dstBucket).Msg("ensure destination bucket failed")
+		if err := s.cfg.Destination.EnsureBucket(ctx, bc.Destination); err != nil {
+			log.Error().Err(err).Str("bucket", bc.Destination).Msg("ensure destination bucket failed")
 			continue
 		}
 
-		logger := log.With().Str("bucket", bucket).Logger()
+		logger := log.With().Str("src", srcBucket).Str("dst", bc.Destination).Logger()
 		logger.Info().Int("count", len(pending)).Msg("queuing objects")
 
 		for _, key := range pending {
@@ -198,9 +249,10 @@ func (s *Syncer) sync(ctx context.Context, buckets []string) error {
 				break
 			}
 			pool.submit(Job{
-				SrcBucket: bucket,
-				DstBucket: dstBucket,
+				SrcBucket: srcBucket,
+				DstBucket: bc.Destination,
 				Key:       key,
+				DstKey:    bc.destKey(key),
 			})
 		}
 	}
@@ -225,6 +277,7 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 			log.Debug().
 				Str("bucket", r.Job.SrcBucket).
 				Str("key", r.Job.Key).
+				Str("size", humanize.Bytes(uint64(r.Job.Size))).
 				Dur("duration", r.Duration).
 				Msg("transfer complete")
 			_ = s.cfg.State.MarkSynced(ctx, r.Job.SrcBucket, r.Job.Key)
@@ -243,5 +296,5 @@ func (s *Syncer) transfer(ctx context.Context, job Job) error {
 	defer body.Close()
 
 	job.Size = size
-	return s.cfg.Destination.PutObject(ctx, job.DstBucket, job.Key, body, size)
+	return s.cfg.Destination.PutObject(ctx, job.DstBucket, job.DstKey, body, size)
 }

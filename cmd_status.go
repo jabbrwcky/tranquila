@@ -7,6 +7,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/jabbrwcky/tranquila/internal/state"
 )
 
@@ -53,7 +54,7 @@ func (cmd *StatusCmd) Run() error {
 
 		collected := "never"
 		if !ct.IsZero() {
-			collected = ct.Local().Format(time.RFC3339)
+			collected = humanize.Time(ct)
 		}
 		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%d\n",
 			bucket, collected, stats.Total, stats.Synced, stats.Pending, stats.Failed)

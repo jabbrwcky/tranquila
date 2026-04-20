@@ -9,10 +9,11 @@ import (
 )
 
 type Job struct {
-	SrcBucket  string
-	DstBucket  string
-	Key        string
-	Size       int64
+	SrcBucket string
+	DstBucket string
+	Key       string // source object key
+	DstKey    string // destination object key (may differ via prefix rewrite)
+	Size      int64
 	ModifiedAt time.Time
 }
 

@@ -21,7 +21,10 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
+require github.com/dustin/go-humanize v1.0.1 // indirect
+
 require (
+	github.com/alecthomas/kong-yaml v0.2.0
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.3 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.11 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.3.15 // indirect

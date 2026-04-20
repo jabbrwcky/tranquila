@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -13,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/rs/zerolog/log"
 )
 
 type Config struct {
@@ -82,9 +84,12 @@ func (c *Client) ListBuckets(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// ListObjects streams objects from a bucket. The caller must drain the returned
-// channel or cancel ctx to avoid a goroutine leak.
-func (c *Client) ListObjects(ctx context.Context, bucket string) (<-chan Object, <-chan error) {
+// ListObjects streams objects from a bucket. prefix limits results to keys with
+// that prefix (empty = all objects). Each S3 page is fetched individually with
+// exponential-backoff retries so transient EOF/connection-reset errors mid-scan
+// do not abort a large bucket. The caller must drain the returned channel or
+// cancel ctx to avoid a goroutine leak.
+func (c *Client) ListObjects(ctx context.Context, bucket, prefix string) (<-chan Object, <-chan error) {
 	objects := make(chan Object, 100)
 	errc := make(chan error, 1)
 
@@ -92,15 +97,34 @@ func (c *Client) ListObjects(ctx context.Context, bucket string) (<-chan Object,
 		defer close(objects)
 		defer close(errc)
 
-		paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
-			Bucket: aws.String(bucket),
-		})
-		for paginator.HasMorePages() {
-			page, err := paginator.NextPage(ctx)
+		var token *string
+		var pageNum, total int
+
+		for {
+			input := &s3.ListObjectsV2Input{
+				Bucket:            aws.String(bucket),
+				ContinuationToken: token,
+			}
+			if prefix != "" {
+				input.Prefix = aws.String(prefix)
+			}
+
+			page, err := c.listPageWithRetry(ctx, input)
 			if err != nil {
 				errc <- fmt.Errorf("list objects in %s: %w", bucket, err)
 				return
 			}
+
+			pageNum++
+			total += len(page.Contents)
+			log.Debug().
+				Str("bucket", bucket).
+				Str("prefix", prefix).
+				Int("page", pageNum).
+				Int("page_objects", len(page.Contents)).
+				Int("total", total).
+				Msg("discovery page complete")
+
 			for _, item := range page.Contents {
 				if item.Key == nil {
 					continue
@@ -123,10 +147,51 @@ func (c *Client) ListObjects(ctx context.Context, bucket string) (<-chan Object,
 					return
 				}
 			}
+
+			if !aws.ToBool(page.IsTruncated) {
+				break
+			}
+			token = page.NextContinuationToken
 		}
 	}()
 
 	return objects, errc
+}
+
+const listMaxRetries = 5
+
+// listPageWithRetry fetches a single ListObjectsV2 page, retrying on transient
+// network errors (EOF, connection reset, broken pipe) with exponential backoff.
+func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
+	var err error
+	for attempt := 0; attempt < listMaxRetries; attempt++ {
+		var out *s3.ListObjectsV2Output
+		out, err = c.s3.ListObjectsV2(ctx, input)
+		if err == nil {
+			return out, nil
+		}
+		if !isTransientErr(err) {
+			return nil, err
+		}
+		delay := time.Duration(1<<uint(attempt)) * time.Second
+		log.Warn().Err(err).Int("attempt", attempt+1).Msg("transient list error, retrying")
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, err
+}
+
+func isTransientErr(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe")
 }
 
 func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {

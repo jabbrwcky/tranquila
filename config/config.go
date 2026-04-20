@@ -29,14 +29,15 @@ type TelemetryConfig struct {
 }
 
 type Config struct {
-	Source       S3Config        `yaml:"source"`
-	Destination  S3Config        `yaml:"destination"`
-	Buckets      []string        `yaml:"buckets"`
-	BucketPrefix string          `yaml:"bucket_prefix"`
-	Redis        RedisConfig     `yaml:"redis"`
-	Telemetry    TelemetryConfig `yaml:"telemetry"`
-	Workers      int             `yaml:"workers"`
-	RateLimit    float64         `yaml:"rate_limit"`
+	Source            S3Config        `yaml:"source"`
+	Destination       S3Config        `yaml:"destination"`
+	BucketMappings    []string        `yaml:"bucket_mappings"`  // "name" or "src=dst" entries
+	BucketMappingFile string          `yaml:"bucket_mapping_file"`
+	DestBucketPrefix  string          `yaml:"dest_bucket_prefix"`
+	Redis             RedisConfig     `yaml:"redis"`
+	Telemetry         TelemetryConfig `yaml:"telemetry"`
+	Workers           int             `yaml:"workers"`
+	RateLimit         float64         `yaml:"rate_limit"`
 }
 
 func defaults() Config {
@@ -76,12 +77,13 @@ func NewResolver(cfg *Config) kong.Resolver {
 		"source-region":           cfg.Source.Region,
 		"source-access-key":       cfg.Source.AccessKey,
 		"source-secret-key":       cfg.Source.SecretKey,
-		"source-buckets":          cfg.Buckets,
-		"dest-endpoint":           cfg.Destination.Endpoint,
-		"dest-region":             cfg.Destination.Region,
-		"dest-access-key":         cfg.Destination.AccessKey,
-		"dest-secret-key":         cfg.Destination.SecretKey,
-		"dest-bucket-prefix":      cfg.BucketPrefix,
+		"bucket-mappings":          cfg.BucketMappings,
+		"bucket-mapping-file":      cfg.BucketMappingFile,
+		"dest-endpoint":            cfg.Destination.Endpoint,
+		"dest-region":              cfg.Destination.Region,
+		"dest-access-key":          cfg.Destination.AccessKey,
+		"dest-secret-key":          cfg.Destination.SecretKey,
+		"dest-bucket-prefix":       cfg.DestBucketPrefix,
 		"redis-addr":              cfg.Redis.Addr,
 		"redis-password":          cfg.Redis.Password,
 		"redis-db":                cfg.Redis.DB,
