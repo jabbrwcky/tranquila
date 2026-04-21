@@ -39,6 +39,7 @@ General operating instructions for coding agents working in this repository.
   - Relevant tests pass (or explain why they were not run).
   - Lint/format checks pass when configured.
 - If validation fails, fix issues introduced by your change before finishing.
+- Ensure a test coverage of at least 75% for new code, unless explicitly waived.
 
 ## 6) Language and Tooling Conventions
 
