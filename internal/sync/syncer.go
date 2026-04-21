@@ -40,6 +40,7 @@ type Config struct {
 	DestBucketPrefix string                  // prefix for auto-discovered destination bucket names
 	Workers          int
 	RateLimit        float64
+	CheckSizes       bool      // re-queue synced objects whose destination size differs from source
 	Progress         *Progress // optional; enables live progress tracking for the management API
 }
 
@@ -171,7 +172,7 @@ func (s *Syncer) discover(ctx context.Context, buckets map[string]BucketConfig) 
 					errc <- err
 					return
 				}
-				if err := s.discoverBucket(ctx, b, cfg.SrcPrefix, collectionTime); err != nil {
+				if err := s.discoverBucket(ctx, b, cfg, collectionTime); err != nil {
 					errc <- fmt.Errorf("discover bucket %s: %w", b, err)
 				}
 			}(bucket, bc)
@@ -184,15 +185,15 @@ wait:
 	return <-errc
 }
 
-func (s *Syncer) discoverBucket(ctx context.Context, bucket, prefix string, collectionTime time.Time) error {
-	logger := log.With().Str("bucket", bucket).Str("prefix", prefix).Logger()
+func (s *Syncer) discoverBucket(ctx context.Context, bucket string, cfg BucketConfig, collectionTime time.Time) error {
+	logger := log.With().Str("bucket", bucket).Str("prefix", cfg.SrcPrefix).Logger()
 
-	objects, errc := s.cfg.Source.ListObjects(ctx, bucket, prefix)
+	objects, errc := s.cfg.Source.ListObjects(ctx, bucket, cfg.SrcPrefix)
 	var count, pending int
 
 	for obj := range objects {
 		count++
-		needsSync, err := s.needsSync(ctx, bucket, obj)
+		needsSync, err := s.needsSync(ctx, bucket, obj, cfg)
 		if err != nil {
 			logger.Warn().Err(err).Str("key", obj.Key).Msg("state check failed, marking pending")
 			needsSync = true
@@ -219,7 +220,7 @@ func (s *Syncer) discoverBucket(ctx context.Context, bucket, prefix string, coll
 	return nil
 }
 
-func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Object) (bool, error) {
+func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Object, cfg BucketConfig) (bool, error) {
 	stored, err := s.cfg.State.GetObject(ctx, bucket, obj.Key)
 	if err != nil {
 		return false, err
@@ -231,7 +232,21 @@ func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Objec
 		return true, nil
 	}
 	// Re-sync if source object was modified after the stored modification time.
-	return obj.ModifiedAt.After(stored.ModifiedAt), nil
+	if obj.ModifiedAt.After(stored.ModifiedAt) {
+		return true, nil
+	}
+	// Optionally verify destination size matches source to catch incomplete uploads.
+	if s.cfg.CheckSizes && obj.Size > 0 {
+		dstSize, err := s.cfg.Destination.HeadObject(ctx, cfg.Destination, cfg.destKey(obj.Key))
+		if err != nil {
+			// Object missing or inaccessible on destination — re-sync.
+			return true, nil
+		}
+		if dstSize != obj.Size {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Syncer) sync(ctx context.Context, buckets map[string]BucketConfig) error {

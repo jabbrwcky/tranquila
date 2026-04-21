@@ -268,6 +268,19 @@ func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
 	return nil
 }
 
+func (c *Client) HeadObject(ctx context.Context, bucket, key string) (int64, error) {
+	start := time.Now()
+	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	c.recordOp(ctx, "HeadObject", bucket, start, err)
+	if err != nil {
+		return 0, fmt.Errorf("head object %s/%s: %w", bucket, key, err)
+	}
+	return aws.ToInt64(out.ContentLength), nil
+}
+
 func (c *Client) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, int64, error) {
 	start := time.Now()
 	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{

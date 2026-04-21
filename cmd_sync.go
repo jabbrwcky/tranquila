@@ -38,8 +38,9 @@ type SyncCmd struct {
 	RedisPassword string `kong:"name='redis-password',env='REDIS_PASSWORD',help='Redis password'"`
 	RedisDB       int    `kong:"name='redis-db',env='REDIS_DB',default='0',help='Redis database number'"`
 
-	Workers   int     `kong:"name='workers',env='TRANQUILA_WORKERS',default='10',help='Number of concurrent sync workers'"`
-	RateLimit float64 `kong:"name='rate-limit',env='TRANQUILA_RATE_LIMIT',default='0',help='Max S3 requests per second (0 = unlimited)'"`
+	Workers    int     `kong:"name='workers',env='TRANQUILA_WORKERS',default='10',help='Number of concurrent sync workers'"`
+	RateLimit  float64 `kong:"name='rate-limit',env='TRANQUILA_RATE_LIMIT',default='0',help='Max S3 requests per second (0 = unlimited)'"`
+	CheckSizes bool    `kong:"name='check-sizes',env='TRANQUILA_CHECK_SIZES',default='false',help='Re-sync objects whose destination size differs from source'"`
 
 	TelemetryExporter     string `kong:"name='telemetry-exporter',env='TELEMETRY_EXPORTER',default='prometheus',enum='prometheus,otlp,none',help='Metrics exporter'"`
 	TelemetryAddr         string `kong:"name='telemetry-addr',env='TELEMETRY_ADDR',default=':9090',help='Prometheus metrics listen address'"`
@@ -216,6 +217,7 @@ func (cmd *SyncCmd) Run() error {
 		DestBucketPrefix: cmd.DestBucketPrefix,
 		Workers:          cmd.Workers,
 		RateLimit:        cmd.RateLimit,
+		CheckSizes:       cmd.CheckSizes,
 		Progress:         progress,
 	})
 	if err != nil {
