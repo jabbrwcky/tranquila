@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
+	"github.com/jabbrwcky/tranquila/internal/api"
 	"github.com/jabbrwcky/tranquila/internal/state"
 	"github.com/jabbrwcky/tranquila/internal/storage"
 	internalsync "github.com/jabbrwcky/tranquila/internal/sync"
@@ -42,6 +44,8 @@ type SyncCmd struct {
 	TelemetryExporter     string `kong:"name='telemetry-exporter',env='TELEMETRY_EXPORTER',default='prometheus',enum='prometheus,otlp,none',help='Metrics exporter'"`
 	TelemetryAddr         string `kong:"name='telemetry-addr',env='TELEMETRY_ADDR',default=':9090',help='Prometheus metrics listen address'"`
 	TelemetryOTLPEndpoint string `kong:"name='telemetry-otlp-endpoint',env='TELEMETRY_OTLP_ENDPOINT',help='OTLP gRPC endpoint'"`
+
+	MgmtAddr string `kong:"name='mgmt-addr',env='MGMT_ADDR',default=':8080',help='Management API listen address'"`
 }
 
 // resolveBuckets merges --bucket-mappings, --prefix-mappings, and --bucket-mapping-file
@@ -167,6 +171,7 @@ func (cmd *SyncCmd) Run() error {
 		Region:    cmd.SourceRegion,
 		AccessKey: cmd.SourceAccessKey,
 		SecretKey: cmd.SourceSecretKey,
+		Meter:     tel.Meter,
 	})
 	if err != nil {
 		return fmt.Errorf("create source S3 client: %w", err)
@@ -177,6 +182,7 @@ func (cmd *SyncCmd) Run() error {
 		Region:    cmd.DestRegion,
 		AccessKey: cmd.DestAccessKey,
 		SecretKey: cmd.DestSecretKey,
+		Meter:     tel.Meter,
 	})
 	if err != nil {
 		return fmt.Errorf("create destination S3 client: %w", err)
@@ -187,6 +193,20 @@ func (cmd *SyncCmd) Run() error {
 		return fmt.Errorf("resolve bucket mappings: %w", err)
 	}
 
+	progress := internalsync.NewProgress()
+
+	mgmt := api.NewServer(api.Config{
+		Addr:     cmd.MgmtAddr,
+		State:    store,
+		Progress: progress,
+	})
+	go func() {
+		if err := mgmt.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error().Err(err).Msg("management API error")
+		}
+	}()
+	defer mgmt.Shutdown(context.Background())
+
 	syncer, err := internalsync.New(internalsync.Config{
 		Source:           src,
 		Destination:      dst,
@@ -196,6 +216,7 @@ func (cmd *SyncCmd) Run() error {
 		DestBucketPrefix: cmd.DestBucketPrefix,
 		Workers:          cmd.Workers,
 		RateLimit:        cmd.RateLimit,
+		Progress:         progress,
 	})
 	if err != nil {
 		return fmt.Errorf("create syncer: %w", err)
@@ -205,6 +226,7 @@ func (cmd *SyncCmd) Run() error {
 		Int("workers", cmd.Workers).
 		Float64("rate_limit", cmd.RateLimit).
 		Str("telemetry", cmd.TelemetryExporter).
+		Str("mgmt_addr", cmd.MgmtAddr).
 		Msg("tranquila starting")
 
 	if err := syncer.Run(ctx); err != nil && err != context.Canceled {

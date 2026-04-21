@@ -16,6 +16,8 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithy "github.com/aws/smithy-go"
 	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 type Config struct {
@@ -23,6 +25,7 @@ type Config struct {
 	Region    string
 	AccessKey string
 	SecretKey string
+	Meter     metric.Meter // optional; zero value produces no-op instruments
 }
 
 type Object struct {
@@ -33,10 +36,15 @@ type Object struct {
 	ETag       string
 }
 
+type clientMetrics struct {
+	opDuration metric.Float64Histogram
+}
+
 type Client struct {
 	s3       *s3.Client
 	uploader *manager.Uploader
 	region   string
+	m        clientMetrics
 }
 
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
@@ -64,15 +72,40 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	}
 
 	s3c := s3.NewFromConfig(awsCfg, clientOpts...)
+
+	opDuration, err := cfg.Meter.Float64Histogram("tranquila.s3.operation.duration",
+		metric.WithDescription("Duration of individual S3 API calls"),
+		metric.WithUnit("ms"))
+	if err != nil {
+		return nil, fmt.Errorf("init s3 metrics: %w", err)
+	}
+
 	return &Client{
 		s3:       s3c,
 		uploader: manager.NewUploader(s3c),
 		region:   cfg.Region,
+		m:        clientMetrics{opDuration: opDuration},
 	}, nil
 }
 
+// recordOp records a completed S3 API call with operation name, bucket, success flag, and duration.
+func (c *Client) recordOp(ctx context.Context, op, bucket string, start time.Time, err error) {
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	c.m.opDuration.Record(ctx, float64(time.Since(start).Milliseconds()),
+		metric.WithAttributes(
+			attribute.String("operation", op),
+			attribute.String("bucket", bucket),
+			attribute.String("status", status),
+		))
+}
+
 func (c *Client) ListBuckets(ctx context.Context) ([]string, error) {
+	start := time.Now()
 	out, err := c.s3.ListBuckets(ctx, &s3.ListBucketsInput{})
+	c.recordOp(ctx, "ListBuckets", "", start, err)
 	if err != nil {
 		return nil, fmt.Errorf("list buckets: %w", err)
 	}
@@ -164,10 +197,13 @@ const listMaxRetries = 5
 // listPageWithRetry fetches a single ListObjectsV2 page, retrying on transient
 // network errors (EOF, connection reset, broken pipe) with exponential backoff.
 func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
+	bucket := aws.ToString(input.Bucket)
 	var err error
 	for attempt := 0; attempt < listMaxRetries; attempt++ {
+		start := time.Now()
 		var out *s3.ListObjectsV2Output
 		out, err = c.s3.ListObjectsV2(ctx, input)
+		c.recordOp(ctx, "ListObjectsV2", bucket, start, err)
 		if err == nil {
 			return out, nil
 		}
@@ -204,7 +240,9 @@ func isTransientErr(err error) bool {
 }
 
 func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
+	start := time.Now()
 	_, err := c.s3.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)})
+	c.recordOp(ctx, "HeadBucket", bucket, start, err)
 	if err == nil {
 		return nil
 	}
@@ -216,7 +254,9 @@ func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
 		}
 	}
 
+	start = time.Now()
 	_, err = c.s3.CreateBucket(ctx, input)
+	c.recordOp(ctx, "CreateBucket", bucket, start, err)
 	if err != nil {
 		var alreadyExists *s3types.BucketAlreadyExists
 		var alreadyOwned *s3types.BucketAlreadyOwnedByYou
@@ -229,10 +269,12 @@ func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
 }
 
 func (c *Client) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, int64, error) {
+	start := time.Now()
 	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
+	c.recordOp(ctx, "GetObject", bucket, start, err)
 	if err != nil {
 		return nil, 0, fmt.Errorf("get object %s/%s: %w", bucket, key, err)
 	}
@@ -248,7 +290,9 @@ func (c *Client) PutObject(ctx context.Context, bucket, key string, body io.Read
 	if size > 0 {
 		input.ContentLength = aws.Int64(size)
 	}
+	start := time.Now()
 	_, err := c.uploader.Upload(ctx, input)
+	c.recordOp(ctx, "PutObject", bucket, start, err)
 	if err != nil {
 		return fmt.Errorf("put object %s/%s: %w", bucket, key, err)
 	}

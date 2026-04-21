@@ -1,0 +1,188 @@
+openapi: "3.1.0"
+
+info:
+  title: Tranquila Management API
+  version: "1.0.0"
+  description: |
+    Management and observability API for the Tranquila S3 bucket synchronization tool.
+    The API is served by the sync process on the address configured via --mgmt-addr.
+
+servers:
+  - url: http://localhost:8080
+    description: Default local management server
+
+paths:
+  /api/v1/buckets:
+    get:
+      operationId: listBuckets
+      summary: List all tracked source buckets
+      description: >
+        Returns the persisted sync state for every source bucket that has been
+        discovered at least once. Includes live in-flight progress when a sync
+        is currently running.
+      responses:
+        "200":
+          description: Array of bucket status objects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BucketStatus"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/buckets/{name}:
+    get:
+      operationId: getBucket
+      summary: Get sync status for a specific source bucket
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Source bucket name
+      responses:
+        "200":
+          description: Bucket status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BucketStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/sync:
+    get:
+      operationId: getSyncStatus
+      summary: Get current sync process status and per-bucket progress
+      description: >
+        Returns whether a sync is currently running, when it started, and
+        per-bucket progress including objects processed, transfer rate, and
+        estimated time to completion.
+      responses:
+        "200":
+          description: Sync process status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncStatus"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  schemas:
+    BucketStats:
+      type: object
+      required: [total, synced, pending, failed]
+      properties:
+        total:
+          type: integer
+          format: int64
+          description: Total objects tracked for this bucket
+        synced:
+          type: integer
+          format: int64
+          description: Objects successfully synced
+        pending:
+          type: integer
+          format: int64
+          description: Objects waiting to be synced
+        failed:
+          type: integer
+          format: int64
+          description: Objects whose last sync attempt failed
+
+    BucketSyncProgress:
+      type: object
+      description: Live progress for a bucket that is currently being synced
+      required: [started_at, pending_at_start, synced_this_run, failed_this_run, rate_per_sec]
+      properties:
+        started_at:
+          type: string
+          format: date-time
+          description: When the current sync run started for this bucket
+        pending_at_start:
+          type: integer
+          format: int64
+          description: Number of pending objects at the start of this run
+        synced_this_run:
+          type: integer
+          format: int64
+          description: Objects successfully synced during this run
+        failed_this_run:
+          type: integer
+          format: int64
+          description: Objects that failed during this run
+        rate_per_sec:
+          type: number
+          format: double
+          description: Current throughput in objects per second
+        eta_seconds:
+          type: number
+          format: double
+          nullable: true
+          description: >
+            Estimated seconds until all pending objects are synced based on the
+            current rate. Null when rate is zero or all objects are accounted for.
+
+    BucketStatus:
+      type: object
+      required: [name, stats]
+      properties:
+        name:
+          type: string
+          description: Source bucket name
+        last_collected:
+          type: string
+          format: date-time
+          nullable: true
+          description: Timestamp of the last completed discovery run for this bucket
+        stats:
+          $ref: "#/components/schemas/BucketStats"
+        sync_progress:
+          $ref: "#/components/schemas/BucketSyncProgress"
+          nullable: true
+          description: Present only when a sync is actively running for this bucket
+
+    SyncStatus:
+      type: object
+      required: [running, buckets]
+      properties:
+        running:
+          type: boolean
+          description: Whether a sync process is currently active
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the current (or most recent) sync run started
+        buckets:
+          type: array
+          description: Status of each bucket that is part of the active sync run
+          items:
+            $ref: "#/components/schemas/BucketStatus"
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+  responses:
+    NotFound:
+      description: The requested resource was not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

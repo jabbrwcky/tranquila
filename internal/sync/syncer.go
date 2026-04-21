@@ -40,6 +40,7 @@ type Config struct {
 	DestBucketPrefix string                  // prefix for auto-discovered destination bucket names
 	Workers          int
 	RateLimit        float64
+	Progress         *Progress // optional; enables live progress tracking for the management API
 }
 
 type metrics struct {
@@ -47,6 +48,7 @@ type metrics struct {
 	failed           metric.Int64Counter
 	bytesTransferred metric.Int64Counter
 	duration         metric.Float64Histogram
+	activeWorkers    metric.Int64UpDownCounter
 }
 
 type Syncer struct {
@@ -85,12 +87,28 @@ func newMetrics(meter metric.Meter) (metrics, error) {
 	if err != nil {
 		return metrics{}, err
 	}
-	return metrics{synced: synced, failed: failed, bytesTransferred: bytes, duration: dur}, nil
+	activeWorkers, err := meter.Int64UpDownCounter("tranquila.workers.active",
+		metric.WithDescription("Number of workers currently executing a transfer"))
+	if err != nil {
+		return metrics{}, err
+	}
+	return metrics{
+		synced:           synced,
+		failed:           failed,
+		bytesTransferred: bytes,
+		duration:         dur,
+		activeWorkers:    activeWorkers,
+	}, nil
 }
 
 // Run performs discovery then syncs all pending objects. It blocks until done
 // or ctx is cancelled (graceful shutdown: in-flight transfers finish).
 func (s *Syncer) Run(ctx context.Context) error {
+	if s.cfg.Progress != nil {
+		s.cfg.Progress.start(time.Now().UTC())
+		defer s.cfg.Progress.stop()
+	}
+
 	bucketMap, err := s.resolveBuckets(ctx)
 	if err != nil {
 		return err
@@ -217,7 +235,7 @@ func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Objec
 }
 
 func (s *Syncer) sync(ctx context.Context, buckets map[string]BucketConfig) error {
-	pool := newWorkerPool(ctx, s.cfg.Workers, s.cfg.RateLimit, s.transfer)
+	pool := newWorkerPool(ctx, s.cfg.Workers, s.cfg.RateLimit, s.transfer, s.m.activeWorkers)
 
 	var resultWg sync.WaitGroup
 	resultWg.Add(1)
@@ -239,6 +257,10 @@ func (s *Syncer) sync(ctx context.Context, buckets map[string]BucketConfig) erro
 		if err := s.cfg.Destination.EnsureBucket(ctx, bc.Destination); err != nil {
 			log.Error().Err(err).Str("bucket", bc.Destination).Msg("ensure destination bucket failed")
 			continue
+		}
+
+		if s.cfg.Progress != nil {
+			s.cfg.Progress.startBucket(srcBucket, int64(len(pending)))
 		}
 
 		logger := log.With().Str("src", srcBucket).Str("dst", bc.Destination).Logger()
@@ -273,6 +295,9 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 				Msg("transfer failed")
 			_ = s.cfg.State.MarkFailed(ctx, r.Job.SrcBucket, r.Job.Key)
 			s.m.failed.Add(ctx, 1, metric.WithAttributes(attrs...))
+			if s.cfg.Progress != nil {
+				s.cfg.Progress.recordFailed(r.Job.SrcBucket)
+			}
 		} else {
 			log.Debug().
 				Str("bucket", r.Job.SrcBucket).
@@ -284,6 +309,9 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 			s.m.synced.Add(ctx, 1, metric.WithAttributes(attrs...))
 			s.m.bytesTransferred.Add(ctx, r.Job.Size, metric.WithAttributes(attrs...))
 			s.m.duration.Record(ctx, r.Duration.Seconds(), metric.WithAttributes(attrs...))
+			if s.cfg.Progress != nil {
+				s.cfg.Progress.recordSynced(r.Job.SrcBucket)
+			}
 		}
 	}
 }

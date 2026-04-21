@@ -176,6 +176,21 @@ func (s *Store) GetCollectionTime(ctx context.Context, bucket string) (time.Time
 	return t, nil
 }
 
+// ListBuckets returns the names of all source buckets that have completed at
+// least one discovery run (i.e. have a stored collection timestamp).
+func (s *Store) ListBuckets(ctx context.Context) ([]string, error) {
+	const prefix = "tranquila:collection:"
+	var buckets []string
+	iter := s.client.Scan(ctx, 0, prefix+"*", scanBatchSize).Iterator()
+	for iter.Next(ctx) {
+		buckets = append(buckets, strings.TrimPrefix(iter.Val(), prefix))
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("scan collection keys: %w", err)
+	}
+	return buckets, nil
+}
+
 func (s *Store) BucketStats(ctx context.Context, bucket string) (BucketStats, error) {
 	pattern := "tranquila:obj:" + bucket + ":*"
 	var keys []string
