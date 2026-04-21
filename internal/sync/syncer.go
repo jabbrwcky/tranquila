@@ -317,12 +317,29 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 }
 
 func (s *Syncer) transfer(ctx context.Context, job Job) error {
-	body, size, err := s.cfg.Source.GetObject(ctx, job.SrcBucket, job.Key)
+	body, srcSize, err := s.cfg.Source.GetObject(ctx, job.SrcBucket, job.Key)
 	if err != nil {
 		return err
 	}
 	defer body.Close()
 
-	job.Size = size
-	return s.cfg.Destination.PutObject(ctx, job.DstBucket, job.DstKey, body, size)
+	job.Size = srcSize
+	if err := s.cfg.Destination.PutObject(ctx, job.DstBucket, job.DstKey, body, srcSize); err != nil {
+		return err
+	}
+
+	// Verify destination size matches source to catch silent data-loss during upload.
+	// Skip when srcSize is unknown (server did not provide Content-Length).
+	if srcSize > 0 {
+		dstSize, err := s.cfg.Destination.HeadObject(ctx, job.DstBucket, job.DstKey)
+		if err != nil {
+			return fmt.Errorf("verify %s/%s: %w", job.DstBucket, job.DstKey, err)
+		}
+		if dstSize != srcSize {
+			return fmt.Errorf("size mismatch for %s/%s: source=%d destination=%d",
+				job.DstBucket, job.DstKey, srcSize, dstSize)
+		}
+	}
+
+	return nil
 }
