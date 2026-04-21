@@ -11,7 +11,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	tmtypes "github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	smithy "github.com/aws/smithy-go"
@@ -41,10 +42,10 @@ type clientMetrics struct {
 }
 
 type Client struct {
-	s3       *s3.Client
-	uploader *manager.Uploader
-	region   string
-	m        clientMetrics
+	s3     *s3.Client
+	tm     *transfermanager.Client
+	region string
+	m      clientMetrics
 }
 
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
@@ -81,10 +82,10 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		s3:       s3c,
-		uploader: manager.NewUploader(s3c),
-		region:   cfg.Region,
-		m:        clientMetrics{opDuration: opDuration},
+		s3:     s3c,
+		tm:     transfermanager.New(s3c),
+		region: cfg.Region,
+		m:      clientMetrics{opDuration: opDuration},
 	}, nil
 }
 
@@ -283,7 +284,7 @@ func (c *Client) HeadObject(ctx context.Context, bucket, key string) (int64, err
 
 func (c *Client) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, int64, error) {
 	start := time.Now()
-	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
+	out, err := c.tm.GetObject(ctx, &transfermanager.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
@@ -291,20 +292,17 @@ func (c *Client) GetObject(ctx context.Context, bucket, key string) (io.ReadClos
 	if err != nil {
 		return nil, 0, fmt.Errorf("get object %s/%s: %w", bucket, key, err)
 	}
-	return out.Body, aws.ToInt64(out.ContentLength), nil
+	return io.NopCloser(out.Body), aws.ToInt64(out.ContentLength), nil
 }
 
 func (c *Client) PutObject(ctx context.Context, bucket, key string, body io.Reader, size int64) error {
-	input := &s3.PutObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-		Body:   body,
-	}
-	if size > 0 {
-		input.ContentLength = aws.Int64(size)
-	}
 	start := time.Now()
-	_, err := c.uploader.Upload(ctx, input)
+	_, err := c.tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
+		Bucket:            aws.String(bucket),
+		Key:               aws.String(key),
+		Body:              body,
+		ChecksumAlgorithm: tmtypes.ChecksumAlgorithmCrc32,
+	})
 	c.recordOp(ctx, "PutObject", bucket, start, err)
 	if err != nil {
 		return fmt.Errorf("put object %s/%s: %w", bucket, key, err)

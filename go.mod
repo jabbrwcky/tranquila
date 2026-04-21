@@ -24,6 +24,7 @@ require (
 )
 
 require (
+	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.17 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.10 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/prometheus/otlptranslator v1.0.0 // indirect
