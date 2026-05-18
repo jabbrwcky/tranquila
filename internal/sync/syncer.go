@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/jabbrwcky/tranquila/internal/state"
 	"github.com/jabbrwcky/tranquila/internal/storage"
+	"github.com/jabbrwcky/tranquila/internal/watcher"
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -329,6 +331,105 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 			}
 		}
 	}
+}
+
+// RunWatch repeatedly calls Run until ctx is cancelled, sleeping interval between
+// each completed cycle. The sleep is context-aware: cancellation during the sleep
+// exits immediately and cleanly.
+func (s *Syncer) RunWatch(ctx context.Context, interval time.Duration) error {
+	return s.runWatch(ctx, interval, s.Run)
+}
+
+// runWatch is the testable core of RunWatch; cycleFn replaces s.Run so tests can
+// inject controlled behaviour without requiring real S3 or Redis connections.
+func (s *Syncer) runWatch(ctx context.Context, interval time.Duration, cycleFn func(context.Context) error) error {
+	for {
+		if err := cycleFn(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+		log.Info().Dur("interval", interval).Msg("watch: cycle complete, waiting before next discovery")
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(interval):
+		}
+	}
+}
+
+// RunWatcher performs an initial full sync cycle to catch any changes missed while
+// the program was down, then switches to event-driven mode consuming events from w.
+// In-flight transfers complete before returning on context cancellation.
+func (s *Syncer) RunWatcher(ctx context.Context, w watcher.Watcher) error {
+	if err := s.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	bucketMap, err := s.resolveBuckets(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, bc := range bucketMap {
+		if err := s.cfg.Destination.EnsureBucket(ctx, bc.Destination); err != nil {
+			log.Error().Err(err).Str("bucket", bc.Destination).Msg("ensure destination bucket failed")
+		}
+	}
+
+	srcBuckets := make([]string, 0, len(bucketMap))
+	for b := range bucketMap {
+		srcBuckets = append(srcBuckets, b)
+	}
+
+	return s.runWatcher(ctx, w, srcBuckets, bucketMap)
+}
+
+// runWatcher is the testable event-loop core of RunWatcher; it accepts a pre-resolved
+// bucket map and an already-started Watcher so tests can inject controlled behaviour.
+func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets []string, bucketMap map[string]BucketConfig) error {
+	events, err := w.Watch(ctx, srcBuckets)
+	if err != nil {
+		return fmt.Errorf("start watcher: %w", err)
+	}
+
+	pool := newWorkerPool(ctx, s.cfg.Workers, s.cfg.RateLimit, s.transfer, s.m.activeWorkers)
+
+	var resultWg sync.WaitGroup
+	resultWg.Add(1)
+	go func() {
+		defer resultWg.Done()
+		s.processResults(ctx, pool.resultsCh())
+	}()
+
+	log.Info().Strs("buckets", srcBuckets).Msg("watch: listening for object events")
+
+	for event := range events {
+		bc, ok := bucketMap[event.Bucket]
+		if !ok {
+			log.Warn().Str("bucket", event.Bucket).Msg("watch: received event for unknown bucket, skipping")
+			continue
+		}
+		if s.cfg.State != nil {
+			if err := s.cfg.State.MarkPending(ctx, event.Bucket, event.Key, event.ModifiedAt); err != nil {
+				log.Error().Err(err).Str("bucket", event.Bucket).Str("key", event.Key).Msg("watch: mark pending failed")
+				continue
+			}
+		}
+		pool.submit(Job{
+			SrcBucket:  event.Bucket,
+			DstBucket:  bc.Destination,
+			Key:        event.Key,
+			DstKey:     bc.destKey(event.Key),
+			Size:       event.Size,
+			ModifiedAt: event.ModifiedAt,
+		})
+	}
+
+	pool.close()
+	resultWg.Wait()
+	return nil
 }
 
 func (s *Syncer) transfer(ctx context.Context, job Job) error {

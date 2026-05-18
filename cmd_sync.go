@@ -9,12 +9,14 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jabbrwcky/tranquila/internal/api"
 	"github.com/jabbrwcky/tranquila/internal/state"
 	"github.com/jabbrwcky/tranquila/internal/storage"
 	internalsync "github.com/jabbrwcky/tranquila/internal/sync"
 	"github.com/jabbrwcky/tranquila/internal/telemetry"
+	"github.com/jabbrwcky/tranquila/internal/watcher"
 	"github.com/rs/zerolog/log"
 )
 
@@ -41,6 +43,11 @@ type SyncCmd struct {
 	Workers    int     `kong:"name='workers',env='TRANQUILA_WORKERS',default='10',help='Number of concurrent sync workers'"`
 	RateLimit  float64 `kong:"name='rate-limit',env='TRANQUILA_RATE_LIMIT',default='0',help='Max S3 requests per second (0 = unlimited)'"`
 	CheckSizes bool    `kong:"name='check-sizes',env='TRANQUILA_CHECK_SIZES',default='false',help='Re-sync objects whose destination size differs from source'"`
+
+	Watch         bool          `kong:"name='watch',env='TRANQUILA_WATCH',default='false',help='Continuously re-run sync until interrupted'"`
+	WatchMode     string        `kong:"name='watch-mode',env='TRANQUILA_WATCH_MODE',default='poll',enum='poll,minio,sqs',help='Watch backend: poll|minio|sqs'"`
+	WatchInterval time.Duration `kong:"name='watch-interval',env='TRANQUILA_WATCH_INTERVAL',default='60s',help='Idle time between poll cycles (poll mode only)'"`
+	SQSQueueURL   string        `kong:"name='sqs-queue-url',env='TRANQUILA_SQS_QUEUE_URL',help='SQS queue URL for S3 event notifications (sqs mode)'"`
 
 	TelemetryExporter     string `kong:"name='telemetry-exporter',env='TELEMETRY_EXPORTER',default='prometheus',enum='prometheus,otlp,none',help='Metrics exporter'"`
 	TelemetryAddr         string `kong:"name='telemetry-addr',env='TELEMETRY_ADDR',default=':9090',help='Prometheus metrics listen address'"`
@@ -227,12 +234,46 @@ func (cmd *SyncCmd) Run() error {
 	log.Info().
 		Int("workers", cmd.Workers).
 		Float64("rate_limit", cmd.RateLimit).
+		Bool("watch", cmd.Watch).
+		Str("watch_mode", cmd.WatchMode).
 		Str("telemetry", cmd.TelemetryExporter).
 		Str("mgmt_addr", cmd.MgmtAddr).
 		Msg("tranquila starting")
 
-	if err := syncer.Run(ctx); err != nil && err != context.Canceled {
-		return err
+	var runErr error
+	if !cmd.Watch {
+		runErr = syncer.Run(ctx)
+	} else {
+		switch cmd.WatchMode {
+		case "poll":
+			runErr = syncer.RunWatch(ctx, cmd.WatchInterval)
+		case "minio":
+			w, err := watcher.NewMinIO(watcher.MinIOConfig{
+				Endpoint:  cmd.SourceEndpoint,
+				AccessKey: cmd.SourceAccessKey,
+				SecretKey: cmd.SourceSecretKey,
+				Secure:    strings.HasPrefix(cmd.SourceEndpoint, "https://"),
+			})
+			if err != nil {
+				return fmt.Errorf("create minio watcher: %w", err)
+			}
+			runErr = syncer.RunWatcher(ctx, w)
+		case "sqs":
+			w, err := watcher.NewSQS(watcher.SQSConfig{
+				QueueURL:  cmd.SQSQueueURL,
+				Region:    cmd.SourceRegion,
+				AccessKey: cmd.SourceAccessKey,
+				SecretKey: cmd.SourceSecretKey,
+			})
+			if err != nil {
+				return fmt.Errorf("create sqs watcher: %w", err)
+			}
+			runErr = syncer.RunWatcher(ctx, w)
+		}
+	}
+
+	if runErr != nil && runErr != context.Canceled {
+		return runErr
 	}
 
 	log.Info().Msg("tranquila done")

@@ -124,7 +124,7 @@ func (s *Server) bucketStatus(ctx context.Context, name string, snap internalsyn
 			RatePerSec:     rate,
 		}
 		if rate > 0 {
-			remaining := float64(bp.PendingAtStart-bp.Synced-bp.Failed)
+			remaining := float64(bp.PendingAtStart - bp.Synced - bp.Failed)
 			if remaining > 0 {
 				eta := remaining / rate
 				p.ETASeconds = &eta
