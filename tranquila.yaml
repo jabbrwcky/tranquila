@@ -2,14 +2,14 @@
 # source:
 #   endpoint: ""        # leave empty for AWS; set for S3-compatible services
 #   region: "us-east-1"
-#   access_key: ""
-#   secret_key: ""
+#   access-key: ""
+#   secret-key: ""
 
 # destination:
 #   endpoint: ""
 #   region: "us-east-1"
-#   access_key: ""
-#   secret_key: ""
+#   access-key: ""
+#   secret-key: ""
 sync:
   buckets:
     - source:
@@ -130,7 +130,7 @@ sync:
   telemetry:
     exporter: "prometheus"   # prometheus | otlp | none
     addr: ":8081"
-    otlp_endpoint: ""        # gRPC endpoint, e.g. localhost:4317
+    otlp-endpoint: ""        # gRPC endpoint, e.g. localhost:4317
 
   workers: 10
-  rate_limit: 5.0
+  rate-limit: 5.0

@@ -147,6 +147,26 @@ sync:
 	}
 }
 
+func TestConfigFileSyncTuningHyphenKeys(t *testing.T) {
+	// rate-limit and check-sizes use hyphens in their flag names; underscore
+	// variants (rate_limit, check_sizes) are silently ignored by kong-yaml.
+	sync := configFromYAML(t, `
+sync:
+  rate-limit: 7.5
+  workers: 3
+  check-sizes: true
+`)
+	if sync.RateLimit != 7.5 {
+		t.Errorf("RateLimit = %f, want 7.5 (underscore key would silently ignore this)", sync.RateLimit)
+	}
+	if sync.Workers != 3 {
+		t.Errorf("Workers = %d, want 3", sync.Workers)
+	}
+	if !sync.CheckSizes {
+		t.Error("CheckSizes = false, want true")
+	}
+}
+
 func TestConfigFileMgmtAddr(t *testing.T) {
 	sync := configFromYAML(t, `
 sync:
