@@ -54,12 +54,19 @@ func (p *Progress) stop() {
 	p.running = false
 }
 
-func (p *Progress) startBucket(bucket string, pendingCount int64) {
+func (p *Progress) startBucket(bucket string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.buckets[bucket] = &bucketProgress{
-		pendingAtStart: pendingCount,
-		startedAt:      time.Now().UTC(),
+	p.buckets[bucket] = &bucketProgress{startedAt: time.Now().UTC()}
+}
+
+// addPending increments the pending count for a bucket as objects are queued
+// during batched discovery. Called once per batch.
+func (p *Progress) addPending(bucket string, n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if bp, ok := p.buckets[bucket]; ok {
+		bp.pendingAtStart += n
 	}
 }
 

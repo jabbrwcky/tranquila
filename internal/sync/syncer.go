@@ -15,8 +15,9 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	"golang.org/x/time/rate"
 )
+
+const defaultDiscoveryBatchSize = 100_000
 
 // BucketConfig holds destination routing and path-prefix configuration for a source bucket.
 type BucketConfig struct {
@@ -34,16 +35,17 @@ func (bc BucketConfig) destKey(srcKey string) string {
 }
 
 type Config struct {
-	Source           *storage.Client
-	Destination      *storage.Client
-	State            *state.Store
-	Meter            metric.Meter
-	Buckets          map[string]BucketConfig // src → config; nil = auto-discover all
-	DestBucketPrefix string                  // prefix for auto-discovered destination bucket names
-	Workers          int
-	RateLimit        float64
-	CheckSizes       bool      // re-queue synced objects whose destination size differs from source
-	Progress         *Progress // optional; enables live progress tracking for the management API
+	Source             *storage.Client
+	Destination        *storage.Client
+	State              *state.Store
+	Meter              metric.Meter
+	Buckets            map[string]BucketConfig // src → config; nil = auto-discover all
+	DestBucketPrefix   string                  // prefix for auto-discovered destination bucket names
+	Workers            int
+	RateLimit          float64
+	CheckSizes         bool      // re-queue synced objects whose destination size differs from source
+	Progress           *Progress // optional; enables live progress tracking for the management API
+	DiscoveryBatchSize int       // max objects to discover per bucket before syncing (0 = default 100 000)
 }
 
 type metrics struct {
@@ -104,8 +106,19 @@ func newMetrics(meter metric.Meter) (metrics, error) {
 	}, nil
 }
 
-// Run performs discovery then syncs all pending objects. It blocks until done
-// or ctx is cancelled (graceful shutdown: in-flight transfers finish).
+// discoveryBatchSize returns the effective batch size: cfg value if positive, default otherwise.
+func (s *Syncer) discoveryBatchSize() int {
+	if s.cfg.DiscoveryBatchSize > 0 {
+		return s.cfg.DiscoveryBatchSize
+	}
+	return defaultDiscoveryBatchSize
+}
+
+// Run performs discovery and sync for all configured buckets. Each bucket's
+// discovery runs concurrently with other buckets; sync starts as soon as a
+// bucket's discovery batch is ready. Large buckets are processed in batches of
+// DiscoveryBatchSize objects so that sync begins without waiting for the full
+// listing and memory usage stays bounded.
 func (s *Syncer) Run(ctx context.Context) error {
 	if s.cfg.Progress != nil {
 		s.cfg.Progress.start(time.Now().UTC())
@@ -123,12 +136,141 @@ func (s *Syncer) Run(ctx context.Context) error {
 	}
 	log.Info().Strs("buckets", srcs).Msg("starting discovery")
 
-	if err := s.discover(ctx, bucketMap); err != nil {
-		return fmt.Errorf("discovery: %w", err)
+	pool := newWorkerPool(ctx, s.cfg.Workers, s.cfg.RateLimit, s.transfer, s.m.activeWorkers)
+
+	var resultWg sync.WaitGroup
+	resultWg.Add(1)
+	go func() {
+		defer resultWg.Done()
+		s.processResults(ctx, pool.resultsCh())
+	}()
+
+	collectionTime := time.Now().UTC()
+	sem := make(chan struct{}, s.cfg.Workers)
+	errc := make(chan error, len(bucketMap))
+	var discoverWg sync.WaitGroup
+
+	for bucket, bc := range bucketMap {
+		if ctx.Err() != nil {
+			break
+		}
+		sem <- struct{}{}
+		discoverWg.Add(1)
+		go func(b string, cfg BucketConfig) {
+			defer discoverWg.Done()
+			defer func() { <-sem }()
+			if err := s.discoverAndSyncBucket(ctx, b, cfg, collectionTime, pool); err != nil {
+				if !errors.Is(err, context.Canceled) {
+					errc <- fmt.Errorf("bucket %s: %w", b, err)
+				}
+			}
+		}(bucket, bc)
 	}
 
-	log.Info().Msg("starting sync")
-	return s.sync(ctx, bucketMap)
+	discoverWg.Wait()
+	pool.close()
+	resultWg.Wait()
+	close(errc)
+	return <-errc
+}
+
+// discoverAndSyncBucket lists the source bucket in batches of DiscoveryBatchSize
+// objects, marks each pending in Redis, submits them to the worker pool, and
+// waits for the batch to finish syncing before fetching the next page. This
+// keeps memory bounded and starts transferring objects without waiting for the
+// full listing to complete. Called concurrently by Run for each bucket.
+func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg BucketConfig, collectionTime time.Time, pool *workerPool) error {
+	logger := log.With().Str("bucket", bucket).Str("prefix", cfg.SrcPrefix).Logger()
+
+	if err := s.cfg.Destination.EnsureBucket(ctx, cfg.Destination); err != nil {
+		return fmt.Errorf("ensure destination bucket %s: %w", cfg.Destination, err)
+	}
+
+	if s.cfg.Progress != nil {
+		s.cfg.Progress.startBucket(bucket)
+	}
+
+	batchSize := s.discoveryBatchSize()
+	var token *string
+	var batchNum, totalCount, totalPending int
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		page, nextToken, err := s.cfg.Source.ListObjectsPage(ctx, bucket, cfg.SrcPrefix, token, batchSize)
+		if err != nil {
+			return fmt.Errorf("list objects: %w", err)
+		}
+
+		batchNum++
+		var batchPending int
+		var batchDone sync.WaitGroup
+
+		for _, obj := range page {
+			totalCount++
+			needsSync, err := s.needsSync(ctx, bucket, obj, cfg)
+			if err != nil {
+				logger.Warn().Err(err).Str("key", obj.Key).Msg("state check failed, marking pending")
+				needsSync = true
+			}
+			if !needsSync {
+				continue
+			}
+			if s.cfg.State != nil {
+				if err := s.cfg.State.MarkPending(ctx, bucket, obj.Key, obj.ModifiedAt); err != nil {
+					return fmt.Errorf("mark pending %s: %w", obj.Key, err)
+				}
+			}
+			totalPending++
+			batchPending++
+			batchDone.Add(1)
+			pool.submit(Job{
+				SrcBucket:  bucket,
+				DstBucket:  cfg.Destination,
+				Key:        obj.Key,
+				DstKey:     cfg.destKey(obj.Key),
+				Size:       obj.Size,
+				ModifiedAt: obj.ModifiedAt,
+				OnComplete: batchDone.Done,
+			})
+		}
+
+		if s.cfg.Progress != nil {
+			s.cfg.Progress.addPending(bucket, int64(batchPending))
+		}
+
+		if nextToken != nil {
+			logger.Info().
+				Int("batch", batchNum).
+				Int("discovered", len(page)).
+				Int("queued", batchPending).
+				Msg("batch queued, waiting for sync before continuing discovery")
+			batchDone.Wait()
+			logger.Info().Int("batch", batchNum).Msg("batch synced, resuming discovery")
+		} else {
+			logger.Info().
+				Int("total", totalCount).
+				Int("pending", totalPending).
+				Int("batches", batchNum).
+				Msg("discovery complete")
+			batchDone.Wait()
+		}
+
+		token = nextToken
+		if token == nil {
+			break
+		}
+	}
+
+	if s.cfg.State != nil {
+		if err := s.cfg.State.SetCollectionTime(ctx, bucket, collectionTime); err != nil {
+			return fmt.Errorf("set collection time: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (s *Syncer) resolveBuckets(ctx context.Context) (map[string]BucketConfig, error) {
@@ -144,82 +286,6 @@ func (s *Syncer) resolveBuckets(ctx context.Context) (map[string]BucketConfig, e
 		m[b] = BucketConfig{Destination: s.cfg.DestBucketPrefix + b}
 	}
 	return m, nil
-}
-
-// discover scans each source bucket in parallel (up to cfg.Workers goroutines),
-// compares objects against stored state, and marks objects as pending when they
-// are new or modified since last sync.
-func (s *Syncer) discover(ctx context.Context, buckets map[string]BucketConfig) error {
-	collectionTime := time.Now().UTC()
-
-	lim := rate.NewLimiter(rate.Inf, 0)
-	if s.cfg.RateLimit > 0 {
-		lim = rate.NewLimiter(rate.Limit(s.cfg.RateLimit), int(s.cfg.RateLimit)+1)
-	}
-
-	sem := make(chan struct{}, s.cfg.Workers)
-	errc := make(chan error, len(buckets))
-	var wg sync.WaitGroup
-
-	for bucket, bc := range buckets {
-		select {
-		case <-ctx.Done():
-			goto wait
-		case sem <- struct{}{}:
-			wg.Add(1)
-			go func(b string, cfg BucketConfig) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				if err := lim.Wait(ctx); err != nil {
-					errc <- err
-					return
-				}
-				if err := s.discoverBucket(ctx, b, cfg, collectionTime); err != nil {
-					errc <- fmt.Errorf("discover bucket %s: %w", b, err)
-				}
-			}(bucket, bc)
-		}
-	}
-
-wait:
-	wg.Wait()
-	close(errc)
-	return <-errc
-}
-
-func (s *Syncer) discoverBucket(ctx context.Context, bucket string, cfg BucketConfig, collectionTime time.Time) error {
-	logger := log.With().Str("bucket", bucket).Str("prefix", cfg.SrcPrefix).Logger()
-
-	objects, errc := s.cfg.Source.ListObjects(ctx, bucket, cfg.SrcPrefix)
-	var count, pending int
-
-	for obj := range objects {
-		count++
-		needsSync, err := s.needsSync(ctx, bucket, obj, cfg)
-		if err != nil {
-			logger.Warn().Err(err).Str("key", obj.Key).Msg("state check failed, marking pending")
-			needsSync = true
-		}
-		if needsSync {
-			pending++
-			if err := s.cfg.State.MarkPending(ctx, bucket, obj.Key, obj.ModifiedAt); err != nil {
-				return fmt.Errorf("mark pending %s: %w", obj.Key, err)
-			}
-		}
-	}
-	if err := <-errc; err != nil {
-		return err
-	}
-
-	if err := s.cfg.State.SetCollectionTime(ctx, bucket, collectionTime); err != nil {
-		return fmt.Errorf("set collection time: %w", err)
-	}
-
-	logger.Info().
-		Int("total", count).
-		Int("pending", pending).
-		Msg("discovery complete")
-	return nil
 }
 
 func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Object, cfg BucketConfig) (bool, error) {
@@ -251,56 +317,6 @@ func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Objec
 	return false, nil
 }
 
-func (s *Syncer) sync(ctx context.Context, buckets map[string]BucketConfig) error {
-	pool := newWorkerPool(ctx, s.cfg.Workers, s.cfg.RateLimit, s.transfer, s.m.activeWorkers)
-
-	var resultWg sync.WaitGroup
-	resultWg.Add(1)
-	go func() {
-		defer resultWg.Done()
-		s.processResults(ctx, pool.resultsCh())
-	}()
-
-	for srcBucket, bc := range buckets {
-		if ctx.Err() != nil {
-			break
-		}
-		pending, err := s.cfg.State.ScanPending(ctx, srcBucket)
-		if err != nil {
-			log.Error().Err(err).Str("bucket", srcBucket).Msg("scan pending failed")
-			continue
-		}
-
-		if err := s.cfg.Destination.EnsureBucket(ctx, bc.Destination); err != nil {
-			log.Error().Err(err).Str("bucket", bc.Destination).Msg("ensure destination bucket failed")
-			continue
-		}
-
-		if s.cfg.Progress != nil {
-			s.cfg.Progress.startBucket(srcBucket, int64(len(pending)))
-		}
-
-		logger := log.With().Str("src", srcBucket).Str("dst", bc.Destination).Logger()
-		logger.Info().Int("count", len(pending)).Msg("queuing objects")
-
-		for _, key := range pending {
-			if ctx.Err() != nil {
-				break
-			}
-			pool.submit(Job{
-				SrcBucket: srcBucket,
-				DstBucket: bc.Destination,
-				Key:       key,
-				DstKey:    bc.destKey(key),
-			})
-		}
-	}
-
-	pool.close()
-	resultWg.Wait()
-	return nil
-}
-
 func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 	for r := range results {
 		attrs := []attribute.KeyValue{attribute.String("bucket", r.Job.SrcBucket)}
@@ -329,6 +345,9 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 			if s.cfg.Progress != nil {
 				s.cfg.Progress.recordSynced(r.Job.SrcBucket)
 			}
+		}
+		if r.Job.OnComplete != nil {
+			r.Job.OnComplete()
 		}
 	}
 }

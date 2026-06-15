@@ -48,9 +48,10 @@ type SyncCmd struct {
 	RedisPassword string `name:"redis-password" env:"REDIS_PASSWORD" help:"Redis password"`
 	RedisDB       int    `name:"redis-db" env:"REDIS_DB" default:"0" help:"Redis database number"`
 
-	Workers    int     `name:"workers" env:"TRANQUILA_WORKERS" default:"10" help:"Number of concurrent sync workers"`
-	RateLimit  float64 `name:"rate-limit" env:"TRANQUILA_RATE_LIMIT" default:"0" help:"Max S3 requests per second (0 = unlimited)"`
-	CheckSizes bool    `name:"check-sizes" env:"TRANQUILA_CHECK_SIZES" default:"false" help:"Re-sync objects whose destination size differs from source"`
+	Workers            int     `name:"workers" env:"TRANQUILA_WORKERS" default:"10" help:"Number of concurrent sync workers"`
+	RateLimit          float64 `name:"rate-limit" env:"TRANQUILA_RATE_LIMIT" default:"0" help:"Max S3 requests per second (0 = unlimited)"`
+	CheckSizes         bool    `name:"check-sizes" env:"TRANQUILA_CHECK_SIZES" default:"false" help:"Re-sync objects whose destination size differs from source"`
+	DiscoveryBatchSize int     `name:"discovery-batch-size" env:"TRANQUILA_DISCOVERY_BATCH_SIZE" default:"100000" help:"Objects to discover per bucket before syncing; next batch starts after sync drains (0 = default 100000)"`
 
 	Watch         bool          `name:"watch" env:"TRANQUILA_WATCH" default:"false" help:"Continuously re-run sync until interrupted"`
 	WatchMode     string        `name:"watch-mode" env:"TRANQUILA_WATCH_MODE" default:"poll" enum:"poll,minio,sqs" help:"Watch backend: poll|minio|sqs"`
@@ -242,16 +243,17 @@ func (cmd *SyncCmd) Run() error {
 	defer mgmt.Shutdown(context.Background())
 
 	syncer, err := internalsync.New(internalsync.Config{
-		Source:           src,
-		Destination:      dst,
-		State:            store,
-		Meter:            tel.Meter,
-		Buckets:          bucketMap,
-		DestBucketPrefix: cmd.DestBucketPrefix,
-		Workers:          cmd.Workers,
-		RateLimit:        cmd.RateLimit,
-		CheckSizes:       cmd.CheckSizes,
-		Progress:         progress,
+		Source:             src,
+		Destination:        dst,
+		State:              store,
+		Meter:              tel.Meter,
+		Buckets:            bucketMap,
+		DestBucketPrefix:   cmd.DestBucketPrefix,
+		Workers:            cmd.Workers,
+		RateLimit:          cmd.RateLimit,
+		CheckSizes:         cmd.CheckSizes,
+		Progress:           progress,
+		DiscoveryBatchSize: cmd.DiscoveryBatchSize,
 	})
 	if err != nil {
 		return fmt.Errorf("create syncer: %w", err)

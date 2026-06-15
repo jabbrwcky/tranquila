@@ -16,6 +16,10 @@ type Job struct {
 	DstKey     string // destination object key (may differ via prefix rewrite)
 	Size       int64
 	ModifiedAt time.Time
+	// OnComplete is called exactly once after the job is either transferred,
+	// failed, or skipped due to context cancellation. Used by discoverAndSyncBucket
+	// to wait for a batch to drain before continuing discovery.
+	OnComplete func()
 }
 
 type Result struct {
@@ -63,27 +67,29 @@ func newWorkerPool(ctx context.Context, n int, rateLimit float64, fn transferFn,
 
 func (p *workerPool) runWorker(ctx context.Context, fn transferFn) {
 	defer p.wg.Done()
-	for {
-		select {
-		case job, ok := <-p.jobs:
-			if !ok {
-				return
+	for job := range p.jobs {
+		// Skip job (without transferring) when ctx is cancelled. OnComplete is
+		// still called so that any batchDone.Wait() in discoverAndSyncBucket can
+		// unblock — the job remains pending in Redis and is retried on the next run.
+		if ctx.Err() != nil {
+			if job.OnComplete != nil {
+				job.OnComplete()
 			}
-			// Respect signal context for rate limiting; skip job on cancellation
-			// so it stays "pending" in Redis for the next run.
-			if err := p.limiter.Wait(ctx); err != nil {
-				continue
-			}
-			p.activeWorkers.Add(context.Background(), 1)
-			// Use background context for the transfer itself so in-flight
-			// transfers complete even after the signal context is cancelled.
-			start := time.Now()
-			err := fn(context.Background(), job)
-			p.activeWorkers.Add(context.Background(), -1)
-			p.results <- Result{Job: job, Duration: time.Since(start), Err: err}
-		case <-ctx.Done():
-			return
+			continue
 		}
+		if err := p.limiter.Wait(ctx); err != nil {
+			if job.OnComplete != nil {
+				job.OnComplete()
+			}
+			continue
+		}
+		p.activeWorkers.Add(context.Background(), 1)
+		// Use background context for the transfer itself so in-flight
+		// transfers complete even after the signal context is cancelled.
+		start := time.Now()
+		err := fn(context.Background(), job)
+		p.activeWorkers.Add(context.Background(), -1)
+		p.results <- Result{Job: job, Duration: time.Since(start), Err: err}
 	}
 }
 

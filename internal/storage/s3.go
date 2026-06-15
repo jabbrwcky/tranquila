@@ -193,6 +193,70 @@ func (c *Client) ListObjects(ctx context.Context, bucket, prefix string) (<-chan
 	return objects, errc
 }
 
+// ListObjectsPage fetches up to maxObjects from bucket starting after token,
+// accumulating complete S3 API pages. Returns the objects, the continuation
+// token for the next call (nil when the listing is exhausted), and any error.
+// Callers can use repeated calls with the returned token to page through a
+// large bucket in bounded-memory batches.
+func (c *Client) ListObjectsPage(ctx context.Context, bucket, prefix string, token *string, maxObjects int) ([]Object, *string, error) {
+	var collected []Object
+	current := token
+	var pageNum int
+
+	for len(collected) < maxObjects {
+		input := &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			ContinuationToken: current,
+		}
+		if prefix != "" {
+			input.Prefix = aws.String(prefix)
+		}
+
+		page, err := c.listPageWithRetry(ctx, input)
+		if err != nil {
+			return nil, nil, fmt.Errorf("list objects in %s: %w", bucket, err)
+		}
+
+		pageNum++
+		log.Debug().
+			Str("bucket", bucket).
+			Str("prefix", prefix).
+			Int("page", pageNum).
+			Int("page_objects", len(page.Contents)).
+			Int("total", len(collected)+len(page.Contents)).
+			Msg("discovery page complete")
+
+		for _, item := range page.Contents {
+			if item.Key == nil {
+				continue
+			}
+			obj := Object{
+				Bucket: bucket,
+				Key:    *item.Key,
+				Size:   aws.ToInt64(item.Size),
+			}
+			if item.LastModified != nil {
+				obj.ModifiedAt = *item.LastModified
+			}
+			if item.ETag != nil {
+				obj.ETag = *item.ETag
+			}
+			collected = append(collected, obj)
+		}
+
+		if !aws.ToBool(page.IsTruncated) {
+			return collected, nil, nil
+		}
+		current = page.NextContinuationToken
+
+		if len(collected) >= maxObjects {
+			return collected, current, nil
+		}
+	}
+
+	return collected, current, nil
+}
+
 const listMaxRetries = 5
 
 // listPageWithRetry fetches a single ListObjectsV2 page, retrying on transient
