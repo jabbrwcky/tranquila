@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jabbrwcky/tranquila/config"
 	"github.com/jabbrwcky/tranquila/internal/api"
 	"github.com/jabbrwcky/tranquila/internal/state"
 	"github.com/jabbrwcky/tranquila/internal/storage"
@@ -20,40 +21,49 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+type S3Server struct {
+	Endpoint  string `name:"endpoint" env:"ENDPOINT" help:"Source S3-compatible endpoint URL (empty = AWS)"`
+	Region    string
+	AccessKey string
+	SecretKey string
+}
+
 type SyncCmd struct {
-	SourceEndpoint  string `kong:"name='source-endpoint',env='SOURCE_ENDPOINT',help='Source S3-compatible endpoint URL (empty = AWS)'"`
-	SourceRegion    string `kong:"name='source-region',env='SOURCE_REGION',default='us-east-1',help='Source AWS region'"`
-	SourceAccessKey string `kong:"name='source-access-key',env='SOURCE_ACCESS_KEY',help='Source AWS access key ID'"`
-	SourceSecretKey string `kong:"name='source-secret-key',env='SOURCE_SECRET_KEY',help='Source AWS secret access key'"`
+	SourceEndpoint  string `name:"source-endpoint" env:"SOURCE_ENDPOINT" help:"Source S3-compatible endpoint URL (empty = AWS)"`
+	SourceRegion    string `name:"source-region" env:"SOURCE_REGION" default:"us-east-1" help:"Source AWS region"`
+	SourceAccessKey string `name:"source-access-key" env:"SOURCE_ACCESS_KEY" help:"Source AWS access key ID"`
+	SourceSecretKey string `name:"source-secret-key" env:"SOURCE_SECRET_KEY" help:"Source AWS secret access key"`
 
-	DestEndpoint     string `kong:"name='dest-endpoint',env='DEST_ENDPOINT',help='Destination S3-compatible endpoint URL (empty = AWS)'"`
-	DestRegion       string `kong:"name='dest-region',env='DEST_REGION',default='us-east-1',help='Destination AWS region'"`
-	DestAccessKey    string `kong:"name='dest-access-key',env='DEST_ACCESS_KEY',help='Destination AWS access key ID'"`
-	DestSecretKey    string `kong:"name='dest-secret-key',env='DEST_SECRET_KEY',help='Destination AWS secret access key'"`
-	DestBucketPrefix string `kong:"name='dest-bucket-prefix',env='DEST_BUCKET_PREFIX',help='Prefix prepended to auto-discovered destination bucket names'"`
+	DestEndpoint     string `name:"dest-endpoint" env:"DEST_ENDPOINT" help:"Destination S3-compatible endpoint URL (empty = AWS)"`
+	DestRegion       string `name:"dest-region" env:"DEST_REGION" default:"us-east-1" help:"Destination AWS region"`
+	DestAccessKey    string `name:"dest-access-key" env:"DEST_ACCESS_KEY" help:"Destination AWS access key ID"`
+	DestSecretKey    string `name:"dest-secret-key" env:"DEST_SECRET_KEY" help:"Destination AWS secret access key"`
+	DestBucketPrefix string `name:"dest-bucket-prefix" env:"DEST_BUCKET_PREFIX" help:"Prefix prepended to auto-discovered destination bucket names"`
 
-	BucketMappings    []string `kong:"name='bucket-mappings',env='BUCKET_MAPPINGS',help='Bucket mappings: \"name\" or \"src=dst\". Comma-separated.',sep=','"`
-	BucketMappingFile string   `kong:"name='bucket-mapping-file',env='BUCKET_MAPPING_FILE',help='Path to file with bucket mappings (one per line)'"`
-	PrefixMappings    []string `kong:"name='prefix-mappings',env='PREFIX_MAPPINGS',help='Path prefix mappings: \"bucket/src-prefix\" or \"bucket/src-prefix=dst-prefix\". Comma-separated.',sep=','"`
+	BucketMappings    []string `name:"bucket-mappings" env:"BUCKET_MAPPINGS" help:"Bucket mappings: \"name\" or \"src=dst\". Comma-separated." sep:","`
+	BucketMappingFile string   `name:"bucket-mapping-file" env:"BUCKET_MAPPING_FILE" help:"Path to file with bucket mappings (one per line)"`
+	PrefixMappings    []string `name:"prefix-mappings" env:"PREFIX_MAPPINGS" help:"Path prefix mappings: \"bucket/src-prefix\" or \"bucket/src-prefix=dst-prefix\". Comma-separated." sep:","`
 
-	RedisAddr     string `kong:"name='redis-addr',env='REDIS_ADDR',default='localhost:6379',help='Redis server address'"`
-	RedisPassword string `kong:"name='redis-password',env='REDIS_PASSWORD',help='Redis password'"`
-	RedisDB       int    `kong:"name='redis-db',env='REDIS_DB',default='0',help='Redis database number'"`
+	RedisAddr     string `name:"redis-addr" env:"REDIS_ADDR" default:"localhost:6379" help:"Redis server address"`
+	RedisPassword string `name:"redis-password" env:"REDIS_PASSWORD" help:"Redis password"`
+	RedisDB       int    `name:"redis-db" env:"REDIS_DB" default:"0" help:"Redis database number"`
 
-	Workers    int     `kong:"name='workers',env='TRANQUILA_WORKERS',default='10',help='Number of concurrent sync workers'"`
-	RateLimit  float64 `kong:"name='rate-limit',env='TRANQUILA_RATE_LIMIT',default='0',help='Max S3 requests per second (0 = unlimited)'"`
-	CheckSizes bool    `kong:"name='check-sizes',env='TRANQUILA_CHECK_SIZES',default='false',help='Re-sync objects whose destination size differs from source'"`
+	Workers    int     `name:"workers" env:"TRANQUILA_WORKERS" default:"10" help:"Number of concurrent sync workers"`
+	RateLimit  float64 `name:"rate-limit" env:"TRANQUILA_RATE_LIMIT" default:"0" help:"Max S3 requests per second (0 = unlimited)"`
+	CheckSizes bool    `name:"check-sizes" env:"TRANQUILA_CHECK_SIZES" default:"false" help:"Re-sync objects whose destination size differs from source"`
 
-	Watch         bool          `kong:"name='watch',env='TRANQUILA_WATCH',default='false',help='Continuously re-run sync until interrupted'"`
-	WatchMode     string        `kong:"name='watch-mode',env='TRANQUILA_WATCH_MODE',default='poll',enum='poll,minio,sqs',help='Watch backend: poll|minio|sqs'"`
-	WatchInterval time.Duration `kong:"name='watch-interval',env='TRANQUILA_WATCH_INTERVAL',default='60s',help='Idle time between poll cycles (poll mode only)'"`
-	SQSQueueURL   string        `kong:"name='sqs-queue-url',env='TRANQUILA_SQS_QUEUE_URL',help='SQS queue URL for S3 event notifications (sqs mode)'"`
+	Watch         bool          `name:"watch" env:"TRANQUILA_WATCH" default:"false" help:"Continuously re-run sync until interrupted"`
+	WatchMode     string        `name:"watch-mode" env:"TRANQUILA_WATCH_MODE" default:"poll" enum:"poll,minio,sqs" help:"Watch backend: poll|minio|sqs"`
+	WatchInterval time.Duration `name:"watch-interval" env:"TRANQUILA_WATCH_INTERVAL" default:"60s" help:"Idle time between poll cycles (poll mode only)"`
+	SQSQueueURL   string        `name:"sqs-queue-url" env:"TRANQUILA_SQS_QUEUE_URL" help:"SQS queue URL for S3 event notifications (sqs mode)"`
 
-	TelemetryExporter     string `kong:"name='telemetry-exporter',env='TELEMETRY_EXPORTER',default='prometheus',enum='prometheus,otlp,none',help='Metrics exporter'"`
-	TelemetryAddr         string `kong:"name='telemetry-addr',env='TELEMETRY_ADDR',default=':9090',help='Prometheus metrics listen address'"`
-	TelemetryOTLPEndpoint string `kong:"name='telemetry-otlp-endpoint',env='TELEMETRY_OTLP_ENDPOINT',help='OTLP gRPC endpoint'"`
+	TelemetryExporter     string `name:"telemetry-exporter" env:"TELEMETRY_EXPORTER" default:"prometheus" enum:"prometheus,otlp,none" help:"Metrics exporter"`
+	TelemetryAddr         string `name:"telemetry-addr" env:"TELEMETRY_ADDR" default:":8081" help:"Prometheus metrics listen address"`
+	TelemetryOTLPEndpoint string `name:"telemetry-otlp-endpoint" env:"TELEMETRY_OTLP_ENDPOINT" help:"OTLP gRPC endpoint"`
 
-	MgmtAddr string `kong:"name='mgmt-addr',env='MGMT_ADDR',default=':8080',help='Management API listen address'"`
+	MgmtAddr string `name:"mgmt-addr" env:"MGMT_ADDR" default:":8080" help:"Management API listen address"`
+
+	Buckets config.BucketMappings `name:"buckets" help:"Structured bucket mappings (from config file)"`
 }
 
 // resolveBuckets merges --bucket-mappings, --prefix-mappings, and --bucket-mapping-file
@@ -62,6 +72,26 @@ type SyncCmd struct {
 // lines with a "/" in the source part are treated as prefix mappings.
 // Returns nil when nothing is specified (signals the syncer to auto-discover).
 func (cmd *SyncCmd) resolveBuckets() (map[string]internalsync.BucketConfig, error) {
+	result := make(map[string]internalsync.BucketConfig)
+
+	// Structured buckets from config file — processed first so CLI flags can override.
+	for _, bm := range cmd.Buckets {
+		src := bm.Source.Bucket
+		if src == "" {
+			continue
+		}
+		dst := bm.Destination.Bucket
+		if dst == "" {
+			dst = src
+		}
+		result[src] = internalsync.BucketConfig{
+			Destination: dst,
+			SrcPrefix:   bm.Source.Prefix,
+			DstPrefix:   bm.Destination.Prefix,
+		}
+	}
+
+	// Legacy string-based mappings from CLI flags and mapping file.
 	var entries []string
 	entries = append(entries, cmd.BucketMappings...)
 	entries = append(entries, cmd.PrefixMappings...)
@@ -71,9 +101,6 @@ func (cmd *SyncCmd) resolveBuckets() (map[string]internalsync.BucketConfig, erro
 			return nil, err
 		}
 		entries = append(entries, fileEntries...)
-	}
-	if len(entries) == 0 {
-		return nil, nil
 	}
 
 	var bucketEntries, prefixEntries []string
@@ -90,7 +117,6 @@ func (cmd *SyncCmd) resolveBuckets() (map[string]internalsync.BucketConfig, erro
 		}
 	}
 
-	result := make(map[string]internalsync.BucketConfig)
 	for src, dst := range parseBucketMappings(bucketEntries) {
 		result[src] = internalsync.BucketConfig{Destination: dst}
 	}

@@ -1,0 +1,136 @@
+# src/dest server configured via env
+# source:
+#   endpoint: ""        # leave empty for AWS; set for S3-compatible services
+#   region: "us-east-1"
+#   access_key: ""
+#   secret_key: ""
+
+# destination:
+#   endpoint: ""
+#   region: "us-east-1"
+#   access_key: ""
+#   secret_key: ""
+sync:
+  buckets:
+    - source:
+        bucket: ausgehenderechnung
+      destination:
+        bucket: p4e-staging-ausgehenderechnung-20260320144827448200000008
+    - source:
+        bucket: deliveries
+      destination:
+        bucket: p4e-staging-deliveries-2026032014482841680000001a
+    - source:
+        bucket: deliverynotes
+      destination:
+        bucket: p4e-staging-deliverynotes-2026032014482766600000000c
+    - source:
+        bucket: events
+        prefix: 2026/1
+      destination:
+        bucket: p4e-staging-events-20260320144827421600000006
+    - source:
+        bucket: fibu-its
+      destination:
+        bucket: p4e-staging-fibu-its-20260320144828053500000014
+    - source:
+        bucket: genehmigungen
+      destination:
+        bucket: p4e-staging-genehmigungen-20260320144827365700000004
+    - source:
+        bucket: gutschrift
+      destination:
+        bucket: p4e-staging-gutschrift-20260320144828053500000015
+    - source:
+        bucket: ida-docs
+      destination:
+        bucket: p4e-staging-ida-docs-2026032014482884570000001b
+    - source:
+        bucket: iftsta
+      destination:
+        bucket: p4e-staging-iftsta-20260320144828272900000018
+    - source:
+        bucket: incoming-xmls
+      destination:
+        bucket: p4e-staging-incoming-xmls-2026032014482767750000000e
+    - source:
+        bucket: invoices
+      destination:
+        bucket: p4e-staging-invoices-20260320144828252800000016
+    - source:
+        bucket: keycloak-audit-events
+      destination:
+        bucket: p4e-staging-keycloak-audit-events-20260320144827452500000009
+    - source:
+        bucket: medifox
+      destination:
+        bucket: p4e-staging-medifox-20260320144827353800000002
+    - source:
+        bucket: my-curabox
+      destination:
+        bucket: p4e-staging-my-curabox-20260320144827764100000010
+    - source:
+        bucket: orders
+      destination:
+        bucket: p4e-staging-orders-20260320144827968300000013
+    - source:
+        bucket: playground
+      destination:
+        bucket: p4e-staging-playground-2026032014482766930000000d
+    - source:
+        bucket: produktdaten
+      destination:
+        bucket: p4e-staging-produktdaten-20260320144827316400000001
+    - source:
+        bucket: rechnung
+      destination:
+        bucket: p4e-staging-rechnung-20260320144828344200000019
+    - source:
+        bucket: returns
+      destination:
+        bucket: p4e-staging-returns-20260320144827444200000007
+    - source:
+        bucket: scans
+      destination:
+        bucket: p4e-staging-scans-20260320144827800500000012
+    - source:
+        bucket: scantest
+      destination:
+        bucket: p4e-staging-scantest-20260320144827766900000011
+    - source:
+        bucket: sftpgo
+      destination:
+        bucket: p4e-staging-sftpgo-2026032014482774900000000f
+    - source:
+        bucket: standard
+      destination:
+        bucket: p4e-staging-standard-2026032014482766080000000b
+    - source:
+        bucket: test
+      destination:
+        bucket: p4e-staging-test-20260320144828266100000017
+    - source:
+        bucket: ud-generated
+      destination:
+        bucket: p4e-staging-ud-generated-20260320144827382900000005
+    - source:
+        bucket: ud-temp
+      destination:
+        bucket: p4e-staging-ud-temp-20260320144827355000000003
+    - source:
+        bucket: ud-template
+      destination:
+        bucket: p4e-staging-ud-template-2026032014482764260000000a
+
+  redis:
+    addr: "localhost:6379"
+    password: ""
+    db: 0
+
+  telemetry:
+    exporter: "prometheus"   # prometheus | otlp | none
+    addr: ":8081"
+    otlp_endpoint: ""        # gRPC endpoint, e.g. localhost:4317
+
+  workers: 10
+  rate_limit: 5.0

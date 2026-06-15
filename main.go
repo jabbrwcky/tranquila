@@ -13,12 +13,24 @@ import (
 var version = "dev"
 
 type CLI struct {
-	ConfigFile kong.ConfigFlag  `json:"configFile" name:"configFile" short:"c" help:"Full path to a user-supplied config file"`
+	ConfigFile kong.ConfigFlag  `name:"configFile" short:"c" help:"Full path to a user-supplied config file"`
 	LogLevel   string           `name:"log-level" help:"Log level (trace,debug,info,warn,error)" env:"TRANQUILA_LOG_LEVEL" default:"info"`
 	LogJSON    bool             `name:"log-json" help:"Output logs as JSON" env:"TRANQUILA_LOG_JSON"`
-	Version    kong.VersionFlag `name:"version" short:"V" help:"Show version and exit'"`
+	Version    kong.VersionFlag `name:"version" short:"V" help:"Show version and exit"`
 	Sync       SyncCmd          `cmd:"" default:"" help:"Synchronize S3 buckets (default)"`
 	Status     StatusCmd        `cmd:"" help:"Show synchronization status"`
+}
+
+// buildParser constructs the kong parser for cli, loading YAML config from cfgPaths in order.
+// Exported for test reuse.
+func buildParser(cli *CLI, cfgPaths ...string) *kong.Kong {
+	return kong.Must(cli,
+		kong.Configuration(kongyaml.Loader, cfgPaths...),
+		kong.Name("tranquila"),
+		kong.Description("S3 bucket synchronization tool"),
+		kong.Vars{"version": version},
+		kong.ConfigureHelp(kong.HelpOptions{Compact: true}),
+	)
 }
 
 func main() {
@@ -28,12 +40,9 @@ func main() {
 	}
 
 	cli := &CLI{}
-	parser := kong.Must(cli,
-		kong.Configuration(kongyaml.Loader, filepath.Join(homeDir, ".config", "tranquila.yaml"), "tranquila.yaml"),
-		kong.Name("tranquila"),
-		kong.Description("S3 bucket synchronization tool"),
-		kong.Vars{"version": version},
-		kong.ConfigureHelp(kong.HelpOptions{Compact: true}),
+	parser := buildParser(cli,
+		filepath.Join(homeDir, ".config", "tranquila.yaml"),
+		"tranquila.yaml",
 	)
 
 	kctx, err := parser.Parse(os.Args[1:])

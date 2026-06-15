@@ -56,7 +56,12 @@ destination:
   secret_key: ""
 
 buckets: []           # source buckets to sync; empty = all buckets
-bucket_prefix: ""     # prepended to each destination bucket name
+#   - source:
+#       bucket: "my-bucket"
+#       prefix: "optional/prefix/"
+#     destination:
+#       bucket: "backup-my-bucket"
+#       prefix: "optional/destination/prefix/"
 
 redis:
   addr: "localhost:6379"
@@ -73,6 +78,8 @@ rate_limit: 0.0            # max S3 requests/sec; 0 = unlimited
 ```
 
 Specify the config file path with `--config <path>` or `TRANQUILA_CONFIG=<path>`.
+
+Structured config buckets and legacy --bucket-mappings / --prefix-mappings / --bucket-mapping-file are additive. CLI flags win on conflict (same source bucket).
 
 ### Environment Variables
 
