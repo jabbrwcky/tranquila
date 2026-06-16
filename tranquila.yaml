@@ -1,15 +1,18 @@
 # src/dest server configured via env
-# source:
-#   endpoint: ""        # leave empty for AWS; set for S3-compatible services
-#   region: "us-east-1"
-#   access-key: ""
-#   secret-key: ""
+source:
+  # endpoint: ""        # leave empty for AWS; set for S3-compatible services
+  # region: "us-east-1"
+  # access-key: ""
+  # secret-key: ""
+  rate-limit: 100     # max S3 API calls/sec; 0 = unlimited
 
 # destination:
 #   endpoint: ""
 #   region: "us-east-1"
 #   access-key: ""
 #   secret-key: ""
+#   rate-limit: 0.0
+
 sync:
   buckets:
     - source:
@@ -133,4 +136,3 @@ sync:
     otlp-endpoint: ""        # gRPC endpoint, e.g. localhost:4317
 
   workers: 10
-  rate-limit: 5.0

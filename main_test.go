@@ -32,17 +32,17 @@ sync:
     access-key: "srckey"
     secret-key: "srcsecret"
 `)
-	if sync.SourceEndpoint != "http://minio:9000" {
-		t.Errorf("SourceEndpoint = %q, want %q", sync.SourceEndpoint, "http://minio:9000")
+	if sync.Source.Endpoint != "http://minio:9000" {
+		t.Errorf("Source.Endpoint = %q, want %q", sync.Source.Endpoint, "http://minio:9000")
 	}
-	if sync.SourceRegion != "eu-west-1" {
-		t.Errorf("SourceRegion = %q, want %q", sync.SourceRegion, "eu-west-1")
+	if sync.Source.Region != "eu-west-1" {
+		t.Errorf("Source.Region = %q, want %q", sync.Source.Region, "eu-west-1")
 	}
-	if sync.SourceAccessKey != "srckey" {
-		t.Errorf("SourceAccessKey = %q, want %q", sync.SourceAccessKey, "srckey")
+	if sync.Source.AccessKey != "srckey" {
+		t.Errorf("Source.AccessKey = %q, want %q", sync.Source.AccessKey, "srckey")
 	}
-	if sync.SourceSecretKey != "srcsecret" {
-		t.Errorf("SourceSecretKey = %q, want %q", sync.SourceSecretKey, "srcsecret")
+	if sync.Source.SecretKey != "srcsecret" {
+		t.Errorf("Source.SecretKey = %q, want %q", sync.Source.SecretKey, "srcsecret")
 	}
 }
 
@@ -55,17 +55,39 @@ sync:
     access-key: "dstkey"
     secret-key: "dstsecret"
 `)
-	if sync.DestEndpoint != "http://minio-dst:9000" {
-		t.Errorf("DestEndpoint = %q, want %q", sync.DestEndpoint, "http://minio-dst:9000")
+	if sync.Destination.Endpoint != "http://minio-dst:9000" {
+		t.Errorf("Destination.Endpoint = %q, want %q", sync.Destination.Endpoint, "http://minio-dst:9000")
 	}
-	if sync.DestRegion != "us-west-2" {
-		t.Errorf("DestRegion = %q, want %q", sync.DestRegion, "us-west-2")
+	if sync.Destination.Region != "us-west-2" {
+		t.Errorf("Destination.Region = %q, want %q", sync.Destination.Region, "us-west-2")
 	}
-	if sync.DestAccessKey != "dstkey" {
-		t.Errorf("DestAccessKey = %q, want %q", sync.DestAccessKey, "dstkey")
+	if sync.Destination.AccessKey != "dstkey" {
+		t.Errorf("Destination.AccessKey = %q, want %q", sync.Destination.AccessKey, "dstkey")
 	}
-	if sync.DestSecretKey != "dstsecret" {
-		t.Errorf("DestSecretKey = %q, want %q", sync.DestSecretKey, "dstsecret")
+	if sync.Destination.SecretKey != "dstsecret" {
+		t.Errorf("Destination.SecretKey = %q, want %q", sync.Destination.SecretKey, "dstsecret")
+	}
+}
+
+func TestConfigFileSourceRateLimit(t *testing.T) {
+	sync := configFromYAML(t, `
+sync:
+  source:
+    rate-limit: 10.0
+`)
+	if sync.Source.RateLimit != 10.0 {
+		t.Errorf("Source.RateLimit = %f, want 10.0", sync.Source.RateLimit)
+	}
+}
+
+func TestConfigFileDestRateLimit(t *testing.T) {
+	sync := configFromYAML(t, `
+sync:
+  dest:
+    rate-limit: 5.0
+`)
+	if sync.Destination.RateLimit != 5.0 {
+		t.Errorf("Destination.RateLimit = %f, want 5.0", sync.Destination.RateLimit)
 	}
 }
 
@@ -92,14 +114,26 @@ func TestConfigFileSyncTuning(t *testing.T) {
 	sync := configFromYAML(t, `
 sync:
   workers: 5
-  rate-limit: 2.5
   check-sizes: true
 `)
 	if sync.Workers != 5 {
 		t.Errorf("Workers = %d, want 5", sync.Workers)
 	}
-	if sync.RateLimit != 2.5 {
-		t.Errorf("RateLimit = %f, want 2.5", sync.RateLimit)
+	if !sync.CheckSizes {
+		t.Error("CheckSizes = false, want true")
+	}
+}
+
+func TestConfigFileSyncTuningHyphenKeys(t *testing.T) {
+	// check-sizes uses hyphens in its flag name; the underscore variant
+	// (check_sizes) is silently ignored by kong-yaml.
+	sync := configFromYAML(t, `
+sync:
+  workers: 3
+  check-sizes: true
+`)
+	if sync.Workers != 3 {
+		t.Errorf("Workers = %d, want 3", sync.Workers)
 	}
 	if !sync.CheckSizes {
 		t.Error("CheckSizes = false, want true")
@@ -144,26 +178,6 @@ sync:
 	}
 	if sync.TelemetryOTLPEndpoint != "localhost:4317" {
 		t.Errorf("TelemetryOTLPEndpoint = %q, want %q", sync.TelemetryOTLPEndpoint, "localhost:4317")
-	}
-}
-
-func TestConfigFileSyncTuningHyphenKeys(t *testing.T) {
-	// rate-limit and check-sizes use hyphens in their flag names; underscore
-	// variants (rate_limit, check_sizes) are silently ignored by kong-yaml.
-	sync := configFromYAML(t, `
-sync:
-  rate-limit: 7.5
-  workers: 3
-  check-sizes: true
-`)
-	if sync.RateLimit != 7.5 {
-		t.Errorf("RateLimit = %f, want 7.5 (underscore key would silently ignore this)", sync.RateLimit)
-	}
-	if sync.Workers != 3 {
-		t.Errorf("Workers = %d, want 3", sync.Workers)
-	}
-	if !sync.CheckSizes {
-		t.Error("CheckSizes = false, want true")
 	}
 }
 
@@ -213,11 +227,11 @@ sync:
 func clearSyncEnvVars(t *testing.T) {
 	t.Helper()
 	for _, v := range []string{
-		"SOURCE_ENDPOINT", "SOURCE_REGION", "SOURCE_ACCESS_KEY", "SOURCE_SECRET_KEY",
-		"DEST_ENDPOINT", "DEST_REGION", "DEST_ACCESS_KEY", "DEST_SECRET_KEY",
+		"SOURCE_ENDPOINT", "SOURCE_REGION", "SOURCE_ACCESS_KEY", "SOURCE_SECRET_KEY", "SOURCE_RATE_LIMIT",
+		"DEST_ENDPOINT", "DEST_REGION", "DEST_ACCESS_KEY", "DEST_SECRET_KEY", "DEST_RATE_LIMIT",
 		"DEST_BUCKET_PREFIX", "BUCKET_MAPPINGS", "BUCKET_MAPPING_FILE", "PREFIX_MAPPINGS",
 		"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB",
-		"TRANQUILA_WORKERS", "TRANQUILA_RATE_LIMIT", "TRANQUILA_CHECK_SIZES",
+		"TRANQUILA_WORKERS", "TRANQUILA_CHECK_SIZES",
 		"TRANQUILA_WATCH", "TRANQUILA_WATCH_MODE", "TRANQUILA_WATCH_INTERVAL", "TRANQUILA_SQS_QUEUE_URL",
 		"TELEMETRY_EXPORTER", "TELEMETRY_ADDR", "TELEMETRY_OTLP_ENDPOINT",
 		"MGMT_ADDR",
@@ -234,11 +248,11 @@ func TestConfigFileDefaults(t *testing.T) {
 	clearSyncEnvVars(t)
 	// Empty config — verify flag defaults apply.
 	sync := configFromYAML(t, "sync: {}\n")
-	if sync.SourceRegion != "us-east-1" {
-		t.Errorf("SourceRegion default = %q, want us-east-1", sync.SourceRegion)
+	if sync.Source.Region != "us-east-1" {
+		t.Errorf("Source.Region default = %q, want us-east-1", sync.Source.Region)
 	}
-	if sync.DestRegion != "us-east-1" {
-		t.Errorf("DestRegion default = %q, want us-east-1", sync.DestRegion)
+	if sync.Destination.Region != "us-east-1" {
+		t.Errorf("Destination.Region default = %q, want us-east-1", sync.Destination.Region)
 	}
 	if sync.RedisAddr != "localhost:6379" {
 		t.Errorf("RedisAddr default = %q, want localhost:6379", sync.RedisAddr)

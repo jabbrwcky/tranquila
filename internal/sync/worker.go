@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
-	"golang.org/x/time/rate"
 )
 
 type Job struct {
@@ -34,20 +33,13 @@ type workerPool struct {
 	jobs          chan Job
 	results       chan Result
 	wg            sync.WaitGroup
-	limiter       *rate.Limiter
 	activeWorkers metric.Int64UpDownCounter
 }
 
-func newWorkerPool(ctx context.Context, n int, rateLimit float64, fn transferFn, activeWorkers metric.Int64UpDownCounter) *workerPool {
-	lim := rate.NewLimiter(rate.Inf, 0)
-	if rateLimit > 0 {
-		lim = rate.NewLimiter(rate.Limit(rateLimit), int(rateLimit)+1)
-	}
-
+func newWorkerPool(ctx context.Context, n int, fn transferFn, activeWorkers metric.Int64UpDownCounter) *workerPool {
 	p := &workerPool{
 		jobs:          make(chan Job, n*2),
 		results:       make(chan Result, n*2),
-		limiter:       lim,
 		activeWorkers: activeWorkers,
 	}
 
@@ -77,15 +69,10 @@ func (p *workerPool) runWorker(ctx context.Context, fn transferFn) {
 			}
 			continue
 		}
-		if err := p.limiter.Wait(ctx); err != nil {
-			if job.OnComplete != nil {
-				job.OnComplete()
-			}
-			continue
-		}
 		p.activeWorkers.Add(context.Background(), 1)
 		// Use background context for the transfer itself so in-flight
 		// transfers complete even after the signal context is cancelled.
+		// Rate limiting is applied inside the storage client methods.
 		start := time.Now()
 		err := fn(context.Background(), job)
 		p.activeWorkers.Add(context.Background(), -1)

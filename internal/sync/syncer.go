@@ -42,7 +42,6 @@ type Config struct {
 	Buckets            map[string]BucketConfig // src → config; nil = auto-discover all
 	DestBucketPrefix   string                  // prefix for auto-discovered destination bucket names
 	Workers            int
-	RateLimit          float64
 	CheckSizes         bool      // re-queue synced objects whose destination size differs from source
 	Progress           *Progress // optional; enables live progress tracking for the management API
 	DiscoveryBatchSize int       // max objects to discover per bucket before syncing (0 = default 100 000)
@@ -136,7 +135,7 @@ func (s *Syncer) Run(ctx context.Context) error {
 	}
 	log.Info().Strs("buckets", srcs).Msg("starting discovery")
 
-	pool := newWorkerPool(ctx, s.cfg.Workers, s.cfg.RateLimit, s.transfer, s.m.activeWorkers)
+	pool := newWorkerPool(ctx, s.cfg.Workers, s.transfer, s.m.activeWorkers)
 
 	var resultWg sync.WaitGroup
 	resultWg.Add(1)
@@ -413,7 +412,7 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 		return fmt.Errorf("start watcher: %w", err)
 	}
 
-	pool := newWorkerPool(ctx, s.cfg.Workers, s.cfg.RateLimit, s.transfer, s.m.activeWorkers)
+	pool := newWorkerPool(ctx, s.cfg.Workers, s.transfer, s.m.activeWorkers)
 
 	var resultWg sync.WaitGroup
 	resultWg.Add(1)

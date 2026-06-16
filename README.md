@@ -58,12 +58,14 @@ sync:
     region: "us-east-1"
     access-key: ""
     secret-key: ""
+    rate-limit: 0         # max S3 API calls/sec for source endpoint (0 = unlimited)
 
   dest:
     endpoint: ""
     region: "us-east-1"
     access-key: ""
     secret-key: ""
+    rate-limit: 0         # max S3 API calls/sec for destination endpoint (0 = unlimited)
     bucket-prefix: ""     # prepended to auto-discovered destination bucket names
 
   # Structured bucket mappings (preferred for multiple buckets)
@@ -85,7 +87,6 @@ sync:
     db: 0
 
   workers: 10
-  rate-limit: 0             # max S3 requests/sec; 0 = unlimited
   check-sizes: false        # re-sync if destination size differs from source
   discovery-batch-size: 100000  # objects per batch; sync drains before next batch starts
 
@@ -128,10 +129,12 @@ tranquila sync --prefix-mappings "bucket/src-prefix=dst-prefix"
 | `SOURCE_REGION`                   | `us-east-1`      | Source AWS region                                    |
 | `SOURCE_ACCESS_KEY`               |                  | Source access key ID                                 |
 | `SOURCE_SECRET_KEY`               |                  | Source secret access key                             |
+| `SOURCE_RATE_LIMIT`               | `0`              | Max S3 API calls/sec for source endpoint             |
 | `DEST_ENDPOINT`                   | _(AWS)_          | S3-compatible destination endpoint                   |
 | `DEST_REGION`                     | `us-east-1`      | Destination AWS region                               |
 | `DEST_ACCESS_KEY`                 |                  | Destination access key ID                            |
 | `DEST_SECRET_KEY`                 |                  | Destination secret access key                        |
+| `DEST_RATE_LIMIT`                 | `0`              | Max S3 API calls/sec for destination endpoint        |
 | `DEST_BUCKET_PREFIX`              |                  | Prefix prepended to destination bucket names         |
 | `BUCKET_MAPPINGS`                 |                  | Comma-separated bucket mappings (`src=dst` or `name`)|
 | `BUCKET_MAPPING_FILE`             |                  | Path to bucket mapping file                          |
@@ -140,7 +143,6 @@ tranquila sync --prefix-mappings "bucket/src-prefix=dst-prefix"
 | `REDIS_PASSWORD`                  |                  | Redis password                                       |
 | `REDIS_DB`                        | `0`              | Redis database number                                |
 | `TRANQUILA_WORKERS`               | `10`             | Number of concurrent sync workers                    |
-| `TRANQUILA_RATE_LIMIT`            | `0`              | Max S3 requests per second (0 = unlimited)           |
 | `TRANQUILA_CHECK_SIZES`           | `false`          | Re-sync objects whose destination size differs       |
 | `TRANQUILA_DISCOVERY_BATCH_SIZE`  | `100000`         | Objects per discovery batch (0 = use default)        |
 | `TRANQUILA_WATCH`                 | `false`          | Enable continuous watch mode                         |

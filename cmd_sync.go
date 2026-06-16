@@ -21,23 +21,21 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// S3Server holds connection and auth settings for one S3-compatible endpoint.
+// It is embedded in SyncCmd twice — once for source, once for destination —
+// with distinct flag and env-var prefixes applied by kong.
 type S3Server struct {
-	Endpoint  string `name:"endpoint" env:"ENDPOINT" help:"Source S3-compatible endpoint URL (empty = AWS)"`
-	Region    string
-	AccessKey string
-	SecretKey string
+	Endpoint  string  `name:"endpoint" help:"S3-compatible endpoint URL (empty = AWS)"`
+	Region    string  `name:"region" default:"us-east-1" help:"AWS region"`
+	AccessKey string  `name:"access-key" help:"AWS access key ID"`
+	SecretKey string  `name:"secret-key" help:"AWS secret access key"`
+	RateLimit float64 `name:"rate-limit" default:"0" help:"Max S3 API calls/sec (0 = unlimited)"`
 }
 
 type SyncCmd struct {
-	SourceEndpoint  string `name:"source-endpoint" env:"SOURCE_ENDPOINT" help:"Source S3-compatible endpoint URL (empty = AWS)"`
-	SourceRegion    string `name:"source-region" env:"SOURCE_REGION" default:"us-east-1" help:"Source AWS region"`
-	SourceAccessKey string `name:"source-access-key" env:"SOURCE_ACCESS_KEY" help:"Source AWS access key ID"`
-	SourceSecretKey string `name:"source-secret-key" env:"SOURCE_SECRET_KEY" help:"Source AWS secret access key"`
+	Source      S3Server `embed:"" prefix:"source-" envprefix:"SOURCE_"`
+	Destination S3Server `embed:"" prefix:"dest-" envprefix:"DEST_"`
 
-	DestEndpoint     string `name:"dest-endpoint" env:"DEST_ENDPOINT" help:"Destination S3-compatible endpoint URL (empty = AWS)"`
-	DestRegion       string `name:"dest-region" env:"DEST_REGION" default:"us-east-1" help:"Destination AWS region"`
-	DestAccessKey    string `name:"dest-access-key" env:"DEST_ACCESS_KEY" help:"Destination AWS access key ID"`
-	DestSecretKey    string `name:"dest-secret-key" env:"DEST_SECRET_KEY" help:"Destination AWS secret access key"`
 	DestBucketPrefix string `name:"dest-bucket-prefix" env:"DEST_BUCKET_PREFIX" help:"Prefix prepended to auto-discovered destination bucket names"`
 
 	BucketMappings    []string `name:"bucket-mappings" env:"BUCKET_MAPPINGS" help:"Bucket mappings: \"name\" or \"src=dst\". Comma-separated." sep:","`
@@ -48,10 +46,9 @@ type SyncCmd struct {
 	RedisPassword string `name:"redis-password" env:"REDIS_PASSWORD" help:"Redis password"`
 	RedisDB       int    `name:"redis-db" env:"REDIS_DB" default:"0" help:"Redis database number"`
 
-	Workers            int     `name:"workers" env:"TRANQUILA_WORKERS" default:"10" help:"Number of concurrent sync workers"`
-	RateLimit          float64 `name:"rate-limit" env:"TRANQUILA_RATE_LIMIT" default:"0" help:"Max S3 requests per second (0 = unlimited)"`
-	CheckSizes         bool    `name:"check-sizes" env:"TRANQUILA_CHECK_SIZES" default:"false" help:"Re-sync objects whose destination size differs from source"`
-	DiscoveryBatchSize int     `name:"discovery-batch-size" env:"TRANQUILA_DISCOVERY_BATCH_SIZE" default:"100000" help:"Objects to discover per bucket before syncing; next batch starts after sync drains (0 = default 100000)"`
+	Workers            int  `name:"workers" env:"TRANQUILA_WORKERS" default:"10" help:"Number of concurrent sync workers"`
+	CheckSizes         bool `name:"check-sizes" env:"TRANQUILA_CHECK_SIZES" default:"false" help:"Re-sync objects whose destination size differs from source"`
+	DiscoveryBatchSize int  `name:"discovery-batch-size" env:"TRANQUILA_DISCOVERY_BATCH_SIZE" default:"100000" help:"Objects to discover per bucket before syncing; next batch starts after sync drains (0 = default 100000)"`
 
 	Watch         bool          `name:"watch" env:"TRANQUILA_WATCH" default:"false" help:"Continuously re-run sync until interrupted"`
 	WatchMode     string        `name:"watch-mode" env:"TRANQUILA_WATCH_MODE" default:"poll" enum:"poll,minio,sqs" help:"Watch backend: poll|minio|sqs"`
@@ -200,12 +197,13 @@ func (cmd *SyncCmd) Run() error {
 	}
 	defer store.Close()
 
-	log.Debug().Str("endpoint", cmd.SourceEndpoint).Str("region", cmd.SourceRegion).Msg("creating source client")
+	log.Debug().Str("endpoint", cmd.Source.Endpoint).Str("region", cmd.Source.Region).Msg("creating source client")
 	src, err := storage.NewClient(ctx, storage.Config{
-		Endpoint:  cmd.SourceEndpoint,
-		Region:    cmd.SourceRegion,
-		AccessKey: cmd.SourceAccessKey,
-		SecretKey: cmd.SourceSecretKey,
+		Endpoint:  cmd.Source.Endpoint,
+		Region:    cmd.Source.Region,
+		AccessKey: cmd.Source.AccessKey,
+		SecretKey: cmd.Source.SecretKey,
+		RateLimit: cmd.Source.RateLimit,
 		Meter:     tel.Meter,
 	})
 	if err != nil {
@@ -213,10 +211,11 @@ func (cmd *SyncCmd) Run() error {
 	}
 
 	dst, err := storage.NewClient(ctx, storage.Config{
-		Endpoint:  cmd.DestEndpoint,
-		Region:    cmd.DestRegion,
-		AccessKey: cmd.DestAccessKey,
-		SecretKey: cmd.DestSecretKey,
+		Endpoint:  cmd.Destination.Endpoint,
+		Region:    cmd.Destination.Region,
+		AccessKey: cmd.Destination.AccessKey,
+		SecretKey: cmd.Destination.SecretKey,
+		RateLimit: cmd.Destination.RateLimit,
 		Meter:     tel.Meter,
 	})
 	if err != nil {
@@ -250,7 +249,6 @@ func (cmd *SyncCmd) Run() error {
 		Buckets:            bucketMap,
 		DestBucketPrefix:   cmd.DestBucketPrefix,
 		Workers:            cmd.Workers,
-		RateLimit:          cmd.RateLimit,
 		CheckSizes:         cmd.CheckSizes,
 		Progress:           progress,
 		DiscoveryBatchSize: cmd.DiscoveryBatchSize,
@@ -261,7 +259,8 @@ func (cmd *SyncCmd) Run() error {
 
 	log.Info().
 		Int("workers", cmd.Workers).
-		Float64("rate_limit", cmd.RateLimit).
+		Float64("source_rate_limit", cmd.Source.RateLimit).
+		Float64("dest_rate_limit", cmd.Destination.RateLimit).
 		Bool("watch", cmd.Watch).
 		Str("watch_mode", cmd.WatchMode).
 		Str("telemetry", cmd.TelemetryExporter).
@@ -277,10 +276,10 @@ func (cmd *SyncCmd) Run() error {
 			runErr = syncer.RunWatch(ctx, cmd.WatchInterval)
 		case "minio":
 			w, err := watcher.NewMinIO(watcher.MinIOConfig{
-				Endpoint:  cmd.SourceEndpoint,
-				AccessKey: cmd.SourceAccessKey,
-				SecretKey: cmd.SourceSecretKey,
-				Secure:    strings.HasPrefix(cmd.SourceEndpoint, "https://"),
+				Endpoint:  cmd.Source.Endpoint,
+				AccessKey: cmd.Source.AccessKey,
+				SecretKey: cmd.Source.SecretKey,
+				Secure:    strings.HasPrefix(cmd.Source.Endpoint, "https://"),
 			})
 			if err != nil {
 				return fmt.Errorf("create minio watcher: %w", err)
@@ -289,9 +288,9 @@ func (cmd *SyncCmd) Run() error {
 		case "sqs":
 			w, err := watcher.NewSQS(watcher.SQSConfig{
 				QueueURL:  cmd.SQSQueueURL,
-				Region:    cmd.SourceRegion,
-				AccessKey: cmd.SourceAccessKey,
-				SecretKey: cmd.SourceSecretKey,
+				Region:    cmd.Source.Region,
+				AccessKey: cmd.Source.AccessKey,
+				SecretKey: cmd.Source.SecretKey,
 			})
 			if err != nil {
 				return fmt.Errorf("create sqs watcher: %w", err)

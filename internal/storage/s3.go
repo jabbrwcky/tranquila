@@ -19,6 +19,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"golang.org/x/time/rate"
 )
 
 type Config struct {
@@ -26,6 +27,7 @@ type Config struct {
 	Region    string
 	AccessKey string
 	SecretKey string
+	RateLimit float64     // max S3 API calls/sec for this client; 0 = unlimited
 	Meter     metric.Meter // optional; zero value produces no-op instruments
 }
 
@@ -42,10 +44,11 @@ type clientMetrics struct {
 }
 
 type Client struct {
-	s3     *s3.Client
-	tm     *transfermanager.Client
-	region string
-	m      clientMetrics
+	s3      *s3.Client
+	tm      *transfermanager.Client
+	region  string
+	limiter *rate.Limiter // nil = unlimited
+	m       clientMetrics
 }
 
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
@@ -81,12 +84,28 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("init s3 metrics: %w", err)
 	}
 
+	var lim *rate.Limiter
+	if cfg.RateLimit > 0 {
+		// Burst of 1 enforces strict per-call pacing with no token accumulation.
+		lim = rate.NewLimiter(rate.Limit(cfg.RateLimit), 1)
+	}
+
 	return &Client{
-		s3:     s3c,
-		tm:     transfermanager.New(s3c),
-		region: cfg.Region,
-		m:      clientMetrics{opDuration: opDuration},
+		s3:      s3c,
+		tm:      transfermanager.New(s3c),
+		region:  cfg.Region,
+		limiter: lim,
+		m:       clientMetrics{opDuration: opDuration},
 	}, nil
+}
+
+// wait blocks until the rate limiter allows the next S3 API call.
+// No-op when RateLimit is 0 (unlimited).
+func (c *Client) wait(ctx context.Context) error {
+	if c.limiter == nil {
+		return nil
+	}
+	return c.limiter.Wait(ctx)
 }
 
 // recordOp records a completed S3 API call with operation name, bucket, success flag, and duration.
@@ -104,6 +123,9 @@ func (c *Client) recordOp(ctx context.Context, op, bucket string, start time.Tim
 }
 
 func (c *Client) ListBuckets(ctx context.Context) ([]string, error) {
+	if err := c.wait(ctx); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	out, err := c.s3.ListBuckets(ctx, &s3.ListBucketsInput{})
 	c.recordOp(ctx, "ListBuckets", "", start, err)
@@ -265,6 +287,9 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 	bucket := aws.ToString(input.Bucket)
 	var err error
 	for attempt := 0; attempt < listMaxRetries; attempt++ {
+		if err = c.wait(ctx); err != nil {
+			return nil, err
+		}
 		start := time.Now()
 		var out *s3.ListObjectsV2Output
 		out, err = c.s3.ListObjectsV2(ctx, input)
@@ -305,6 +330,9 @@ func isTransientErr(err error) bool {
 }
 
 func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
+	if err := c.wait(ctx); err != nil {
+		return err
+	}
 	start := time.Now()
 	_, err := c.s3.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(bucket)})
 	c.recordOp(ctx, "HeadBucket", bucket, start, err)
@@ -312,6 +340,9 @@ func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
 		return nil
 	}
 
+	if err := c.wait(ctx); err != nil {
+		return err
+	}
 	input := &s3.CreateBucketInput{Bucket: aws.String(bucket)}
 	if c.region != "" && c.region != "us-east-1" {
 		input.CreateBucketConfiguration = &s3types.CreateBucketConfiguration{
@@ -334,6 +365,9 @@ func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
 }
 
 func (c *Client) HeadObject(ctx context.Context, bucket, key string) (int64, error) {
+	if err := c.wait(ctx); err != nil {
+		return 0, err
+	}
 	start := time.Now()
 	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
@@ -347,6 +381,9 @@ func (c *Client) HeadObject(ctx context.Context, bucket, key string) (int64, err
 }
 
 func (c *Client) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, int64, error) {
+	if err := c.wait(ctx); err != nil {
+		return nil, 0, err
+	}
 	start := time.Now()
 	out, err := c.tm.GetObject(ctx, &transfermanager.GetObjectInput{
 		Bucket: aws.String(bucket),
@@ -360,6 +397,9 @@ func (c *Client) GetObject(ctx context.Context, bucket, key string) (io.ReadClos
 }
 
 func (c *Client) PutObject(ctx context.Context, bucket, key string, body io.Reader, size int64) error {
+	if err := c.wait(ctx); err != nil {
+		return err
+	}
 	start := time.Now()
 	_, err := c.tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		Bucket:            aws.String(bucket),
