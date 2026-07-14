@@ -107,6 +107,12 @@ func (s *Store) MarkFailed(ctx context.Context, bucket, key string) error {
 	return s.client.HSet(ctx, objKey(bucket, key), "status", StatusFailed).Err()
 }
 
+// RemoveObject deletes the tracking record for an object that has been fully
+// processed in burn-after-reading mode (source object deleted from source bucket).
+func (s *Store) RemoveObject(ctx context.Context, bucket, key string) error {
+	return s.client.Del(ctx, objKey(bucket, key)).Err()
+}
+
 func (s *Store) MarkPending(ctx context.Context, bucket, key string, modifiedAt time.Time) error {
 	return s.client.HSet(ctx, objKey(bucket, key), map[string]interface{}{
 		"status":      StatusPending,

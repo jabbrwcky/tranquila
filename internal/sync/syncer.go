@@ -211,15 +211,22 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 
 		for _, obj := range page {
 			totalCount++
-			needsSync, err := s.needsSync(ctx, bucket, obj, cfg)
+			needsFullSync, err := s.needsSync(ctx, bucket, obj, cfg)
 			if err != nil {
 				logger.Warn().Err(err).Str("key", obj.Key).Msg("state check failed, marking pending")
-				needsSync = true
+				needsFullSync = true
 			}
-			if !needsSync {
+
+			// For non-BAR buckets: skip objects that don't need sync.
+			// For BAR buckets: even already-synced objects need verify-and-delete
+			// (source was not deleted when the bucket was previously in normal mode).
+			if !needsFullSync && !cfg.BurnAfterReading {
 				continue
 			}
-			if s.cfg.State != nil {
+
+			verifyAndDelete := !needsFullSync // already-synced; skip re-upload, just verify+delete
+
+			if needsFullSync && s.cfg.State != nil {
 				if err := s.cfg.State.MarkPending(ctx, bucket, obj.Key, obj.ModifiedAt); err != nil {
 					return fmt.Errorf("mark pending %s: %w", obj.Key, err)
 				}
@@ -237,6 +244,7 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 				OnComplete:       batchDone.Done,
 				BurnAfterReading: cfg.BurnAfterReading,
 				DryRun:           s.cfg.DryRun,
+				VerifyAndDelete:  verifyAndDelete,
 			})
 		}
 
@@ -341,7 +349,13 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 				Str("size", humanize.Bytes(uint64(r.Job.Size))).
 				Dur("duration", r.Duration).
 				Msg("transfer complete")
-			_ = s.cfg.State.MarkSynced(ctx, r.Job.SrcBucket, r.Job.Key)
+			// BAR (non-dry-run): source was deleted — remove the tracking record so
+			// BucketStats stays accurate and future runs don't encounter stale entries.
+			if r.Job.BurnAfterReading && !r.Job.DryRun {
+				_ = s.cfg.State.RemoveObject(ctx, r.Job.SrcBucket, r.Job.Key)
+			} else {
+				_ = s.cfg.State.MarkSynced(ctx, r.Job.SrcBucket, r.Job.Key)
+			}
 			s.m.synced.Add(ctx, 1, metric.WithAttributes(attrs...))
 			s.m.bytesTransferred.Add(ctx, r.Job.Size, metric.WithAttributes(attrs...))
 			s.m.duration.Record(ctx, r.Duration.Seconds(), metric.WithAttributes(attrs...))
@@ -457,6 +471,12 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 }
 
 func (s *Syncer) transfer(ctx context.Context, job Job) error {
+	// VerifyAndDelete: object was already synced before BAR mode was enabled.
+	// Skip re-upload; confirm destination still has it (size check), then delete source.
+	if job.VerifyAndDelete {
+		return performVerifyAndDelete(ctx, job, s.cfg.Destination, s.cfg.Source)
+	}
+
 	body, srcSize, err := s.cfg.Source.GetObject(ctx, job.SrcBucket, job.Key)
 	if err != nil {
 		return err
@@ -489,6 +509,45 @@ func (s *Syncer) transfer(ctx context.Context, job Job) error {
 // objectDeleter is the narrow interface that performBurnAfterReading needs from the source client.
 type objectDeleter interface {
 	DeleteObject(ctx context.Context, bucket, key string) error
+}
+
+// destinationVerifier is the narrow interface that performVerifyAndDelete needs from the destination client.
+type destinationVerifier interface {
+	HeadObject(ctx context.Context, bucket, key string) (size int64, checksumCRC32 string, err error)
+}
+
+// performVerifyAndDelete handles the verify-and-delete path for objects that were already synced
+// before burn-after-reading mode was enabled. It confirms the destination still has the object
+// (existence + size check), then deletes from source. No re-upload is performed.
+func performVerifyAndDelete(ctx context.Context, job Job, dst destinationVerifier, src objectDeleter) error {
+	dstSize, _, err := dst.HeadObject(ctx, job.DstBucket, job.DstKey)
+	if err != nil {
+		return fmt.Errorf("burn-after-reading verify: destination check %s/%s: %w", job.DstBucket, job.DstKey, err)
+	}
+	if job.Size > 0 && dstSize != job.Size {
+		return fmt.Errorf("burn-after-reading verify: size mismatch %s/%s: expected=%d got=%d",
+			job.DstBucket, job.DstKey, job.Size, dstSize)
+	}
+	log.Info().
+		Str("bucket", job.SrcBucket).
+		Str("key", job.Key).
+		Int64("size", dstSize).
+		Msg("burn-after-reading: destination verified")
+	if job.DryRun {
+		log.Info().
+			Str("bucket", job.SrcBucket).
+			Str("key", job.Key).
+			Msg("burn-after-reading: DRY-RUN would delete source object")
+		return nil
+	}
+	if err := src.DeleteObject(ctx, job.SrcBucket, job.Key); err != nil {
+		return fmt.Errorf("burn-after-reading: delete source %s/%s: %w", job.SrcBucket, job.Key, err)
+	}
+	log.Info().
+		Str("bucket", job.SrcBucket).
+		Str("key", job.Key).
+		Msg("burn-after-reading: source object deleted")
+	return nil
 }
 
 // performBurnAfterReading verifies destination integrity and deletes the source object.

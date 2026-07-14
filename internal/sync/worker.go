@@ -21,6 +21,7 @@ type Job struct {
 	OnComplete       func()
 	BurnAfterReading bool // delete source object after verified sync
 	DryRun           bool // log planned deletions without executing them
+	VerifyAndDelete  bool // skip upload; only verify destination presence + delete source (BAR for already-synced objects)
 }
 
 type Result struct {
