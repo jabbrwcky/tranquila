@@ -16,6 +16,8 @@ type Config struct {
 	Addr     string
 	State    *state.Store
 	Progress *internalsync.Progress
+	// Ready checks readiness dependencies. If nil, defaults to State.Ping.
+	Ready func(ctx context.Context) error
 }
 
 // Server is the HTTP management API server.
@@ -23,12 +25,18 @@ type Server struct {
 	srv      *http.Server
 	state    *state.Store
 	progress *internalsync.Progress
+	ready    func(ctx context.Context) error
 }
 
 // NewServer creates a Server and registers all routes. Call ListenAndServe to start.
 func NewServer(cfg Config) *Server {
-	s := &Server{state: cfg.State, progress: cfg.Progress}
+	s := &Server{state: cfg.State, progress: cfg.Progress, ready: cfg.Ready}
+	if s.ready == nil && cfg.State != nil {
+		s.ready = cfg.State.Ping
+	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.HandleFunc("GET /api/v1/buckets", s.listBuckets)
 	mux.HandleFunc("GET /api/v1/buckets/{name}", s.getBucket)
 	mux.HandleFunc("GET /api/v1/sync", s.getSyncStatus)
@@ -137,6 +145,27 @@ func (s *Server) bucketStatus(ctx context.Context, name string, snap internalsyn
 }
 
 // ── handlers ─────────────────────────────────────────────────────────────────
+
+// healthz is the liveness probe: returns 200 whenever the process is serving
+// HTTP. It intentionally checks no dependencies — an unreachable Redis must not
+// trigger a pod restart.
+func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// readyz is the readiness probe: verifies the API's dependencies (Redis) are
+// reachable so traffic is only routed to pods that can serve requests.
+func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if s.ready != nil {
+		if err := s.ready(ctx); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable", "error": err.Error()})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
 
 func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
