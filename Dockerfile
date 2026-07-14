@@ -7,7 +7,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /tranquila .
 
-FROM gcr.io/distroless/static-debian12@sha256:22fd79fd75eab2372585b44517f8a094349938919dc613aafc37e4bdc9967c82
+FROM gcr.io/distroless/static-debian13
 COPY --from=builder /tranquila /tranquila
 
 ENTRYPOINT ["/tranquila", "sync"]
