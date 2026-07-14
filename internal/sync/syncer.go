@@ -21,9 +21,10 @@ const defaultDiscoveryBatchSize = 100_000
 
 // BucketConfig holds destination routing and path-prefix configuration for a source bucket.
 type BucketConfig struct {
-	Destination string // destination bucket name
-	SrcPrefix   string // list/filter prefix applied when scanning the source; empty = all objects
-	DstPrefix   string // replaces SrcPrefix in the destination key; empty = keep original key
+	Destination      string // destination bucket name
+	SrcPrefix        string // list/filter prefix applied when scanning the source; empty = all objects
+	DstPrefix        string // replaces SrcPrefix in the destination key; empty = keep original key
+	BurnAfterReading bool   // delete source object after verified sync
 }
 
 // destKey returns the destination object key for srcKey, applying prefix replacement when configured.
@@ -43,6 +44,7 @@ type Config struct {
 	DestBucketPrefix   string                  // prefix for auto-discovered destination bucket names
 	Workers            int
 	CheckSizes         bool      // re-queue synced objects whose destination size differs from source
+	DryRun             bool      // log planned burn-after-reading deletions without executing them
 	Progress           *Progress // optional; enables live progress tracking for the management API
 	DiscoveryBatchSize int       // max objects to discover per bucket before syncing (0 = default 100 000)
 }
@@ -226,13 +228,15 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 			batchPending++
 			batchDone.Add(1)
 			pool.submit(Job{
-				SrcBucket:  bucket,
-				DstBucket:  cfg.Destination,
-				Key:        obj.Key,
-				DstKey:     cfg.destKey(obj.Key),
-				Size:       obj.Size,
-				ModifiedAt: obj.ModifiedAt,
-				OnComplete: batchDone.Done,
+				SrcBucket:        bucket,
+				DstBucket:        cfg.Destination,
+				Key:              obj.Key,
+				DstKey:           cfg.destKey(obj.Key),
+				Size:             obj.Size,
+				ModifiedAt:       obj.ModifiedAt,
+				OnComplete:       batchDone.Done,
+				BurnAfterReading: cfg.BurnAfterReading,
+				DryRun:           s.cfg.DryRun,
 			})
 		}
 
@@ -304,7 +308,7 @@ func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Objec
 	}
 	// Optionally verify destination size matches source to catch incomplete uploads.
 	if s.cfg.CheckSizes && obj.Size > 0 {
-		dstSize, err := s.cfg.Destination.HeadObject(ctx, cfg.Destination, cfg.destKey(obj.Key))
+		dstSize, _, err := s.cfg.Destination.HeadObject(ctx, cfg.Destination, cfg.destKey(obj.Key))
 		if err != nil {
 			// Object missing or inaccessible on destination — re-sync.
 			return true, nil
@@ -436,12 +440,14 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 			}
 		}
 		pool.submit(Job{
-			SrcBucket:  event.Bucket,
-			DstBucket:  bc.Destination,
-			Key:        event.Key,
-			DstKey:     bc.destKey(event.Key),
-			Size:       event.Size,
-			ModifiedAt: event.ModifiedAt,
+			SrcBucket:        event.Bucket,
+			DstBucket:        bc.Destination,
+			Key:              event.Key,
+			DstKey:           bc.destKey(event.Key),
+			Size:             event.Size,
+			ModifiedAt:       event.ModifiedAt,
+			BurnAfterReading: bc.BurnAfterReading,
+			DryRun:           s.cfg.DryRun,
 		})
 	}
 
@@ -458,22 +464,64 @@ func (s *Syncer) transfer(ctx context.Context, job Job) error {
 	defer body.Close()
 
 	job.Size = srcSize
-	if err := s.cfg.Destination.PutObject(ctx, job.DstBucket, job.DstKey, body, srcSize); err != nil {
+	uploadCRC32, err := s.cfg.Destination.PutObject(ctx, job.DstBucket, job.DstKey, body, srcSize)
+	if err != nil {
 		return err
 	}
 
-	// Verify destination size matches source to catch silent data-loss during upload.
-	// Skip when srcSize is unknown (server did not provide Content-Length).
-	if srcSize > 0 {
-		dstSize, err := s.cfg.Destination.HeadObject(ctx, job.DstBucket, job.DstKey)
-		if err != nil {
-			return fmt.Errorf("verify %s/%s: %w", job.DstBucket, job.DstKey, err)
-		}
-		if dstSize != srcSize {
-			return fmt.Errorf("size mismatch for %s/%s: source=%d destination=%d",
-				job.DstBucket, job.DstKey, srcSize, dstSize)
-		}
+	// Verify destination size and capture stored CRC32 for burn-after-reading.
+	// Skip size check when srcSize is unknown (server did not provide Content-Length).
+	dstSize, storedCRC32, err := s.cfg.Destination.HeadObject(ctx, job.DstBucket, job.DstKey)
+	if err != nil {
+		return fmt.Errorf("verify %s/%s: %w", job.DstBucket, job.DstKey, err)
+	}
+	if srcSize > 0 && dstSize != srcSize {
+		return fmt.Errorf("size mismatch for %s/%s: source=%d destination=%d",
+			job.DstBucket, job.DstKey, srcSize, dstSize)
 	}
 
+	if !job.BurnAfterReading {
+		return nil
+	}
+	return performBurnAfterReading(ctx, job, s.cfg.Source, uploadCRC32, storedCRC32)
+}
+
+// objectDeleter is the narrow interface that performBurnAfterReading needs from the source client.
+type objectDeleter interface {
+	DeleteObject(ctx context.Context, bucket, key string) error
+}
+
+// performBurnAfterReading verifies destination integrity and deletes the source object.
+// Both CRC32 values come from S3's own computation (upload response and stored value).
+// Safe-by-default: if either is empty (object stored without a checksum algorithm) the
+// delete is refused so data is never silently lost.
+func performBurnAfterReading(ctx context.Context, job Job, src objectDeleter, uploadCRC32, storedCRC32 string) error {
+	checksumMatch := uploadCRC32 != "" && storedCRC32 != "" && uploadCRC32 == storedCRC32
+	log.Info().
+		Str("bucket", job.SrcBucket).
+		Str("key", job.Key).
+		Str("upload_crc32", uploadCRC32).
+		Str("stored_crc32", storedCRC32).
+		Bool("checksum_match", checksumMatch).
+		Msg("burn-after-reading: checksum verification")
+
+	if job.DryRun {
+		log.Info().
+			Str("bucket", job.SrcBucket).
+			Str("key", job.Key).
+			Msg("burn-after-reading: DRY-RUN would delete source object")
+		return nil
+	}
+	if !checksumMatch {
+		return fmt.Errorf("burn-after-reading: checksum mismatch for %s/%s (upload=%q stored=%q), refusing to delete source",
+			job.SrcBucket, job.Key, uploadCRC32, storedCRC32)
+	}
+	if err := src.DeleteObject(ctx, job.SrcBucket, job.Key); err != nil {
+		return fmt.Errorf("burn-after-reading: delete source %s/%s: %w", job.SrcBucket, job.Key, err)
+	}
+	log.Info().
+		Str("bucket", job.SrcBucket).
+		Str("key", job.Key).
+		Msg("burn-after-reading: source object deleted")
 	return nil
 }

@@ -18,7 +18,9 @@ type Job struct {
 	// OnComplete is called exactly once after the job is either transferred,
 	// failed, or skipped due to context cancellation. Used by discoverAndSyncBucket
 	// to wait for a batch to drain before continuing discovery.
-	OnComplete func()
+	OnComplete       func()
+	BurnAfterReading bool // delete source object after verified sync
+	DryRun           bool // log planned deletions without executing them
 }
 
 type Result struct {

@@ -48,6 +48,7 @@ type SyncCmd struct {
 
 	Workers            int  `name:"workers" env:"TRANQUILA_WORKERS" default:"10" help:"Number of concurrent sync workers"`
 	CheckSizes         bool `name:"check-sizes" env:"TRANQUILA_CHECK_SIZES" default:"false" help:"Re-sync objects whose destination size differs from source"`
+	DryRun             bool `name:"dry-run" env:"TRANQUILA_DRY_RUN" default:"false" help:"Log planned burn-after-reading deletions without executing them"`
 	DiscoveryBatchSize int  `name:"discovery-batch-size" env:"TRANQUILA_DISCOVERY_BATCH_SIZE" default:"100000" help:"Objects to discover per bucket before syncing; next batch starts after sync drains (0 = default 100000)"`
 
 	Watch         bool          `name:"watch" env:"TRANQUILA_WATCH" default:"false" help:"Continuously re-run sync until interrupted"`
@@ -83,9 +84,10 @@ func (cmd *SyncCmd) resolveBuckets() (map[string]internalsync.BucketConfig, erro
 			dst = src
 		}
 		result[src] = internalsync.BucketConfig{
-			Destination: dst,
-			SrcPrefix:   bm.Source.Prefix,
-			DstPrefix:   bm.Destination.Prefix,
+			Destination:      dst,
+			SrcPrefix:        bm.Source.Prefix,
+			DstPrefix:        bm.Destination.Prefix,
+			BurnAfterReading: bm.BurnAfterReading,
 		}
 	}
 
@@ -250,6 +252,7 @@ func (cmd *SyncCmd) Run() error {
 		DestBucketPrefix:   cmd.DestBucketPrefix,
 		Workers:            cmd.Workers,
 		CheckSizes:         cmd.CheckSizes,
+		DryRun:             cmd.DryRun,
 		Progress:           progress,
 		DiscoveryBatchSize: cmd.DiscoveryBatchSize,
 	})
@@ -261,6 +264,7 @@ func (cmd *SyncCmd) Run() error {
 		Int("workers", cmd.Workers).
 		Float64("source_rate_limit", cmd.Source.RateLimit).
 		Float64("dest_rate_limit", cmd.Destination.RateLimit).
+		Bool("dry_run", cmd.DryRun).
 		Bool("watch", cmd.Watch).
 		Str("watch_mode", cmd.WatchMode).
 		Str("telemetry", cmd.TelemetryExporter).

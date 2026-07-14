@@ -136,3 +136,4 @@ sync:
     otlp-endpoint: ""        # gRPC endpoint, e.g. localhost:4317
 
   workers: 10
+  # dry-run: false       # set true to log planned burn-after-reading deletions without executing them

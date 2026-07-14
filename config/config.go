@@ -15,8 +15,9 @@ type BucketEndpoint struct {
 
 // BucketMapping pairs a source bucket/prefix with a destination bucket/prefix.
 type BucketMapping struct {
-	Source      BucketEndpoint `yaml:"source"`
-	Destination BucketEndpoint `yaml:"destination"`
+	Source           BucketEndpoint `yaml:"source"`
+	Destination      BucketEndpoint `yaml:"destination"`
+	BurnAfterReading bool           `yaml:"burn-after-reading"`
 }
 
 // BucketMappings is a slice of BucketMapping that implements kong.MapperValue

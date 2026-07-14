@@ -364,20 +364,24 @@ func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
 	return nil
 }
 
-func (c *Client) HeadObject(ctx context.Context, bucket, key string) (int64, error) {
+// HeadObject returns the content length and CRC32 checksum of an object.
+// The CRC32 is populated only when the object was stored with a checksum algorithm;
+// it is empty string otherwise.
+func (c *Client) HeadObject(ctx context.Context, bucket, key string) (size int64, checksumCRC32 string, err error) {
 	if err := c.wait(ctx); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	start := time.Now()
 	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
+		Bucket:       aws.String(bucket),
+		Key:          aws.String(key),
+		ChecksumMode: s3types.ChecksumModeEnabled,
 	})
 	c.recordOp(ctx, "HeadObject", bucket, start, err)
 	if err != nil {
-		return 0, fmt.Errorf("head object %s/%s: %w", bucket, key, err)
+		return 0, "", fmt.Errorf("head object %s/%s: %w", bucket, key, err)
 	}
-	return aws.ToInt64(out.ContentLength), nil
+	return aws.ToInt64(out.ContentLength), aws.ToString(out.ChecksumCRC32), nil
 }
 
 func (c *Client) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, int64, error) {
@@ -396,12 +400,14 @@ func (c *Client) GetObject(ctx context.Context, bucket, key string) (io.ReadClos
 	return io.NopCloser(out.Body), aws.ToInt64(out.ContentLength), nil
 }
 
-func (c *Client) PutObject(ctx context.Context, bucket, key string, body io.Reader, size int64) error {
+// PutObject uploads body to bucket/key using CRC32 checksum validation.
+// Returns the base64-encoded CRC32 checksum from the upload response (empty if unavailable).
+func (c *Client) PutObject(ctx context.Context, bucket, key string, body io.Reader, size int64) (checksumCRC32 string, err error) {
 	if err := c.wait(ctx); err != nil {
-		return err
+		return "", err
 	}
 	start := time.Now()
-	_, err := c.tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
+	out, err := c.tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		Bucket:            aws.String(bucket),
 		Key:               aws.String(key),
 		Body:              body,
@@ -409,7 +415,24 @@ func (c *Client) PutObject(ctx context.Context, bucket, key string, body io.Read
 	})
 	c.recordOp(ctx, "PutObject", bucket, start, err)
 	if err != nil {
-		return fmt.Errorf("put object %s/%s: %w", bucket, key, err)
+		return "", fmt.Errorf("put object %s/%s: %w", bucket, key, err)
+	}
+	return aws.ToString(out.ChecksumCRC32), nil
+}
+
+// DeleteObject removes an object from bucket. Returns nil if the object does not exist.
+func (c *Client) DeleteObject(ctx context.Context, bucket, key string) error {
+	if err := c.wait(ctx); err != nil {
+		return err
+	}
+	start := time.Now()
+	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	c.recordOp(ctx, "DeleteObject", bucket, start, err)
+	if err != nil {
+		return fmt.Errorf("delete object %s/%s: %w", bucket, key, err)
 	}
 	return nil
 }

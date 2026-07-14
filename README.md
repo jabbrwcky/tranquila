@@ -106,6 +106,30 @@ sync:
 
 **Note:** underscores in YAML keys (e.g. `access_key`) are not equivalent to hyphens — use hyphens to match flag names.
 
+#### Burn-After-Reading
+
+Set `burn-after-reading: true` on any bucket mapping to delete source objects after they are successfully synced and verified:
+
+```yaml
+sync:
+  buckets:
+    - source:
+        bucket: staging-uploads
+      destination:
+        bucket: archive-uploads
+      burn-after-reading: true
+```
+
+**Verification:** after each upload, tranquila compares the CRC32 checksum returned by the S3 upload response with the CRC32 stored by S3 (retrieved via `HeadObject`). If either value is absent or the checksums do not match, the source object is **not** deleted and the job is marked failed for retry.
+
+**Dry-run mode:** pass `--dry-run` (or set `TRANQUILA_DRY_RUN=true`) to log what would be deleted without actually removing anything:
+
+```shell
+tranquila sync --dry-run -c tranquila.yaml
+```
+
+Dry-run logs include the object key, CRC32 comparison result, and the planned deletion for every object that would be removed.
+
 #### Bucket mappings via CLI / file
 
 Legacy string-based mappings are also supported and additive with structured config. CLI flags win on conflict (same source bucket):
@@ -144,6 +168,7 @@ tranquila sync --prefix-mappings "bucket/src-prefix=dst-prefix"
 | `REDIS_DB`                        | `0`              | Redis database number                                |
 | `TRANQUILA_WORKERS`               | `10`             | Number of concurrent sync workers                    |
 | `TRANQUILA_CHECK_SIZES`           | `false`          | Re-sync objects whose destination size differs       |
+| `TRANQUILA_DRY_RUN`               | `false`          | Log planned burn-after-reading deletions, no delete  |
 | `TRANQUILA_DISCOVERY_BATCH_SIZE`  | `100000`         | Objects per discovery batch (0 = use default)        |
 | `TRANQUILA_WATCH`                 | `false`          | Enable continuous watch mode                         |
 | `TRANQUILA_WATCH_MODE`            | `poll`           | Watch backend: `poll`, `minio`, or `sqs`             |
