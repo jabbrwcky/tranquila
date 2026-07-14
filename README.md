@@ -254,6 +254,33 @@ A lightweight HTTP API is available at `http://localhost:8080` while sync is run
 | `GET /api/v1/buckets`        | List all buckets with Redis state statistics  |
 | `GET /api/v1/buckets/{name}` | Per-bucket statistics with live progress      |
 | `GET /api/v1/sync`           | Overall sync run progress                     |
+| `GET /healthz`               | Liveness probe (always 200 while serving)     |
+| `GET /readyz`                | Readiness probe (200 ready / 503 Redis down)  |
+
+`/healthz` is a **liveness** probe: it returns `200 {"status":"ok"}` whenever the process
+is serving HTTP and checks no dependencies — so a temporarily unreachable Redis will not
+cause a pod restart. `/readyz` is a **readiness** probe: it pings Redis and returns
+`200 {"status":"ok"}` when reachable or `503 {"status":"unavailable","error":...}` when
+not, so traffic is only routed to pods that can serve requests.
+
+#### Kubernetes probes
+
+Point both probes at the management API port (from `--mgmt-addr`, default `8080`):
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```
 
 ## Build
 
