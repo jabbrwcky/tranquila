@@ -59,6 +59,11 @@ func (s *Store) Close() error {
 	return s.client.Close()
 }
 
+// Ping verifies the Redis connection is alive.
+func (s *Store) Ping(ctx context.Context) error {
+	return s.client.Ping(ctx).Err()
+}
+
 func objKey(bucket, key string) string {
 	return "tranquila:obj:" + bucket + ":" + key
 }

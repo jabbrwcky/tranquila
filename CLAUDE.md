@@ -12,7 +12,7 @@
 | Watchers | `internal/watcher/` | `Watcher` interface + poll/MinIO/SQS implementations. |
 | Storage | `internal/storage/` | `aws-sdk-go-v2` + transfermanager. Works with any S3-compatible endpoint. |
 | State | `internal/state/` | Redis. Keys: `tranquila:obj:{bucket}:{key}`, `tranquila:collection:{bucket}`. |
-| API | `internal/api/` | Management HTTP API. `/api/v1/buckets`, `/api/v1/sync`. |
+| API | `internal/api/` | Management HTTP API. `/api/v1/buckets`, `/api/v1/sync`. K8s probes: `/healthz` (liveness), `/readyz` (readiness, pings Redis). |
 
 ## Implemented Features
 

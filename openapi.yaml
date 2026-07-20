@@ -12,6 +12,44 @@ servers:
     description: Default local management server
 
 paths:
+  /healthz:
+    get:
+      operationId: livenessProbe
+      summary: Liveness probe
+      description: >
+        Returns 200 whenever the process is serving HTTP. Checks no external
+        dependencies, so an unreachable Redis does not fail this probe (that is
+        the readiness probe's job). Intended for a Kubernetes livenessProbe.
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /readyz:
+    get:
+      operationId: readinessProbe
+      summary: Readiness probe
+      description: >
+        Verifies the API's dependencies (Redis) are reachable. Returns 200 when
+        ready to serve requests and 503 when a dependency is unavailable.
+        Intended for a Kubernetes readinessProbe.
+      responses:
+        "200":
+          description: Ready to serve requests
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          description: A dependency is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
   /api/v1/buckets:
     get:
       operationId: listBuckets
@@ -165,6 +203,17 @@ components:
           description: Status of each bucket that is part of the active sync run
           items:
             $ref: "#/components/schemas/BucketStatus"
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          description: '"ok" when healthy/ready, "unavailable" when a dependency is down'
+        error:
+          type: string
+          description: Present only when status is "unavailable"
 
     Error:
       type: object
