@@ -73,7 +73,7 @@ func collKey(bucket string) string {
 }
 
 func (s *Store) UpsertObject(ctx context.Context, bucket, key string, obj ObjectState) error {
-	fields := map[string]interface{}{
+	fields := map[string]any{
 		"status":      obj.Status,
 		"modified_at": obj.ModifiedAt.UTC().Format(time.RFC3339Nano),
 	}
@@ -102,7 +102,7 @@ func (s *Store) GetObject(ctx context.Context, bucket, key string) (*ObjectState
 }
 
 func (s *Store) MarkSynced(ctx context.Context, bucket, key string) error {
-	return s.client.HSet(ctx, objKey(bucket, key), map[string]interface{}{
+	return s.client.HSet(ctx, objKey(bucket, key), map[string]any{
 		"status":    StatusSynced,
 		"synced_at": time.Now().UTC().Format(time.RFC3339Nano),
 	}).Err()
@@ -119,7 +119,7 @@ func (s *Store) RemoveObject(ctx context.Context, bucket, key string) error {
 }
 
 func (s *Store) MarkPending(ctx context.Context, bucket, key string, modifiedAt time.Time) error {
-	return s.client.HSet(ctx, objKey(bucket, key), map[string]interface{}{
+	return s.client.HSet(ctx, objKey(bucket, key), map[string]any{
 		"status":      StatusPending,
 		"modified_at": modifiedAt.UTC().Format(time.RFC3339Nano),
 	}).Err()
@@ -145,10 +145,7 @@ func (s *Store) ScanPending(ctx context.Context, bucket string) ([]string, error
 
 	var pending []string
 	for i := 0; i < len(keys); i += scanBatchSize {
-		end := i + scanBatchSize
-		if end > len(keys) {
-			end = len(keys)
-		}
+		end := min(i+scanBatchSize, len(keys))
 		batch := keys[i:end]
 
 		pipe := s.client.Pipeline()
@@ -215,10 +212,7 @@ func (s *Store) BucketStats(ctx context.Context, bucket string) (BucketStats, er
 
 	var stats BucketStats
 	for i := 0; i < len(keys); i += scanBatchSize {
-		end := i + scanBatchSize
-		if end > len(keys) {
-			end = len(keys)
-		}
+		end := min(i+scanBatchSize, len(keys))
 		batch := keys[i:end]
 
 		pipe := s.client.Pipeline()

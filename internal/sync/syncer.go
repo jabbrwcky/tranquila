@@ -140,11 +140,9 @@ func (s *Syncer) Run(ctx context.Context) error {
 	pool := newWorkerPool(ctx, s.cfg.Workers, s.transfer, s.m.activeWorkers)
 
 	var resultWg sync.WaitGroup
-	resultWg.Add(1)
-	go func() {
-		defer resultWg.Done()
+	resultWg.Go(func() {
 		s.processResults(ctx, pool.resultsCh())
-	}()
+	})
 
 	collectionTime := time.Now().UTC()
 	sem := make(chan struct{}, s.cfg.Workers)
@@ -433,11 +431,9 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 	pool := newWorkerPool(ctx, s.cfg.Workers, s.transfer, s.m.activeWorkers)
 
 	var resultWg sync.WaitGroup
-	resultWg.Add(1)
-	go func() {
-		defer resultWg.Done()
+	resultWg.Go(func() {
 		s.processResults(ctx, pool.resultsCh())
-	}()
+	})
 
 	log.Info().Strs("buckets", srcBuckets).Msg("watch: listening for object events")
 
