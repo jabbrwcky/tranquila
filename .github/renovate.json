@@ -1,0 +1,66 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":gitSignOff",
+    "helpers:pinGitHubActionDigests",
+    ":dependencyDashboard"
+  ],
+  "pinDigests": true,
+  "separateMajorMinor": false,
+  "separateMinorPatch": false,
+  "pruneStaleBranches": true,
+  "baseBranchPatterns": [
+    "main"
+  ],
+  "configMigration": true,
+  "vulnerabilityAlerts": {
+    "enabled": true
+  },
+  "rebaseWhen": "conflicted",
+  "labels": [
+    "dependencies"
+  ],
+  "automergeStrategy": "auto",
+  "automergeType": "pr",
+  "ignoreTests": true,
+  "timezone": "Europe/Berlin",
+  "assignAutomerge": true,
+  "packageRules": [
+    {
+      "matchManagers": ["gomod"],
+      "groupName": "go dependencies",
+      "matchUpdateTypes": [
+        "major",
+        "minor",
+        "patch"
+      ],
+      "minimumReleaseAge": "5 days"
+    },
+    {
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "*"
+      ],
+      "versioning": "docker",
+      "automerge": true,
+      "minimumReleaseAge": "0"
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "automerge": true,
+      "pinDigests": true
+    },
+    {
+      "groupName": "all github action dependencies",
+      "groupSlug": "all-github-action",
+      "matchFileNames": [
+        ".github/**"
+      ]
+    }
+  ]
+}
