@@ -560,16 +560,23 @@ func performBurnAfterReading(ctx context.Context, job Job, src objectDeleter, up
 		Bool("checksum_match", checksumMatch).
 		Msg("burn-after-reading: checksum verification")
 
+	if !checksumMatch {
+		if job.DryRun {
+			log.Info().
+				Str("bucket", job.SrcBucket).
+				Str("key", job.Key).
+				Msg("burn-after-reading: DRY-RUN would refuse to delete source object (checksum mismatch)")
+			return nil
+		}
+		return fmt.Errorf("burn-after-reading: checksum mismatch for %s/%s (upload=%q stored=%q), refusing to delete source",
+			job.SrcBucket, job.Key, uploadCRC32, storedCRC32)
+	}
 	if job.DryRun {
 		log.Info().
 			Str("bucket", job.SrcBucket).
 			Str("key", job.Key).
 			Msg("burn-after-reading: DRY-RUN would delete source object")
 		return nil
-	}
-	if !checksumMatch {
-		return fmt.Errorf("burn-after-reading: checksum mismatch for %s/%s (upload=%q stored=%q), refusing to delete source",
-			job.SrcBucket, job.Key, uploadCRC32, storedCRC32)
 	}
 	if err := src.DeleteObject(ctx, job.SrcBucket, job.Key); err != nil {
 		return fmt.Errorf("burn-after-reading: delete source %s/%s: %w", job.SrcBucket, job.Key, err)

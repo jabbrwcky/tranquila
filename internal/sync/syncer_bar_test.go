@@ -98,7 +98,7 @@ func TestPerformBurnAfterReading(t *testing.T) {
 			storedCRC32: crc32B,
 			dryRun:      true,
 			wantDeleted: false,
-			wantErr:     false, // dry-run exits before the mismatch check
+			wantErr:     false, // dry-run never errors; logs a refusal instead of "would delete"
 		},
 	}
 
