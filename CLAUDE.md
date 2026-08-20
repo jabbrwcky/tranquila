@@ -56,45 +56,51 @@ Processed in `cmd_sync.go:resolveBuckets()`. Structured config loaded first; CLI
 
 ## Configuration Reference (YAML)
 
+All of the below nests under a top-level `sync:` key — `Source`/`Destination`/`Buckets`/etc.
+are `embed:""` fields flattened onto the `sync` subcommand, and kong-yaml's resolver
+builds its lookup path from the command tree, so a top-level `source:`/`redis:`/etc.
+(no `sync:` wrapper) is silently ignored. Likewise, flag names use hyphens
+(`access-key`, not `access_key`) — the underscore variant is silently ignored too.
+
 ```yaml
-source:
-  endpoint: ""           # empty = AWS; set for MinIO/compatible
-  region: us-east-1
-  access_key: ""
-  secret_key: ""
+sync:
+  source:
+    endpoint: ""           # empty = AWS; set for MinIO/compatible
+    region: us-east-1
+    access-key: ""
+    secret-key: ""
 
-destination:
-  endpoint: ""
-  region: us-east-1
-  access_key: ""
-  secret_key: ""
+  destination:
+    endpoint: ""
+    region: us-east-1
+    access-key: ""
+    secret-key: ""
 
-# Structured bucket mappings (preferred for multiple buckets)
-buckets:
-  - source:
-      bucket: src-bucket
-      prefix: optional/prefix
-    destination:
-      bucket: dst-bucket
-      prefix: optional/prefix
+  # Structured bucket mappings (preferred for multiple buckets)
+  buckets:
+    - source:
+        bucket: src-bucket
+        prefix: optional/prefix
+      destination:
+        bucket: dst-bucket
+        prefix: optional/prefix
 
-# Legacy string mappings (still supported)
-bucket_mappings: []        # "name" or "src=dst"
-bucket_mapping_file: ""
-dest_bucket_prefix: ""
+  # Legacy string mappings (still supported)
+  bucket-mappings: []        # "name" or "src=dst"
+  bucket-mapping-file: ""
+  dest-bucket-prefix: ""
 
-redis:
-  addr: localhost:6379
-  password: ""
-  db: 0
+  redis:
+    addr: localhost:6379
+    password: ""
+    db: 0
 
-workers: 10
-rate_limit: 0              # 0 = unlimited req/s
+  workers: 10
 
-telemetry:
-  exporter: prometheus     # prometheus | otlp | none
-  addr: :9090
-  otlp_endpoint: ""
+  telemetry:
+    exporter: prometheus     # prometheus | otlp | none
+    addr: :9090
+    otlp-endpoint: ""
 ```
 
 ## CLI Flags Added This Session

@@ -25,11 +25,11 @@ import (
 // It is embedded in SyncCmd twice — once for source, once for destination —
 // with distinct flag and env-var prefixes applied by kong.
 type S3Server struct {
-	Endpoint  string  `name:"endpoint" help:"S3-compatible endpoint URL (empty = AWS)"`
-	Region    string  `name:"region" default:"us-east-1" help:"AWS region"`
-	AccessKey string  `name:"access-key" help:"AWS access key ID"`
-	SecretKey string  `name:"secret-key" help:"AWS secret access key"`
-	RateLimit float64 `name:"rate-limit" default:"0" help:"Max S3 API calls/sec (0 = unlimited)"`
+	Endpoint  string  `name:"endpoint" env:"ENDPOINT" help:"S3-compatible endpoint URL (empty = AWS)"`
+	Region    string  `name:"region" env:"REGION" default:"us-east-1" help:"AWS region"`
+	AccessKey string  `name:"access-key" env:"ACCESS_KEY" help:"AWS access key ID"`
+	SecretKey string  `name:"secret-key" env:"SECRET_KEY" help:"AWS secret access key"`
+	RateLimit float64 `name:"rate-limit" env:"RATE_LIMIT" default:"0" help:"Max S3 API calls/sec (0 = unlimited)"`
 }
 
 type SyncCmd struct {
