@@ -46,7 +46,7 @@ func newWorkerPool(ctx context.Context, n int, fn transferFn, activeWorkers metr
 		activeWorkers: activeWorkers,
 	}
 
-	for i := 0; i < n; i++ {
+	for range n {
 		p.wg.Add(1)
 		go p.runWorker(ctx, fn)
 	}

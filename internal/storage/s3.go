@@ -27,7 +27,7 @@ type Config struct {
 	Region    string
 	AccessKey string
 	SecretKey string
-	RateLimit float64     // max S3 API calls/sec for this client; 0 = unlimited
+	RateLimit float64      // max S3 API calls/sec for this client; 0 = unlimited
 	Meter     metric.Meter // optional; zero value produces no-op instruments
 }
 
@@ -286,7 +286,7 @@ const listMaxRetries = 5
 func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
 	bucket := aws.ToString(input.Bucket)
 	var err error
-	for attempt := 0; attempt < listMaxRetries; attempt++ {
+	for attempt := range listMaxRetries {
 		if err = c.wait(ctx); err != nil {
 			return nil, err
 		}
