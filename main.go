@@ -41,8 +41,9 @@ func main() {
 
 	cli := &CLI{}
 	parser := buildParser(cli,
-		filepath.Join(homeDir, ".config", "tranquila.yaml"),
 		"tranquila.yaml",
+		filepath.Join(homeDir, ".config", "tranquila.yaml"),
+		"/etc/tranquila/tranquila.yaml",
 	)
 
 	kctx, err := parser.Parse(os.Args[1:])
