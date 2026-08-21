@@ -5,17 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
+	"math/rand/v2"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	tmtypes "github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	smithy "github.com/aws/smithy-go"
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -64,6 +64,13 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
+	}
+
+	// The SDK default of 3 attempts is not enough to ride out a gateway that
+	// returns 504 under load. Applies to every operation, including the ones
+	// with no retry wrapper of their own (Get/Put/Head/Delete, EnsureBucket).
+	awsCfg.Retryer = func() aws.Retryer {
+		return retry.AddWithMaxAttempts(retry.NewStandard(), s3MaxAttempts)
 	}
 
 	clientOpts := []func(*s3.Options){}
@@ -279,10 +286,17 @@ func (c *Client) ListObjectsPage(ctx context.Context, bucket, prefix string, tok
 	return collected, current, nil
 }
 
-const listMaxRetries = 5
+const (
+	// s3MaxAttempts overrides the SDK default of 3.
+	s3MaxAttempts = 5
 
-// listPageWithRetry fetches a single ListObjectsV2 page, retrying on transient
-// network errors (EOF, connection reset, broken pipe) with exponential backoff.
+	listMaxRetries = 8
+	// listMaxDelay caps the doubling so late attempts do not stall for minutes.
+	listMaxDelay = 30 * time.Second
+)
+
+// listPageWithRetry fetches a single ListObjectsV2 page, retrying transient
+// errors (5xx, EOF, connection reset, broken pipe) with exponential backoff.
 func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
 	bucket := aws.ToString(input.Bucket)
 	var err error
@@ -300,8 +314,10 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 		if !isTransientErr(err) {
 			return nil, err
 		}
-		delay := time.Duration(1<<uint(attempt)) * time.Second
-		log.Warn().Err(err).Int("attempt", attempt+1).Msg("transient list error, retrying")
+		delay := min(time.Duration(1<<uint(attempt))*time.Second, listMaxDelay)
+		// Jitter keeps replicas sharing an endpoint from retrying in lockstep.
+		delay += rand.N(delay / 2)
+		log.Warn().Err(err).Int("attempt", attempt+1).Dur("retry_in", delay).Msg("transient list error, retrying")
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
@@ -309,24 +325,6 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 		}
 	}
 	return nil, err
-}
-
-func isTransientErr(err error) bool {
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	// S3-level codes that indicate a transient server-side disconnect or overload.
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.ErrorCode() {
-		case "ClientDisconnected", "RequestTimeout", "SlowDown", "ServiceUnavailable":
-			return true
-		}
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "EOF") ||
-		strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "broken pipe")
 }
 
 func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
