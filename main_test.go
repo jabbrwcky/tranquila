@@ -162,6 +162,37 @@ sync:
 	}
 }
 
+func TestConfigFileResilience(t *testing.T) {
+	sync := configFromYAML(t, `
+sync:
+  cycle-backoff: 15s
+  cycle-backoff-max: 2m
+  endpoint-fail-threshold: 3
+`)
+	if sync.CycleBackoff != 15*time.Second {
+		t.Errorf("CycleBackoff = %v, want 15s", sync.CycleBackoff)
+	}
+	if sync.CycleBackoffMax != 2*time.Minute {
+		t.Errorf("CycleBackoffMax = %v, want 2m", sync.CycleBackoffMax)
+	}
+	if sync.EndpointFailThreshold != 3 {
+		t.Errorf("EndpointFailThreshold = %d, want 3", sync.EndpointFailThreshold)
+	}
+}
+
+func TestConfigFileResilienceDefaults(t *testing.T) {
+	sync := configFromYAML(t, "sync: {}\n")
+	if sync.CycleBackoff != 5*time.Second {
+		t.Errorf("CycleBackoff = %v, want 5s", sync.CycleBackoff)
+	}
+	if sync.CycleBackoffMax != 10*time.Minute {
+		t.Errorf("CycleBackoffMax = %v, want 10m", sync.CycleBackoffMax)
+	}
+	if sync.EndpointFailThreshold != 5 {
+		t.Errorf("EndpointFailThreshold = %d, want 5", sync.EndpointFailThreshold)
+	}
+}
+
 func TestConfigFileTelemetry(t *testing.T) {
 	sync := configFromYAML(t, `
 sync:
@@ -274,5 +305,85 @@ func TestConfigFileDefaults(t *testing.T) {
 	}
 	if sync.MgmtAddr != ":8080" {
 		t.Errorf("MgmtAddr default = %q, want :8080", sync.MgmtAddr)
+	}
+}
+
+func TestEnvOverridesSource(t *testing.T) {
+	clearSyncEnvVars(t)
+	t.Setenv("SOURCE_ENDPOINT", "http://envsrc:9000")
+	t.Setenv("SOURCE_REGION", "eu-north-1")
+	t.Setenv("SOURCE_ACCESS_KEY", "envsrckey")
+	t.Setenv("SOURCE_SECRET_KEY", "envsrcsecret")
+	t.Setenv("SOURCE_RATE_LIMIT", "42")
+
+	sync := configFromYAML(t, "sync: {}\n")
+	if sync.Source.Endpoint != "http://envsrc:9000" {
+		t.Errorf("Source.Endpoint = %q, want %q", sync.Source.Endpoint, "http://envsrc:9000")
+	}
+	if sync.Source.Region != "eu-north-1" {
+		t.Errorf("Source.Region = %q, want %q", sync.Source.Region, "eu-north-1")
+	}
+	if sync.Source.AccessKey != "envsrckey" {
+		t.Errorf("Source.AccessKey = %q, want %q", sync.Source.AccessKey, "envsrckey")
+	}
+	if sync.Source.SecretKey != "envsrcsecret" {
+		t.Errorf("Source.SecretKey = %q, want %q", sync.Source.SecretKey, "envsrcsecret")
+	}
+	if sync.Source.RateLimit != 42 {
+		t.Errorf("Source.RateLimit = %v, want 42", sync.Source.RateLimit)
+	}
+}
+
+func TestEnvOverridesDest(t *testing.T) {
+	clearSyncEnvVars(t)
+	t.Setenv("DEST_ENDPOINT", "http://envdst:9000")
+	t.Setenv("DEST_REGION", "ap-south-1")
+	t.Setenv("DEST_ACCESS_KEY", "envdstkey")
+	t.Setenv("DEST_SECRET_KEY", "envdstsecret")
+	t.Setenv("DEST_RATE_LIMIT", "7")
+
+	sync := configFromYAML(t, "sync: {}\n")
+	if sync.Destination.Endpoint != "http://envdst:9000" {
+		t.Errorf("Destination.Endpoint = %q, want %q", sync.Destination.Endpoint, "http://envdst:9000")
+	}
+	if sync.Destination.Region != "ap-south-1" {
+		t.Errorf("Destination.Region = %q, want %q", sync.Destination.Region, "ap-south-1")
+	}
+	if sync.Destination.AccessKey != "envdstkey" {
+		t.Errorf("Destination.AccessKey = %q, want %q", sync.Destination.AccessKey, "envdstkey")
+	}
+	if sync.Destination.SecretKey != "envdstsecret" {
+		t.Errorf("Destination.SecretKey = %q, want %q", sync.Destination.SecretKey, "envdstsecret")
+	}
+	if sync.Destination.RateLimit != 7 {
+		t.Errorf("Destination.RateLimit = %v, want 7", sync.Destination.RateLimit)
+	}
+}
+
+// TestEnvOverridesSourceWithConfigFile mirrors the reported deployment failure:
+// the config file sets only source.region under the sync command, while
+// endpoint/access-key/secret-key come from env vars alone.
+func TestEnvOverridesSourceWithConfigFile(t *testing.T) {
+	clearSyncEnvVars(t)
+	t.Setenv("SOURCE_ENDPOINT", "http://envsrc:9000")
+	t.Setenv("SOURCE_ACCESS_KEY", "envsrckey")
+	t.Setenv("SOURCE_SECRET_KEY", "envsrcsecret")
+
+	sync := configFromYAML(t, `
+sync:
+  source:
+    region: "us-east-1"
+`)
+	if sync.Source.Endpoint != "http://envsrc:9000" {
+		t.Errorf("Source.Endpoint = %q, want %q", sync.Source.Endpoint, "http://envsrc:9000")
+	}
+	if sync.Source.AccessKey != "envsrckey" {
+		t.Errorf("Source.AccessKey = %q, want %q", sync.Source.AccessKey, "envsrckey")
+	}
+	if sync.Source.SecretKey != "envsrcsecret" {
+		t.Errorf("Source.SecretKey = %q, want %q", sync.Source.SecretKey, "envsrcsecret")
+	}
+	if sync.Source.Region != "us-east-1" {
+		t.Errorf("Source.Region = %q, want %q", sync.Source.Region, "us-east-1")
 	}
 }

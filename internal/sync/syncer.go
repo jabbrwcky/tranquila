@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 const defaultDiscoveryBatchSize = 100_000
@@ -39,7 +40,7 @@ type Config struct {
 	Source             *storage.Client
 	Destination        *storage.Client
 	State              *state.Store
-	Meter              metric.Meter
+	Meter              metric.Meter            // optional; zero value produces no-op instruments
 	Buckets            map[string]BucketConfig // src → config; nil = auto-discover all
 	DestBucketPrefix   string                  // prefix for auto-discovered destination bucket names
 	Workers            int
@@ -47,6 +48,9 @@ type Config struct {
 	DryRun             bool      // log planned burn-after-reading deletions without executing them
 	Progress           *Progress // optional; enables live progress tracking for the management API
 	DiscoveryBatchSize int       // max objects to discover per bucket before syncing (0 = default 100 000)
+
+	CycleBackoff    time.Duration // base delay before retrying a failed watch cycle (0 = 5s)
+	CycleBackoffMax time.Duration // ceiling for the retry delay (0 = 10m)
 }
 
 type metrics struct {
@@ -55,6 +59,7 @@ type metrics struct {
 	bytesTransferred metric.Int64Counter
 	duration         metric.Float64Histogram
 	activeWorkers    metric.Int64UpDownCounter
+	cycleFailures    metric.Int64Counter
 }
 
 type Syncer struct {
@@ -71,6 +76,10 @@ func New(cfg Config) (*Syncer, error) {
 }
 
 func newMetrics(meter metric.Meter) (metrics, error) {
+	// metric.Meter is an interface, so its zero value is nil rather than a no-op.
+	if meter == nil {
+		meter = noop.Meter{}
+	}
 	synced, err := meter.Int64Counter("tranquila.objects.synced",
 		metric.WithDescription("Total objects successfully synced"))
 	if err != nil {
@@ -98,12 +107,18 @@ func newMetrics(meter metric.Meter) (metrics, error) {
 	if err != nil {
 		return metrics{}, err
 	}
+	cycleFailures, err := meter.Int64Counter("tranquila.sync.cycle.failures",
+		metric.WithDescription("Watch cycles that failed and were retried with backoff"))
+	if err != nil {
+		return metrics{}, err
+	}
 	return metrics{
 		synced:           synced,
 		failed:           failed,
 		bytesTransferred: bytes,
 		duration:         dur,
 		activeWorkers:    activeWorkers,
+		cycleFailures:    cycleFailures,
 	}, nil
 }
 
@@ -140,11 +155,9 @@ func (s *Syncer) Run(ctx context.Context) error {
 	pool := newWorkerPool(ctx, s.cfg.Workers, s.transfer, s.m.activeWorkers)
 
 	var resultWg sync.WaitGroup
-	resultWg.Add(1)
-	go func() {
-		defer resultWg.Done()
+	resultWg.Go(func() {
 		s.processResults(ctx, pool.resultsCh())
-	}()
+	})
 
 	collectionTime := time.Now().UTC()
 	sem := make(chan struct{}, s.cfg.Workers)
@@ -172,7 +185,14 @@ func (s *Syncer) Run(ctx context.Context) error {
 	pool.close()
 	resultWg.Wait()
 	close(errc)
-	return <-errc
+
+	var errs []error
+	for err := range errc {
+		errs = append(errs, err)
+	}
+	// Join rather than first-error: every bucket's failure stays visible, and a
+	// mixed cycle is not misread as pure misconfiguration by isFatalCycleErr.
+	return errors.Join(errs...)
 }
 
 // discoverAndSyncBucket lists the source bucket in batches of DiscoveryBatchSize
@@ -370,24 +390,42 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 }
 
 // RunWatch repeatedly calls Run until ctx is cancelled, sleeping interval between
-// each completed cycle. The sleep is context-aware: cancellation during the sleep
-// exits immediately and cleanly.
+// each completed cycle. A transient failure is retried with exponential backoff
+// rather than aborting: watch mode is a long-lived service and must survive a
+// flaky endpoint without exiting into a crash-loop. Misconfiguration still returns.
 func (s *Syncer) RunWatch(ctx context.Context, interval time.Duration) error {
-	return s.runWatch(ctx, interval, s.Run)
+	return s.runWatch(ctx, interval, s.Run, waitOrDone)
 }
 
-// runWatch is the testable core of RunWatch; cycleFn replaces s.Run so tests can
-// inject controlled behaviour without requiring real S3 or Redis connections.
-func (s *Syncer) runWatch(ctx context.Context, interval time.Duration, cycleFn func(context.Context) error) error {
+// runWatch is the testable core of RunWatch; cycleFn replaces s.Run and sleep
+// replaces waitOrDone so tests can inject controlled behaviour without requiring
+// real S3 or Redis connections, or real delays.
+func (s *Syncer) runWatch(ctx context.Context, interval time.Duration, cycleFn func(context.Context) error, sleep sleeper) error {
+	var fails int
 	for {
-		if err := cycleFn(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		err := cycleFn(ctx)
+		switch {
+		case err == nil || errors.Is(err, context.Canceled):
+			if fails > 0 {
+				log.Info().Int("after_failures", fails).Msg("watch: cycle recovered")
+				fails = 0
+			}
+		case isFatalCycleErr(err):
 			return err
+		default:
+			fails++
+			delay := s.cycleBackoff(fails)
+			s.m.cycleFailures.Add(ctx, 1)
+			log.Error().Err(err).Int("consecutive_failures", fails).Dur("retry_in", delay).
+				Msg("watch: cycle failed, backing off")
+			if !sleep(ctx, delay) {
+				return nil
+			}
+			continue
 		}
 		log.Info().Dur("interval", interval).Msg("watch: cycle complete, waiting before next discovery")
-		select {
-		case <-ctx.Done():
+		if !sleep(ctx, interval) {
 			return nil
-		case <-time.After(interval):
 		}
 	}
 }
@@ -396,7 +434,7 @@ func (s *Syncer) runWatch(ctx context.Context, interval time.Duration, cycleFn f
 // the program was down, then switches to event-driven mode consuming events from w.
 // In-flight transfers complete before returning on context cancellation.
 func (s *Syncer) RunWatcher(ctx context.Context, w watcher.Watcher) error {
-	if err := s.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := s.initialSync(ctx, s.Run, waitOrDone); err != nil {
 		return err
 	}
 	if ctx.Err() != nil {
@@ -419,7 +457,41 @@ func (s *Syncer) RunWatcher(ctx context.Context, w watcher.Watcher) error {
 		srcBuckets = append(srcBuckets, b)
 	}
 
-	return s.runWatcher(ctx, w, srcBuckets, bucketMap)
+	// The event stream can close without error (a MinIO notification stream that
+	// drops is not reconnected by the watcher). Returning here would exit 0 and
+	// let K8s restart the pod, so reconnect with the same backoff instead.
+	for n := 1; ; n++ {
+		err := s.runWatcher(ctx, w, srcBuckets, bucketMap)
+		if err != nil || ctx.Err() != nil {
+			return err
+		}
+		delay := s.cycleBackoff(n)
+		log.Warn().Int("attempt", n).Dur("retry_in", delay).Msg("watch: event stream closed, reconnecting")
+		if !waitOrDone(ctx, delay) {
+			return nil
+		}
+	}
+}
+
+// initialSync retries the catch-up cycle with backoff so a gateway that is flaky
+// at startup does not kill an event-driven watcher before it reaches its event loop.
+func (s *Syncer) initialSync(ctx context.Context, cycleFn func(context.Context) error, sleep sleeper) error {
+	for n := 1; ; n++ {
+		err := cycleFn(ctx)
+		if err == nil || errors.Is(err, context.Canceled) {
+			return nil
+		}
+		if isFatalCycleErr(err) {
+			return err
+		}
+		delay := s.cycleBackoff(n)
+		s.m.cycleFailures.Add(ctx, 1)
+		log.Error().Err(err).Int("attempt", n).Dur("retry_in", delay).
+			Msg("watch: initial sync failed, backing off")
+		if !sleep(ctx, delay) {
+			return nil
+		}
+	}
 }
 
 // runWatcher is the testable event-loop core of RunWatcher; it accepts a pre-resolved
@@ -433,11 +505,9 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 	pool := newWorkerPool(ctx, s.cfg.Workers, s.transfer, s.m.activeWorkers)
 
 	var resultWg sync.WaitGroup
-	resultWg.Add(1)
-	go func() {
-		defer resultWg.Done()
+	resultWg.Go(func() {
 		s.processResults(ctx, pool.resultsCh())
-	}()
+	})
 
 	log.Info().Strs("buckets", srcBuckets).Msg("watch: listening for object events")
 
@@ -564,16 +634,23 @@ func performBurnAfterReading(ctx context.Context, job Job, src objectDeleter, up
 		Bool("checksum_match", checksumMatch).
 		Msg("burn-after-reading: checksum verification")
 
+	if !checksumMatch {
+		if job.DryRun {
+			log.Info().
+				Str("bucket", job.SrcBucket).
+				Str("key", job.Key).
+				Msg("burn-after-reading: DRY-RUN would refuse to delete source object (checksum mismatch)")
+			return nil
+		}
+		return fmt.Errorf("burn-after-reading: checksum mismatch for %s/%s (upload=%q stored=%q), refusing to delete source",
+			job.SrcBucket, job.Key, uploadCRC32, storedCRC32)
+	}
 	if job.DryRun {
 		log.Info().
 			Str("bucket", job.SrcBucket).
 			Str("key", job.Key).
 			Msg("burn-after-reading: DRY-RUN would delete source object")
 		return nil
-	}
-	if !checksumMatch {
-		return fmt.Errorf("burn-after-reading: checksum mismatch for %s/%s (upload=%q stored=%q), refusing to delete source",
-			job.SrcBucket, job.Key, uploadCRC32, storedCRC32)
 	}
 	if err := src.DeleteObject(ctx, job.SrcBucket, job.Key); err != nil {
 		return fmt.Errorf("burn-after-reading: delete source %s/%s: %w", job.SrcBucket, job.Key, err)

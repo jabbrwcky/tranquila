@@ -12,7 +12,7 @@
 | Watchers | `internal/watcher/` | `Watcher` interface + poll/MinIO/SQS implementations. |
 | Storage | `internal/storage/` | `aws-sdk-go-v2` + transfermanager. Works with any S3-compatible endpoint. |
 | State | `internal/state/` | Redis. Keys: `tranquila:obj:{bucket}:{key}`, `tranquila:collection:{bucket}`. |
-| API | `internal/api/` | Management HTTP API. `/api/v1/buckets`, `/api/v1/sync`. |
+| API | `internal/api/` | Management HTTP API. `/api/v1/buckets`, `/api/v1/sync`. K8s probes: `/healthz` (liveness), `/readyz` (readiness, pings Redis). |
 
 ## Implemented Features
 
@@ -56,46 +56,118 @@ Processed in `cmd_sync.go:resolveBuckets()`. Structured config loaded first; CLI
 
 ## Configuration Reference (YAML)
 
+All of the below nests under a top-level `sync:` key — `Source`/`Destination`/`Buckets`/etc.
+are `embed:""` fields flattened onto the `sync` subcommand, and kong-yaml's resolver
+builds its lookup path from the command tree, so a top-level `source:`/`redis:`/etc.
+(no `sync:` wrapper) is silently ignored. Likewise, flag names use hyphens
+(`access-key`, not `access_key`) — the underscore variant is silently ignored too.
+
 ```yaml
-source:
-  endpoint: ""           # empty = AWS; set for MinIO/compatible
-  region: us-east-1
-  access_key: ""
-  secret_key: ""
+sync:
+  source:
+    endpoint: ""           # empty = AWS; set for MinIO/compatible
+    region: us-east-1
+    access-key: ""
+    secret-key: ""
 
-destination:
-  endpoint: ""
-  region: us-east-1
-  access_key: ""
-  secret_key: ""
+  destination:
+    endpoint: ""
+    region: us-east-1
+    access-key: ""
+    secret-key: ""
 
-# Structured bucket mappings (preferred for multiple buckets)
-buckets:
-  - source:
-      bucket: src-bucket
-      prefix: optional/prefix
-    destination:
-      bucket: dst-bucket
-      prefix: optional/prefix
+  # Structured bucket mappings (preferred for multiple buckets)
+  buckets:
+    - source:
+        bucket: src-bucket
+        prefix: optional/prefix
+      destination:
+        bucket: dst-bucket
+        prefix: optional/prefix
 
-# Legacy string mappings (still supported)
-bucket_mappings: []        # "name" or "src=dst"
-bucket_mapping_file: ""
-dest_bucket_prefix: ""
+  # Legacy string mappings (still supported)
+  bucket-mappings: []        # "name" or "src=dst"
+  bucket-mapping-file: ""
+  dest-bucket-prefix: ""
 
-redis:
-  addr: localhost:6379
-  password: ""
-  db: 0
+  redis:
+    addr: localhost:6379
+    password: ""
+    db: 0
 
-workers: 10
-rate_limit: 0              # 0 = unlimited req/s
+  workers: 10
 
-telemetry:
-  exporter: prometheus     # prometheus | otlp | none
-  addr: :9090
-  otlp_endpoint: ""
+  # Resilience (see "Failure Handling" below)
+  cycle-backoff: 5s
+  cycle-backoff-max: 10m
+  endpoint-fail-threshold: 5
+
+  telemetry:
+    exporter: prometheus     # prometheus | otlp | none
+    addr: :8081
+    otlp-endpoint: ""
 ```
+
+## Testing
+
+| Scope | Command | Notes |
+| --- | --- | --- |
+| Unit | `go test ./...` | Stdlib `testing`, table-driven. No containers, no sleeps. |
+| End-to-end | `cd e2e && go test ./...` | Separate module (`github.com/jabbrwcky/tranquila/e2e`) with a `replace` to `../`. Root `go test ./...` does not descend into it. |
+
+The e2e module is separate on purpose: testcontainers pulls ~89 transitive
+dependencies (moby, containerd) that must not enter the production module graph
+or `govulncheck` scope. A submodule can still import `internal/...` because the
+internal rule is lexical on import paths, not module-scoped.
+
+Two fault injectors, because they cover different layers:
+
+- **Toxiproxy** (container) is L4 only — `latency`, `down`, `bandwidth`,
+  `slow_close`, `timeout`, `reset_peer`, `slicer`, `limit_data`. It has no HTTP
+  parsing and **cannot emit 504/503/500**.
+- **`faultproxy_test.go`** is an in-process L7 `httputil.ReverseProxy` that
+  injects HTTP statuses, which is what the production 504 incident needed. It
+  emits both XML bodies (SDK decodes an `APIError`) and non-XML gateway pages
+  (no `APIError` at all — the case that forces status-first classification).
+
+Gotchas worth not rediscovering: assertions use `HeadObject` because
+`listPageWithRetry`'s 8 jittered attempts make a failing list take 2+ minutes;
+podman needs `DOCKER_HOST` pointed at a path containing `podman.sock` or Ryuk
+dies on the missing `bridge` network; Apple's `container` has no Docker API and
+cannot run testcontainers at all. Details in `e2e/README.md`.
+
+## Failure Handling
+
+Watch mode must never exit on a transient endpoint fault — `os.Exit` also kills
+the in-process mgmt server, so `/healthz` stops answering and K8s restarts the pod.
+
+| Layer | Mechanism |
+| --- | --- |
+| Error classification | `storage.Classify` → `ClassOK`/`ClassTransient`/`ClassThrottle`/`ClassPermanent`. HTTP status first (`*awshttp.ResponseError`), then smithy error code. Unknown → transient. |
+| Per-call retry | AWS SDK retryer at `s3MaxAttempts` (5); `listPageWithRetry` at 8 attempts, 30s delay cap, jittered. |
+| Per-cycle retry | `runWatch`/`initialSync` back off with `cycleBackoff` (jittered exponential) and never return on transient errors. |
+| Rate degradation | `internal/storage/aimd.go`, fed one signal per S3 call from `recordOp`. Halve after N transient failures (immediately on throttle), floor 1/s, additive recovery of 10% of base per 20 healthy calls. |
+
+Key decisions:
+
+- **Only permanent errors terminate**, and only when *every* failure in the cycle
+  is permanent (`isFatalCycleErr` fans out one level of `errors.Join`). A mixed
+  cycle counts as transient so a flaky endpoint cannot look like misconfiguration.
+- **One-shot mode is unchanged** — still exits non-zero, so a K8s Job reports failure.
+  The asymmetry falls out of the retry loop living inside `runWatch`.
+- **`Run` returns `errors.Join`**, not the first error, so a partial-failure cycle
+  keeps every bucket's failure visible.
+- **Only endpoints with a configured `rate-limit` degrade.** Unlimited has no
+  ceiling to halve, and inventing one would throttle a healthy endpoint.
+- **The limiter is always constructed** (`rate.Inf` when unlimited) so the pointer
+  is never nil and never swapped — only `SetLimit` mutates. Note `rate.Inf` is
+  `Limit(math.MaxFloat64)`, *not* IEEE infinity: compare with `== rate.Inf`.
+- **AIMD is event-counted, never time-based**, so the control loop is deterministic
+  under test — no clock injection, no sleeps.
+- **`/readyz` stays green while degraded** — degraded is the designed correct
+  response; marking the pod NotReady sheds no load and stalls rollouts.
+- **Detached transfers are time-bounded** (`transferGrace`) so a degraded limiter
+  cannot pace an uncancellable transfer past `terminationGracePeriodSeconds`.
 
 ## CLI Flags Added This Session
 
@@ -104,6 +176,9 @@ telemetry:
 --watch-mode             poll|minio|sqs (default: poll)
 --watch-interval         inter-cycle sleep for poll mode (default: 60s)
 --sqs-queue-url          SQS queue URL (sqs mode only)
+--cycle-backoff          base retry delay after a failed cycle (default: 5s)
+--cycle-backoff-max      cap for the retry delay (default: 10m)
+--endpoint-fail-threshold transient failures before halving the rate (default: 5)
 ```
 
 ## Dependencies Added

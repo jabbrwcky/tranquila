@@ -1,19 +1,21 @@
-# src/dest server configured via env
-source:
-  # endpoint: ""        # leave empty for AWS; set for S3-compatible services
-  # region: "us-east-1"
-  # access-key: ""
-  # secret-key: ""
-  rate-limit: 100     # max S3 API calls/sec; 0 = unlimited
-
-# destination:
-#   endpoint: ""
-#   region: "us-east-1"
-#   access-key: ""
-#   secret-key: ""
-#   rate-limit: 0.0
-
 sync:
+  # src/dest server configured via env
+  source:
+    # endpoint: ""        # leave empty for AWS; set for S3-compatible services
+    # region: "us-east-1"
+    # access-key: ""
+    # secret-key: ""
+    rate-limit: 100     # max S3 API calls/sec; 0 = unlimited
+
+  # destination:
+  #   endpoint: ""
+  #   region: "us-east-1"
+  #   access-key: ""
+  #   secret-key: ""
+  #   # Set a non-zero rate-limit to enable congestion control for the
+  #   # destination; an unlimited endpoint has no ceiling to reduce.
+  #   rate-limit: 0.0
+
   buckets:
     - source:
         bucket: ausgehenderechnung
@@ -137,3 +139,11 @@ sync:
 
   workers: 10
   dry-run: false       # set true to log planned burn-after-reading deletions without executing them
+
+  # Resilience: failed cycles retry with jittered exponential backoff instead of
+  # exiting. After endpoint-fail-threshold consecutive transient failures the
+  # endpoint's rate-limit is halved, then restored additively once it recovers.
+  # Rate reduction only applies to endpoints with a configured rate-limit.
+  cycle-backoff: 5s
+  cycle-backoff-max: 10m
+  endpoint-fail-threshold: 5

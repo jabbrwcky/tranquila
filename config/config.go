@@ -40,7 +40,7 @@ func (b *BucketMappings) Decode(ctx *kong.DecodeContext) error {
 
 // decodeBucketMappings converts the raw interface{} produced by kong-yaml into
 // a typed slice via a YAML round-trip.
-func decodeBucketMappings(raw interface{}) ([]BucketMapping, error) {
+func decodeBucketMappings(raw any) ([]BucketMapping, error) {
 	b, err := yaml.Marshal(raw)
 	if err != nil {
 		return nil, fmt.Errorf("encode bucket mappings: %w", err)

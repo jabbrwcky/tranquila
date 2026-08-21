@@ -25,11 +25,11 @@ import (
 // It is embedded in SyncCmd twice — once for source, once for destination —
 // with distinct flag and env-var prefixes applied by kong.
 type S3Server struct {
-	Endpoint  string  `name:"endpoint" help:"S3-compatible endpoint URL (empty = AWS)"`
-	Region    string  `name:"region" default:"us-east-1" help:"AWS region"`
-	AccessKey string  `name:"access-key" help:"AWS access key ID"`
-	SecretKey string  `name:"secret-key" help:"AWS secret access key"`
-	RateLimit float64 `name:"rate-limit" default:"0" help:"Max S3 API calls/sec (0 = unlimited)"`
+	Endpoint  string  `name:"endpoint" env:"ENDPOINT" help:"S3-compatible endpoint URL (empty = AWS)"`
+	Region    string  `name:"region" env:"REGION" default:"us-east-1" help:"AWS region"`
+	AccessKey string  `name:"access-key" env:"ACCESS_KEY" help:"AWS access key ID"`
+	SecretKey string  `name:"secret-key" env:"SECRET_KEY" help:"AWS secret access key"`
+	RateLimit float64 `name:"rate-limit" env:"RATE_LIMIT" default:"0" help:"Max S3 API calls/sec (0 = unlimited)"`
 }
 
 type SyncCmd struct {
@@ -56,6 +56,10 @@ type SyncCmd struct {
 	WatchInterval time.Duration `name:"watch-interval" env:"TRANQUILA_WATCH_INTERVAL" default:"60s" help:"Idle time between poll cycles (poll mode only)"`
 	SQSQueueURL   string        `name:"sqs-queue-url" env:"TRANQUILA_SQS_QUEUE_URL" help:"SQS queue URL for S3 event notifications (sqs mode)"`
 
+	EndpointFailThreshold int           `name:"endpoint-fail-threshold" env:"TRANQUILA_ENDPOINT_FAIL_THRESHOLD" default:"5" help:"Consecutive transient endpoint failures before its rate limit is halved (requires --source/dest-rate-limit)"`
+	CycleBackoff          time.Duration `name:"cycle-backoff" env:"TRANQUILA_CYCLE_BACKOFF" default:"5s" help:"Base delay before retrying a failed sync cycle in watch mode (exponential with jitter)"`
+	CycleBackoffMax       time.Duration `name:"cycle-backoff-max" env:"TRANQUILA_CYCLE_BACKOFF_MAX" default:"10m" help:"Maximum delay between failed sync cycles in watch mode"`
+
 	TelemetryExporter     string `name:"telemetry-exporter" env:"TELEMETRY_EXPORTER" default:"prometheus" enum:"prometheus,otlp,none" help:"Metrics exporter"`
 	TelemetryAddr         string `name:"telemetry-addr" env:"TELEMETRY_ADDR" default:":8081" help:"Prometheus metrics listen address"`
 	TelemetryOTLPEndpoint string `name:"telemetry-otlp-endpoint" env:"TELEMETRY_OTLP_ENDPOINT" help:"OTLP gRPC endpoint"`
@@ -63,6 +67,19 @@ type SyncCmd struct {
 	MgmtAddr string `name:"mgmt-addr" env:"MGMT_ADDR" default:":8080" help:"Management API listen address"`
 
 	Buckets config.BucketMappings `name:"buckets" help:"Structured bucket mappings (from config file)"`
+}
+
+// endpointState adapts a storage rate-limit snapshot for the management API.
+func endpointState(st storage.LimitState) api.EndpointState {
+	es := api.EndpointState{
+		RateLimit:     st.Current,
+		BaseRateLimit: st.Base,
+		Degraded:      st.Degraded,
+	}
+	if !st.Since.IsZero() {
+		es.DegradedSince = &st.Since
+	}
+	return es
 }
 
 // resolveBuckets merges --bucket-mappings, --prefix-mappings, and --bucket-mapping-file
@@ -201,24 +218,28 @@ func (cmd *SyncCmd) Run() error {
 
 	log.Debug().Str("endpoint", cmd.Source.Endpoint).Str("region", cmd.Source.Region).Msg("creating source client")
 	src, err := storage.NewClient(ctx, storage.Config{
-		Endpoint:  cmd.Source.Endpoint,
-		Region:    cmd.Source.Region,
-		AccessKey: cmd.Source.AccessKey,
-		SecretKey: cmd.Source.SecretKey,
-		RateLimit: cmd.Source.RateLimit,
-		Meter:     tel.Meter,
+		Endpoint:      cmd.Source.Endpoint,
+		Region:        cmd.Source.Region,
+		AccessKey:     cmd.Source.AccessKey,
+		SecretKey:     cmd.Source.SecretKey,
+		RateLimit:     cmd.Source.RateLimit,
+		FailThreshold: cmd.EndpointFailThreshold,
+		Name:          "source",
+		Meter:         tel.Meter,
 	})
 	if err != nil {
 		return fmt.Errorf("create source S3 client: %w", err)
 	}
 
 	dst, err := storage.NewClient(ctx, storage.Config{
-		Endpoint:  cmd.Destination.Endpoint,
-		Region:    cmd.Destination.Region,
-		AccessKey: cmd.Destination.AccessKey,
-		SecretKey: cmd.Destination.SecretKey,
-		RateLimit: cmd.Destination.RateLimit,
-		Meter:     tel.Meter,
+		Endpoint:      cmd.Destination.Endpoint,
+		Region:        cmd.Destination.Region,
+		AccessKey:     cmd.Destination.AccessKey,
+		SecretKey:     cmd.Destination.SecretKey,
+		RateLimit:     cmd.Destination.RateLimit,
+		FailThreshold: cmd.EndpointFailThreshold,
+		Name:          "destination",
+		Meter:         tel.Meter,
 	})
 	if err != nil {
 		return fmt.Errorf("create destination S3 client: %w", err)
@@ -235,6 +256,9 @@ func (cmd *SyncCmd) Run() error {
 		Addr:     cmd.MgmtAddr,
 		State:    store,
 		Progress: progress,
+		Endpoints: func() (api.EndpointState, api.EndpointState) {
+			return endpointState(src.LimitState()), endpointState(dst.LimitState())
+		},
 	})
 	go func() {
 		if err := mgmt.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -255,6 +279,8 @@ func (cmd *SyncCmd) Run() error {
 		DryRun:             cmd.DryRun,
 		Progress:           progress,
 		DiscoveryBatchSize: cmd.DiscoveryBatchSize,
+		CycleBackoff:       cmd.CycleBackoff,
+		CycleBackoffMax:    cmd.CycleBackoffMax,
 	})
 	if err != nil {
 		return fmt.Errorf("create syncer: %w", err)

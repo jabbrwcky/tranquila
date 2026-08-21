@@ -7,8 +7,21 @@ import (
 	"testing"
 	"time"
 
+	smithy "github.com/aws/smithy-go"
 	"github.com/jabbrwcky/tranquila/internal/watcher"
+	"go.opentelemetry.io/otel/metric/noop"
 )
+
+// testMetrics builds no-op instruments so tests can exercise code paths that
+// record metrics without a real meter.
+func testMetrics(t *testing.T) metrics {
+	t.Helper()
+	m, err := newMetrics(noop.Meter{})
+	if err != nil {
+		t.Fatalf("newMetrics: %v", err)
+	}
+	return m
+}
 
 // fakeWatcher implements watcher.Watcher for testing runWatcher.
 type fakeWatcher struct {
@@ -30,12 +43,13 @@ func (f *fakeWatcher) Watch(_ context.Context, _ []string) (<-chan watcher.Objec
 
 func TestRunWatch(t *testing.T) {
 	tests := []struct {
-		name      string
-		cycleFn   func(ctx context.Context) error
-		interval  time.Duration
-		cancelAt  time.Duration // 0 = cancel before starting
-		wantErr   bool
-		minCycles int
+		name        string
+		cycleFn     func(ctx context.Context) error
+		interval    time.Duration
+		cancelAt    time.Duration // 0 = cancel before starting
+		wantErr     bool
+		minCycles   int
+		minAttempts int
 	}{
 		{
 			name:      "cancel_before_first_cycle",
@@ -45,10 +59,24 @@ func TestRunWatch(t *testing.T) {
 			minCycles: 0,
 		},
 		{
-			name: "cycle_error_propagates",
+			// Was cycle_error_propagates: a transient failure used to abort the
+			// loop and exit the process. It must now back off and retry instead.
+			name: "transient_cycle_error_does_not_terminate",
 			cycleFn: func() func(context.Context) error {
 				return func(ctx context.Context) error {
 					return errors.New("boom")
+				}
+			}(),
+			interval:    time.Millisecond,
+			cancelAt:    time.Second,
+			wantErr:     false,
+			minAttempts: 2,
+		},
+		{
+			name: "permanent_cycle_error_propagates",
+			cycleFn: func() func(context.Context) error {
+				return func(ctx context.Context) error {
+					return &smithy.GenericAPIError{Code: "AccessDenied", Message: "denied"}
 				}
 			}(),
 			interval: time.Millisecond,
@@ -75,13 +103,17 @@ func TestRunWatch(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &Syncer{}
+			s := &Syncer{m: testMetrics(t)}
 
 			var (
 				mu        sync.Mutex
 				completed int
+				attempts  int
 			)
 			wrapped := func(ctx context.Context) error {
+				mu.Lock()
+				attempts++
+				mu.Unlock()
 				err := tc.cycleFn(ctx)
 				if err == nil {
 					mu.Lock()
@@ -100,7 +132,11 @@ func TestRunWatch(t *testing.T) {
 				time.AfterFunc(tc.cancelAt, cancel)
 			}
 
-			err := s.runWatch(ctx, tc.interval, wrapped)
+			// Backoff is asserted separately; keep retries fast here.
+			fastSleep := func(ctx context.Context, _ time.Duration) bool {
+				return waitOrDone(ctx, time.Millisecond)
+			}
+			err := s.runWatch(ctx, tc.interval, wrapped, fastSleep)
 
 			if tc.wantErr && err == nil {
 				t.Error("expected error, got nil")
@@ -110,10 +146,13 @@ func TestRunWatch(t *testing.T) {
 			}
 
 			mu.Lock()
-			n := completed
+			n, a := completed, attempts
 			mu.Unlock()
 			if n < tc.minCycles {
 				t.Errorf("completed %d cycles, want at least %d", n, tc.minCycles)
+			}
+			if a < tc.minAttempts {
+				t.Errorf("made %d attempts, want at least %d", a, tc.minAttempts)
 			}
 		})
 	}
