@@ -140,3 +140,17 @@ func TestInitialSyncCancelDuringBackoff(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// TestNewWithZeroMeter pins the documented contract that Config.Meter is
+// optional: metric.Meter is an interface whose zero value is nil, so an omitted
+// meter must fall back to no-op instruments rather than panicking.
+func TestNewWithZeroMeter(t *testing.T) {
+	s, err := New(Config{}) // Meter deliberately unset
+	if err != nil {
+		t.Fatalf("New with zero Meter: %v", err)
+	}
+	// Recording through the resulting instruments must also be safe.
+	s.m.cycleFailures.Add(context.Background(), 1)
+	s.m.synced.Add(context.Background(), 1)
+	s.m.activeWorkers.Add(context.Background(), 1)
+}

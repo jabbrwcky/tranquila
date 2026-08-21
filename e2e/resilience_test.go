@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"go.opentelemetry.io/otel/metric/noop"
-
 	"github.com/jabbrwcky/tranquila/internal/storage"
 	tsync "github.com/jabbrwcky/tranquila/internal/sync"
 )
@@ -20,9 +18,7 @@ func syncerFor(t *testing.T, s *stack, src, dst *storage.Client, srcBucket, dstB
 		Source:      src,
 		Destination: dst,
 		State:       s.store(t),
-		// sync.New calls newMetrics unconditionally and metric.Meter's zero
-		// value is a nil interface, so a meter must be supplied explicitly.
-		Meter:   noop.Meter{},
+		// Meter is left unset: it is optional and falls back to no-op instruments.
 		Buckets: map[string]tsync.BucketConfig{srcBucket: {Destination: dstBucket}},
 		Workers: 4,
 		// Keep retry pacing test-scale; production defaults are 5s/10m.

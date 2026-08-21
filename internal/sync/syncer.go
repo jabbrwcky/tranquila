@@ -15,6 +15,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 const defaultDiscoveryBatchSize = 100_000
@@ -39,7 +40,7 @@ type Config struct {
 	Source             *storage.Client
 	Destination        *storage.Client
 	State              *state.Store
-	Meter              metric.Meter
+	Meter              metric.Meter            // optional; zero value produces no-op instruments
 	Buckets            map[string]BucketConfig // src → config; nil = auto-discover all
 	DestBucketPrefix   string                  // prefix for auto-discovered destination bucket names
 	Workers            int
@@ -75,6 +76,10 @@ func New(cfg Config) (*Syncer, error) {
 }
 
 func newMetrics(meter metric.Meter) (metrics, error) {
+	// metric.Meter is an interface, so its zero value is nil rather than a no-op.
+	if meter == nil {
+		meter = noop.Meter{}
+	}
 	synced, err := meter.Int64Counter("tranquila.objects.synced",
 		metric.WithDescription("Total objects successfully synced"))
 	if err != nil {
