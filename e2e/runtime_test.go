@@ -77,25 +77,31 @@ func configureContainerRuntime() error {
 	return nil
 }
 
-// podmanSocket reports podman's stable socket path when the Docker socket is a
-// symlink into a podman machine.
+// podmanSocket locates a podman socket, preferring paths that are stable and
+// contain the "podman.sock" substring testcontainers matches on. The machine's
+// own API socket is deliberately a last resort: it lives in a temp directory and
+// is named podman-machine-default-api.sock, which does not contain that
+// substring and so would not trigger provider detection.
 func podmanSocket() (string, bool) {
-	const dockerSock = "/var/run/docker.sock"
-	target, err := filepath.EvalSymlinks(dockerSock)
-	if err != nil {
-		return "", false
-	}
-	if !strings.Contains(target, "podman") {
-		return "", false
-	}
-	// Prefer the stable, well-named symlink over the machine's temp-dir socket:
-	// the temp path is called podman-machine-default-api.sock, which does not
-	// contain "podman.sock".
+	var candidates []string
 	if home, err := os.UserHomeDir(); err == nil {
-		stable := filepath.Join(home, ".local", "share", "containers", "podman", "machine", "podman.sock")
-		if _, err := os.Stat(stable); err == nil {
-			return stable, true
+		// podman machine on macOS and Linux.
+		candidates = append(candidates,
+			filepath.Join(home, ".local", "share", "containers", "podman", "machine", "podman.sock"))
+	}
+	if run := os.Getenv("XDG_RUNTIME_DIR"); run != "" {
+		// Rootless podman service on Linux.
+		candidates = append(candidates, filepath.Join(run, "podman", "podman.sock"))
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c, true
 		}
+	}
+	// Fall back to whatever the Docker socket points at, for unusual layouts.
+	target, err := filepath.EvalSymlinks("/var/run/docker.sock")
+	if err != nil || !strings.Contains(target, "podman") {
+		return "", false
 	}
 	return target, true
 }

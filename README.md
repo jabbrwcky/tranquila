@@ -357,21 +357,34 @@ readinessProbe:
 go build -v
 ```
 
-Requires Go 1.22 or later.
+Requires Go 1.25 or later, as declared in `go.mod`.
 
 ## Tests
 
 ```bash
-go test ./...          # unit tests
-cd e2e && go test ./... # end-to-end, container-backed (~5-10 min)
+go test ./...             # unit tests, no containers
+cd e2e && go test ./...    # end-to-end, container-backed (~3-4 min)
 ```
 
 The end-to-end suite drives the resilience behaviour above against a real MinIO,
 injecting HTTP faults (504/503/500) and TCP faults (connection resets) to prove
 that transient failures are absorbed, watch mode survives an outage, and rate
 limits degrade and recover. It is a separate Go module, so it neither slows the
-unit suite nor adds container dependencies to the production module. Runs on
-Docker and on podman without Docker Desktop — see [e2e/README.md](e2e/README.md).
+unit suite nor adds container dependencies to the production module.
+
+It needs a container runtime. Docker works as-is; on macOS, Podman works without
+Docker Desktop, but the machine must be **rootful**:
+
+```bash
+brew install podman
+podman machine init --rootful && podman machine start
+cd e2e && go test ./...
+```
+
+No environment variables are needed — the suite configures the runtime itself,
+and skips with an explanation if none is reachable. Apple's native `container`
+CLI is **not** supported (it exposes no Docker-compatible API). Full setup,
+configuration reference and troubleshooting: **[e2e/README.md](e2e/README.md)**.
 
 ## Usage Examples
 
