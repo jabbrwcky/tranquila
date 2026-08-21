@@ -12,6 +12,8 @@ sync:
   #   region: "us-east-1"
   #   access-key: ""
   #   secret-key: ""
+  #   # Set a non-zero rate-limit to enable congestion control for the
+  #   # destination; an unlimited endpoint has no ceiling to reduce.
   #   rate-limit: 0.0
 
   buckets:
