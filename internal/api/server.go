@@ -18,19 +18,23 @@ type Config struct {
 	Progress *internalsync.Progress
 	// Ready checks readiness dependencies. If nil, defaults to State.Ping.
 	Ready func(ctx context.Context) error
+	// Endpoints reports source and destination rate-limit state. Optional;
+	// when nil the fields are omitted from the sync status response.
+	Endpoints func() (source, destination EndpointState)
 }
 
 // Server is the HTTP management API server.
 type Server struct {
-	srv      *http.Server
-	state    *state.Store
-	progress *internalsync.Progress
-	ready    func(ctx context.Context) error
+	srv       *http.Server
+	state     *state.Store
+	progress  *internalsync.Progress
+	ready     func(ctx context.Context) error
+	endpoints func() (source, destination EndpointState)
 }
 
 // NewServer creates a Server and registers all routes. Call ListenAndServe to start.
 func NewServer(cfg Config) *Server {
-	s := &Server{state: cfg.State, progress: cfg.Progress, ready: cfg.Ready}
+	s := &Server{state: cfg.State, progress: cfg.Progress, ready: cfg.Ready, endpoints: cfg.Endpoints}
 	if s.ready == nil && cfg.State != nil {
 		s.ready = cfg.State.Ping
 	}
@@ -78,10 +82,21 @@ type BucketStatus struct {
 	SyncProgress  *BucketSyncProgress `json:"sync_progress,omitempty"`
 }
 
+// EndpointState reports one endpoint's rate-limit pacing. RateLimit and
+// BaseRateLimit are omitted when the endpoint is unlimited.
+type EndpointState struct {
+	RateLimit     float64    `json:"rate_limit,omitempty"`
+	BaseRateLimit float64    `json:"base_rate_limit,omitempty"`
+	Degraded      bool       `json:"degraded"`
+	DegradedSince *time.Time `json:"degraded_since,omitempty"`
+}
+
 type SyncStatus struct {
-	Running   bool           `json:"running"`
-	StartedAt *time.Time     `json:"started_at,omitempty"`
-	Buckets   []BucketStatus `json:"buckets"`
+	Running     bool           `json:"running"`
+	StartedAt   *time.Time     `json:"started_at,omitempty"`
+	Source      *EndpointState `json:"source,omitempty"`
+	Destination *EndpointState `json:"destination,omitempty"`
+	Buckets     []BucketStatus `json:"buckets"`
 }
 
 type apiError struct {
@@ -221,6 +236,10 @@ func (s *Server) getSyncStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	if !snap.StartedAt.IsZero() {
 		status.StartedAt = &snap.StartedAt
+	}
+	if s.endpoints != nil {
+		src, dst := s.endpoints()
+		status.Source, status.Destination = &src, &dst
 	}
 
 	for name := range snap.Buckets {

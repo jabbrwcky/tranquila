@@ -97,11 +97,49 @@ sync:
 
   workers: 10
 
+  # Resilience (see "Failure Handling" below)
+  cycle-backoff: 5s
+  cycle-backoff-max: 10m
+  endpoint-fail-threshold: 5
+
   telemetry:
     exporter: prometheus     # prometheus | otlp | none
-    addr: :9090
+    addr: :8081
     otlp-endpoint: ""
 ```
+
+## Failure Handling
+
+Watch mode must never exit on a transient endpoint fault — `os.Exit` also kills
+the in-process mgmt server, so `/healthz` stops answering and K8s restarts the pod.
+
+| Layer | Mechanism |
+| --- | --- |
+| Error classification | `storage.Classify` → `ClassOK`/`ClassTransient`/`ClassThrottle`/`ClassPermanent`. HTTP status first (`*awshttp.ResponseError`), then smithy error code. Unknown → transient. |
+| Per-call retry | AWS SDK retryer at `s3MaxAttempts` (5); `listPageWithRetry` at 8 attempts, 30s delay cap, jittered. |
+| Per-cycle retry | `runWatch`/`initialSync` back off with `cycleBackoff` (jittered exponential) and never return on transient errors. |
+| Rate degradation | `internal/storage/aimd.go`, fed one signal per S3 call from `recordOp`. Halve after N transient failures (immediately on throttle), floor 1/s, additive recovery of 10% of base per 20 healthy calls. |
+
+Key decisions:
+
+- **Only permanent errors terminate**, and only when *every* failure in the cycle
+  is permanent (`isFatalCycleErr` fans out one level of `errors.Join`). A mixed
+  cycle counts as transient so a flaky endpoint cannot look like misconfiguration.
+- **One-shot mode is unchanged** — still exits non-zero, so a K8s Job reports failure.
+  The asymmetry falls out of the retry loop living inside `runWatch`.
+- **`Run` returns `errors.Join`**, not the first error, so a partial-failure cycle
+  keeps every bucket's failure visible.
+- **Only endpoints with a configured `rate-limit` degrade.** Unlimited has no
+  ceiling to halve, and inventing one would throttle a healthy endpoint.
+- **The limiter is always constructed** (`rate.Inf` when unlimited) so the pointer
+  is never nil and never swapped — only `SetLimit` mutates. Note `rate.Inf` is
+  `Limit(math.MaxFloat64)`, *not* IEEE infinity: compare with `== rate.Inf`.
+- **AIMD is event-counted, never time-based**, so the control loop is deterministic
+  under test — no clock injection, no sleeps.
+- **`/readyz` stays green while degraded** — degraded is the designed correct
+  response; marking the pod NotReady sheds no load and stalls rollouts.
+- **Detached transfers are time-bounded** (`transferGrace`) so a degraded limiter
+  cannot pace an uncancellable transfer past `terminationGracePeriodSeconds`.
 
 ## CLI Flags Added This Session
 
@@ -110,6 +148,9 @@ sync:
 --watch-mode             poll|minio|sqs (default: poll)
 --watch-interval         inter-cycle sleep for poll mode (default: 60s)
 --sqs-queue-url          SQS queue URL (sqs mode only)
+--cycle-backoff          base retry delay after a failed cycle (default: 5s)
+--cycle-backoff-max      cap for the retry delay (default: 10m)
+--endpoint-fail-threshold transient failures before halving the rate (default: 5)
 ```
 
 ## Dependencies Added

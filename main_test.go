@@ -162,6 +162,37 @@ sync:
 	}
 }
 
+func TestConfigFileResilience(t *testing.T) {
+	sync := configFromYAML(t, `
+sync:
+  cycle-backoff: 15s
+  cycle-backoff-max: 2m
+  endpoint-fail-threshold: 3
+`)
+	if sync.CycleBackoff != 15*time.Second {
+		t.Errorf("CycleBackoff = %v, want 15s", sync.CycleBackoff)
+	}
+	if sync.CycleBackoffMax != 2*time.Minute {
+		t.Errorf("CycleBackoffMax = %v, want 2m", sync.CycleBackoffMax)
+	}
+	if sync.EndpointFailThreshold != 3 {
+		t.Errorf("EndpointFailThreshold = %d, want 3", sync.EndpointFailThreshold)
+	}
+}
+
+func TestConfigFileResilienceDefaults(t *testing.T) {
+	sync := configFromYAML(t, "sync: {}\n")
+	if sync.CycleBackoff != 5*time.Second {
+		t.Errorf("CycleBackoff = %v, want 5s", sync.CycleBackoff)
+	}
+	if sync.CycleBackoffMax != 10*time.Minute {
+		t.Errorf("CycleBackoffMax = %v, want 10m", sync.CycleBackoffMax)
+	}
+	if sync.EndpointFailThreshold != 5 {
+		t.Errorf("EndpointFailThreshold = %d, want 5", sync.EndpointFailThreshold)
+	}
+}
+
 func TestConfigFileTelemetry(t *testing.T) {
 	sync := configFromYAML(t, `
 sync:

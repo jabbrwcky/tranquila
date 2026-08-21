@@ -198,11 +198,40 @@ components:
           format: date-time
           nullable: true
           description: When the current (or most recent) sync run started
+        source:
+          $ref: "#/components/schemas/EndpointState"
+        destination:
+          $ref: "#/components/schemas/EndpointState"
         buckets:
           type: array
           description: Status of each bucket that is part of the active sync run
           items:
             $ref: "#/components/schemas/BucketStatus"
+
+    EndpointState:
+      type: object
+      description: >
+        Rate-limit pacing for one S3 endpoint. Congestion control halves the
+        limit after repeated transient failures and restores it additively.
+        Only endpoints with a configured rate limit are degraded.
+      required: [degraded]
+      properties:
+        rate_limit:
+          type: number
+          format: double
+          description: Effective S3 API calls/sec; omitted when unlimited
+        base_rate_limit:
+          type: number
+          format: double
+          description: Configured ceiling in S3 API calls/sec; omitted when unlimited
+        degraded:
+          type: boolean
+          description: Whether the limit is currently reduced below its configured base
+        degraded_since:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the current degraded episode began
 
     Health:
       type: object
