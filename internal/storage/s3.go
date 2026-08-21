@@ -19,6 +19,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 	"golang.org/x/time/rate"
 )
 
@@ -119,21 +120,27 @@ func (c *Client) initMetrics(cfg Config) error {
 	}
 	m := clientMetrics{attrs: []attribute.KeyValue{attribute.String("endpoint", name)}}
 
+	// metric.Meter is an interface, so its zero value is nil rather than a no-op.
+	meter := cfg.Meter
+	if meter == nil {
+		meter = noop.Meter{}
+	}
+
 	var err error
-	if m.opDuration, err = cfg.Meter.Float64Histogram("tranquila.s3.operation.duration",
+	if m.opDuration, err = meter.Float64Histogram("tranquila.s3.operation.duration",
 		metric.WithDescription("Duration of individual S3 API calls"),
 		metric.WithUnit("ms")); err != nil {
 		return fmt.Errorf("init s3 metrics: %w", err)
 	}
-	if m.errors, err = cfg.Meter.Int64Counter("tranquila.s3.errors",
+	if m.errors, err = meter.Int64Counter("tranquila.s3.errors",
 		metric.WithDescription("S3 API call failures by class")); err != nil {
 		return fmt.Errorf("init s3 metrics: %w", err)
 	}
-	if m.limitChanges, err = cfg.Meter.Int64Counter("tranquila.s3.rate_limit.changes",
+	if m.limitChanges, err = meter.Int64Counter("tranquila.s3.rate_limit.changes",
 		metric.WithDescription("Rate limit adjustments made by congestion control")); err != nil {
 		return fmt.Errorf("init s3 metrics: %w", err)
 	}
-	if _, err = cfg.Meter.Float64ObservableGauge("tranquila.s3.rate_limit",
+	if _, err = meter.Float64ObservableGauge("tranquila.s3.rate_limit",
 		metric.WithDescription("Effective S3 API call rate limit; 0 = unlimited"),
 		metric.WithUnit("{call}/s"),
 		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
@@ -142,7 +149,7 @@ func (c *Client) initMetrics(cfg Config) error {
 		})); err != nil {
 		return fmt.Errorf("init s3 metrics: %w", err)
 	}
-	if _, err = cfg.Meter.Int64ObservableGauge("tranquila.s3.rate_limit.degraded",
+	if _, err = meter.Int64ObservableGauge("tranquila.s3.rate_limit.degraded",
 		metric.WithDescription("1 while the endpoint's rate limit is reduced by congestion control"),
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
 			var v int64

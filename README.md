@@ -247,14 +247,21 @@ congestion control, fed by the outcome of every S3 API call:
 - A permanent error counts as *healthy* for pacing purposes: the endpoint
   answered, so it is not congested.
 
-Source and destination are paced independently, so a flaky source does not slow
-destination writes.
+Source and destination are paced independently and symmetrically: a source-side
+`504` throttles source reads only, and a destination-side `504` throttles
+destination writes only. Every S3 operation feeds the controller, including the
+destination's `PutObject`, `HeadObject`, `DeleteObject` and bucket creation.
 
 > **Requires a configured rate limit.** Only endpoints with an explicit
 > `--source-rate-limit` / `--dest-rate-limit` are degraded. An endpoint left
 > unlimited (the default, `0`) has no ceiling to reduce, and inventing one would
 > throttle a healthy endpoint — so it keeps running unlimited and gets only the
-> cycle backoff above.
+> cycle backoff above. To protect the destination, set `--dest-rate-limit`.
+
+Note that the limiter paces *operations*, not HTTP requests: an upload above the
+transfer manager's 16 MiB multipart threshold issues several requests but spends
+one token, and a failure anywhere in it is one congestion signal. Pacing is
+therefore approximate for workloads dominated by large objects.
 
 Current pacing is exposed on `GET /api/v1/sync` as `source` and `destination`
 (`rate_limit`, `base_rate_limit`, `degraded`, `degraded_since`) and as the
