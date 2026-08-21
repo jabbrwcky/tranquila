@@ -23,12 +23,14 @@ import (
 )
 
 type Config struct {
-	Endpoint  string
-	Region    string
-	AccessKey string
-	SecretKey string
-	RateLimit float64      // max S3 API calls/sec for this client; 0 = unlimited
-	Meter     metric.Meter // optional; zero value produces no-op instruments
+	Endpoint      string
+	Region        string
+	AccessKey     string
+	SecretKey     string
+	RateLimit     float64      // max S3 API calls/sec for this client; 0 = unlimited
+	FailThreshold int          // consecutive transient failures before the rate is halved (0 = default 5)
+	Name          string       // "source"/"destination"; labels metrics
+	Meter         metric.Meter // optional; zero value produces no-op instruments
 }
 
 type Object struct {
@@ -40,14 +42,18 @@ type Object struct {
 }
 
 type clientMetrics struct {
-	opDuration metric.Float64Histogram
+	opDuration   metric.Float64Histogram
+	errors       metric.Int64Counter
+	limitChanges metric.Int64Counter
+	attrs        []attribute.KeyValue // cached endpoint label
 }
 
 type Client struct {
 	s3      *s3.Client
 	tm      *transfermanager.Client
 	region  string
-	limiter *rate.Limiter // nil = unlimited
+	limiter *rate.Limiter // never nil; rate.Inf = unlimited, mutated only via aimd
+	aimd    *aimd
 	m       clientMetrics
 }
 
@@ -84,39 +90,84 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 
 	s3c := s3.NewFromConfig(awsCfg, clientOpts...)
 
-	opDuration, err := cfg.Meter.Float64Histogram("tranquila.s3.operation.duration",
-		metric.WithDescription("Duration of individual S3 API calls"),
-		metric.WithUnit("ms"))
-	if err != nil {
-		return nil, fmt.Errorf("init s3 metrics: %w", err)
-	}
-
-	var lim *rate.Limiter
+	// Always construct the limiter so the pointer is never nil and never
+	// swapped: rate.Inf short-circuits Wait, and only SetLimit ever mutates it.
+	base := rate.Inf
 	if cfg.RateLimit > 0 {
-		// Burst of 1 enforces strict per-call pacing with no token accumulation.
-		lim = rate.NewLimiter(rate.Limit(cfg.RateLimit), 1)
+		base = rate.Limit(cfg.RateLimit)
 	}
+	// Burst of 1 enforces strict per-call pacing with no token accumulation.
+	lim := rate.NewLimiter(base, 1)
 
-	return &Client{
+	c := &Client{
 		s3:      s3c,
 		tm:      transfermanager.New(s3c),
 		region:  cfg.Region,
 		limiter: lim,
-		m:       clientMetrics{opDuration: opDuration},
-	}, nil
+		aimd:    newAIMD(lim, base, cfg.FailThreshold),
+	}
+	if err := c.initMetrics(cfg); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *Client) initMetrics(cfg Config) error {
+	name := cfg.Name
+	if name == "" {
+		name = "s3"
+	}
+	m := clientMetrics{attrs: []attribute.KeyValue{attribute.String("endpoint", name)}}
+
+	var err error
+	if m.opDuration, err = cfg.Meter.Float64Histogram("tranquila.s3.operation.duration",
+		metric.WithDescription("Duration of individual S3 API calls"),
+		metric.WithUnit("ms")); err != nil {
+		return fmt.Errorf("init s3 metrics: %w", err)
+	}
+	if m.errors, err = cfg.Meter.Int64Counter("tranquila.s3.errors",
+		metric.WithDescription("S3 API call failures by class")); err != nil {
+		return fmt.Errorf("init s3 metrics: %w", err)
+	}
+	if m.limitChanges, err = cfg.Meter.Int64Counter("tranquila.s3.rate_limit.changes",
+		metric.WithDescription("Rate limit adjustments made by congestion control")); err != nil {
+		return fmt.Errorf("init s3 metrics: %w", err)
+	}
+	if _, err = cfg.Meter.Float64ObservableGauge("tranquila.s3.rate_limit",
+		metric.WithDescription("Effective S3 API call rate limit; 0 = unlimited"),
+		metric.WithUnit("{call}/s"),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			o.Observe(c.aimd.state().Current, metric.WithAttributes(m.attrs...))
+			return nil
+		})); err != nil {
+		return fmt.Errorf("init s3 metrics: %w", err)
+	}
+	if _, err = cfg.Meter.Int64ObservableGauge("tranquila.s3.rate_limit.degraded",
+		metric.WithDescription("1 while the endpoint's rate limit is reduced by congestion control"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			var v int64
+			if c.aimd.state().Degraded {
+				v = 1
+			}
+			o.Observe(v, metric.WithAttributes(m.attrs...))
+			return nil
+		})); err != nil {
+		return fmt.Errorf("init s3 metrics: %w", err)
+	}
+
+	c.m = m
+	return nil
 }
 
 // wait blocks until the rate limiter allows the next S3 API call.
-// No-op when RateLimit is 0 (unlimited).
+// Returns immediately while the limit is rate.Inf (unlimited).
 func (c *Client) wait(ctx context.Context) error {
-	if c.limiter == nil {
-		return nil
-	}
 	return c.limiter.Wait(ctx)
 }
 
 // recordOp records a completed S3 API call with operation name, bucket, success flag, and duration.
 func (c *Client) recordOp(ctx context.Context, op, bucket string, start time.Time, err error) {
+	class := Classify(err)
 	status := "ok"
 	if err != nil {
 		status = "error"
@@ -127,7 +178,43 @@ func (c *Client) recordOp(ctx context.Context, op, bucket string, start time.Tim
 			attribute.String("bucket", bucket),
 			attribute.String("status", status),
 		))
+	c.observe(ctx, class)
 }
+
+// observe feeds one call outcome to the endpoint's congestion controller.
+func (c *Client) observe(ctx context.Context, class ErrClass) {
+	if class != ClassOK {
+		c.m.errors.Add(ctx, 1, metric.WithAttributes(
+			append(c.m.attrs, attribute.String("class", class.String()))...))
+	}
+
+	switch class {
+	case ClassTransient, ClassThrottle:
+		if c.aimd.onCongestion(class == ClassThrottle) {
+			c.logLimitChange(ctx, "decrease", "endpoint congested, reducing S3 rate limit")
+		}
+	default:
+		// A permanent error still means the endpoint answered, so it is not a
+		// congestion signal; that failure is the syncer's problem, not the pacer's.
+		if c.aimd.onHealthy() {
+			c.logLimitChange(ctx, "increase", "endpoint recovering, raising S3 rate limit")
+		}
+	}
+}
+
+func (c *Client) logLimitChange(ctx context.Context, direction, msg string) {
+	st := c.aimd.state()
+	c.m.limitChanges.Add(ctx, 1, metric.WithAttributes(
+		append(c.m.attrs, attribute.String("direction", direction))...))
+	log.Warn().
+		Float64("rate_limit", st.Current).
+		Float64("base_rate_limit", st.Base).
+		Bool("degraded", st.Degraded).
+		Msg(msg)
+}
+
+// LimitState reports the endpoint's current pacing state.
+func (c *Client) LimitState() LimitState { return c.aimd.state() }
 
 func (c *Client) ListBuckets(ctx context.Context) ([]string, error) {
 	if err := c.wait(ctx); err != nil {

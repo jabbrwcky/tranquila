@@ -137,3 +137,11 @@ sync:
 
   workers: 10
   dry-run: false       # set true to log planned burn-after-reading deletions without executing them
+
+  # Resilience: failed cycles retry with jittered exponential backoff instead of
+  # exiting. After endpoint-fail-threshold consecutive transient failures the
+  # endpoint's rate-limit is halved, then restored additively once it recovers.
+  # Rate reduction only applies to endpoints with a configured rate-limit.
+  cycle-backoff: 5s
+  cycle-backoff-max: 10m
+  endpoint-fail-threshold: 5

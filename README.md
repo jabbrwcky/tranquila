@@ -99,6 +99,7 @@ sync:
   # Retry pacing after a failed cycle in watch mode (exponential, jittered)
   cycle-backoff: 5s
   cycle-backoff-max: 10m
+  endpoint-fail-threshold: 5  # transient failures before an endpoint's rate is halved
 
   telemetry:
     exporter: "prometheus"  # prometheus | otlp | none
@@ -180,6 +181,7 @@ tranquila sync --prefix-mappings "bucket/src-prefix=dst-prefix"
 | `TRANQUILA_SQS_QUEUE_URL`         |                  | SQS queue URL (sqs watch mode)                       |
 | `TRANQUILA_CYCLE_BACKOFF`         | `5s`             | Base retry delay after a failed cycle (watch mode)   |
 | `TRANQUILA_CYCLE_BACKOFF_MAX`     | `10m`            | Maximum retry delay after a failed cycle             |
+| `TRANQUILA_ENDPOINT_FAIL_THRESHOLD` | `5`            | Transient failures before an endpoint's rate is halved |
 | `TELEMETRY_EXPORTER`              | `prometheus`     | Metrics exporter: `prometheus`, `otlp`, or `none`    |
 | `TELEMETRY_ADDR`                  | `:8081`          | Prometheus metrics listen address                    |
 | `TELEMETRY_OTLP_ENDPOINT`         |                  | OTLP gRPC endpoint                                   |
@@ -230,6 +232,40 @@ transient, so a flaky endpoint can never be misread as misconfiguration.
 
 One-shot runs (no `--watch`) are unchanged and still exit non-zero on any
 failure, so a Kubernetes `Job` or CI invocation reports it.
+
+### Adaptive rate limiting
+
+Each endpoint's rate limit is governed by additive-increase/multiplicative-decrease
+congestion control, fed by the outcome of every S3 API call:
+
+- After `--endpoint-fail-threshold` consecutive transient failures (default `5`)
+  the endpoint's rate limit is **halved**, down to a floor of 1 call/sec.
+- An explicit throttle (`503`, `SlowDown`, `429`) is unambiguous back-pressure
+  and halves the rate on the **first** signal, without waiting for the threshold.
+- After 20 consecutive healthy calls the limit climbs back by 10% of the
+  configured base, until it is fully restored. Decrease fast, recover slowly.
+- A permanent error counts as *healthy* for pacing purposes: the endpoint
+  answered, so it is not congested.
+
+Source and destination are paced independently, so a flaky source does not slow
+destination writes.
+
+> **Requires a configured rate limit.** Only endpoints with an explicit
+> `--source-rate-limit` / `--dest-rate-limit` are degraded. An endpoint left
+> unlimited (the default, `0`) has no ceiling to reduce, and inventing one would
+> throttle a healthy endpoint — so it keeps running unlimited and gets only the
+> cycle backoff above.
+
+Current pacing is exposed on `GET /api/v1/sync` as `source` and `destination`
+(`rate_limit`, `base_rate_limit`, `degraded`, `degraded_since`) and as the
+metrics `tranquila_s3_rate_limit`, `tranquila_s3_rate_limit_degraded`,
+`tranquila_s3_rate_limit_changes` and `tranquila_s3_errors`.
+
+`/readyz` stays green while degraded: degraded operation is the designed correct
+response to a flaky endpoint, and reporting it as unready would stall rolling
+updates without shedding any load. Alert on
+`tranquila_s3_rate_limit_degraded == 1` and `tranquila_sync_cycle_failures`
+instead.
 
 ## Required IAM Permissions
 
