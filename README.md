@@ -359,6 +359,20 @@ go build -v
 
 Requires Go 1.22 or later.
 
+## Tests
+
+```bash
+go test ./...          # unit tests
+cd e2e && go test ./... # end-to-end, container-backed (~5-10 min)
+```
+
+The end-to-end suite drives the resilience behaviour above against a real MinIO,
+injecting HTTP faults (504/503/500) and TCP faults (connection resets) to prove
+that transient failures are absorbed, watch mode survives an outage, and rate
+limits degrade and recover. It is a separate Go module, so it neither slows the
+unit suite nor adds container dependencies to the production module. Runs on
+Docker and on podman without Docker Desktop — see [e2e/README.md](e2e/README.md).
+
 ## Usage Examples
 
 Sync with environment variables:

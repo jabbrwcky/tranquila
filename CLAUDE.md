@@ -108,6 +108,34 @@ sync:
     otlp-endpoint: ""
 ```
 
+## Testing
+
+| Scope | Command | Notes |
+| --- | --- | --- |
+| Unit | `go test ./...` | Stdlib `testing`, table-driven. No containers, no sleeps. |
+| End-to-end | `cd e2e && go test ./...` | Separate module (`github.com/jabbrwcky/tranquila/e2e`) with a `replace` to `../`. Root `go test ./...` does not descend into it. |
+
+The e2e module is separate on purpose: testcontainers pulls ~89 transitive
+dependencies (moby, containerd) that must not enter the production module graph
+or `govulncheck` scope. A submodule can still import `internal/...` because the
+internal rule is lexical on import paths, not module-scoped.
+
+Two fault injectors, because they cover different layers:
+
+- **Toxiproxy** (container) is L4 only — `latency`, `down`, `bandwidth`,
+  `slow_close`, `timeout`, `reset_peer`, `slicer`, `limit_data`. It has no HTTP
+  parsing and **cannot emit 504/503/500**.
+- **`faultproxy_test.go`** is an in-process L7 `httputil.ReverseProxy` that
+  injects HTTP statuses, which is what the production 504 incident needed. It
+  emits both XML bodies (SDK decodes an `APIError`) and non-XML gateway pages
+  (no `APIError` at all — the case that forces status-first classification).
+
+Gotchas worth not rediscovering: assertions use `HeadObject` because
+`listPageWithRetry`'s 8 jittered attempts make a failing list take 2+ minutes;
+podman needs `DOCKER_HOST` pointed at a path containing `podman.sock` or Ryuk
+dies on the missing `bridge` network; Apple's `container` has no Docker API and
+cannot run testcontainers at all. Details in `e2e/README.md`.
+
 ## Failure Handling
 
 Watch mode must never exit on a transient endpoint fault — `os.Exit` also kills
