@@ -56,6 +56,9 @@ type SyncCmd struct {
 	WatchInterval time.Duration `name:"watch-interval" env:"TRANQUILA_WATCH_INTERVAL" default:"60s" help:"Idle time between poll cycles (poll mode only)"`
 	SQSQueueURL   string        `name:"sqs-queue-url" env:"TRANQUILA_SQS_QUEUE_URL" help:"SQS queue URL for S3 event notifications (sqs mode)"`
 
+	CycleBackoff    time.Duration `name:"cycle-backoff" env:"TRANQUILA_CYCLE_BACKOFF" default:"5s" help:"Base delay before retrying a failed sync cycle in watch mode (exponential with jitter)"`
+	CycleBackoffMax time.Duration `name:"cycle-backoff-max" env:"TRANQUILA_CYCLE_BACKOFF_MAX" default:"10m" help:"Maximum delay between failed sync cycles in watch mode"`
+
 	TelemetryExporter     string `name:"telemetry-exporter" env:"TELEMETRY_EXPORTER" default:"prometheus" enum:"prometheus,otlp,none" help:"Metrics exporter"`
 	TelemetryAddr         string `name:"telemetry-addr" env:"TELEMETRY_ADDR" default:":8081" help:"Prometheus metrics listen address"`
 	TelemetryOTLPEndpoint string `name:"telemetry-otlp-endpoint" env:"TELEMETRY_OTLP_ENDPOINT" help:"OTLP gRPC endpoint"`
@@ -255,6 +258,8 @@ func (cmd *SyncCmd) Run() error {
 		DryRun:             cmd.DryRun,
 		Progress:           progress,
 		DiscoveryBatchSize: cmd.DiscoveryBatchSize,
+		CycleBackoff:       cmd.CycleBackoff,
+		CycleBackoffMax:    cmd.CycleBackoffMax,
 	})
 	if err != nil {
 		return fmt.Errorf("create syncer: %w", err)
