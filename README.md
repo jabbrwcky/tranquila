@@ -96,6 +96,10 @@ sync:
   watch-interval: 60s       # inter-cycle sleep (poll mode only)
   sqs-queue-url: ""         # SQS queue URL (sqs mode only)
 
+  # Retry pacing after a failed cycle in watch mode (exponential, jittered)
+  cycle-backoff: 5s
+  cycle-backoff-max: 10m
+
   telemetry:
     exporter: "prometheus"  # prometheus | otlp | none
     addr: ":8081"
@@ -174,6 +178,8 @@ tranquila sync --prefix-mappings "bucket/src-prefix=dst-prefix"
 | `TRANQUILA_WATCH_MODE`            | `poll`           | Watch backend: `poll`, `minio`, or `sqs`             |
 | `TRANQUILA_WATCH_INTERVAL`        | `60s`            | Idle time between poll cycles                        |
 | `TRANQUILA_SQS_QUEUE_URL`         |                  | SQS queue URL (sqs watch mode)                       |
+| `TRANQUILA_CYCLE_BACKOFF`         | `5s`             | Base retry delay after a failed cycle (watch mode)   |
+| `TRANQUILA_CYCLE_BACKOFF_MAX`     | `10m`            | Maximum retry delay after a failed cycle             |
 | `TELEMETRY_EXPORTER`              | `prometheus`     | Metrics exporter: `prometheus`, `otlp`, or `none`    |
 | `TELEMETRY_ADDR`                  | `:8081`          | Prometheus metrics listen address                    |
 | `TELEMETRY_OTLP_ENDPOINT`         |                  | OTLP gRPC endpoint                                   |
@@ -204,6 +210,26 @@ tranquila sync --watch --watch-mode=minio --source-endpoint=http://minio:9000
 tranquila sync --watch --watch-mode=sqs \
   --sqs-queue-url=https://sqs.eu-west-1.amazonaws.com/123/my-queue
 ```
+
+### Failure handling in watch mode
+
+Watch mode is a long-lived service, so a transient endpoint fault must not become
+a pod restart. Failed cycles are retried with exponential backoff plus jitter
+(`--cycle-backoff`, `--cycle-backoff-max`) and the process stays alive, keeping
+`/healthz` answering.
+
+| Failure | Watch mode | One-shot |
+| --- | --- | --- |
+| Transient (504, 502, 500, timeouts, dropped connections) | Retried forever with backoff | Exits non-zero |
+| Throttle (503, `SlowDown`, 429) | Retried forever with backoff | Exits non-zero |
+| Permanent (`AccessDenied`, `NoSuchBucket`, bad credentials) | Exits non-zero | Exits non-zero |
+
+Misconfiguration stays loud: only a cycle whose failures are *all* permanent
+terminates. A cycle mixing permanent and transient failures is treated as
+transient, so a flaky endpoint can never be misread as misconfiguration.
+
+One-shot runs (no `--watch`) are unchanged and still exit non-zero on any
+failure, so a Kubernetes `Job` or CI invocation reports it.
 
 ## Required IAM Permissions
 
