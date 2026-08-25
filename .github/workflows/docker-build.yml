@@ -1,12 +1,53 @@
 name: Docker Build
 
+# Triggered by CI's completion rather than push directly, so an image is only
+# built once the build/test/e2e/vuln-check gate is green — a push whose CI
+# fails never produces an image. workflow_run fires regardless of whether that
+# CI run itself came from a push or a pull_request event, so every branch
+# still gets an (now CI-gated) image, matching the old push-triggered coverage;
+# should-run below dedups the branches that trigger CI twice (see its comment).
 on:
-  push:
-    branches: ["**"]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 jobs:
+  # For a branch with an open PR, CI's own push-triggered run has its jobs
+  # skipped by its should-run-push gate but still "completes" (trivially,
+  # since nothing failed) — which would otherwise fire this workflow_run
+  # trigger a second time, once for that trivial push-triggered completion
+  # and once for the real pull_request-triggered completion. Skip the push
+  # one here too so only the pull_request-triggered CI completion builds.
+  should-run:
+    name: Check for duplicate coverage
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Skip when a pull_request-triggered CI run will also cover this commit
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event.workflow_run.event }}" != "push" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          count=$(gh pr list --repo "${{ github.repository }}" --head "${{ github.event.workflow_run.head_branch }}" --state open --json number --jq 'length')
+          if [ "$count" -gt 0 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping — a pull_request-triggered CI run covers this commit"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build & Push
+    needs: [should-run]
+    if: needs.should-run.outputs.run == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -14,6 +55,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -22,14 +65,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
+      # docker/metadata-action's type=ref,event=branch autodetection reads the
+      # triggering push/pull_request event context, which doesn't exist here
+      # (the event is workflow_run) — so tags are derived explicitly from the
+      # workflow_run payload instead, matching the branch/short-sha tags the
+      # old push-triggered config produced.
+      - name: Compute image tags
         id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=ref,event=branch
-            type=sha,format=short,prefix=
+        run: |
+          branch="${{ github.event.workflow_run.head_branch }}"
+          safe_branch=$(echo "$branch" | tr -c 'a-zA-Z0-9._-' '-')
+          sha="${{ github.event.workflow_run.head_sha }}"
+          short_sha="${sha:0:7}"
+          repo_lower=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          {
+            echo "tags<<EOF"
+            echo "${repo_lower}:${safe_branch}"
+            echo "${repo_lower}:${short_sha}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
@@ -40,6 +94,8 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
