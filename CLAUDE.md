@@ -59,6 +59,8 @@ Processed in `cmd_sync.go:resolveBuckets()`. Structured config loaded first; CLI
 - **SQS watcher always deletes messages** — even unparseable ones. Sync is idempotent via Redis; stuck messages in SQS are worse than a missed event.
 - **Initial full sync before event loop** — `RunWatcher` calls `Run()` first so objects changed while the program was down are not missed.
 - **`runWatch`/`runWatcher` private helpers** — public methods delegate to injectable private versions; enables unit tests without real S3/Redis.
+- **`ListObjectsPage` streams via an `onPage` callback, not a return slice** — the old signature accumulated up to `DiscoveryBatchSize` (default 100k) objects in memory across many S3 pages before returning, so `discoverAndSyncBucket` submitted nothing to the worker pool until the *entire* batch was listed. A bucket that's large or hitting transient S3 errors (e.g. 504s) mid-listing looked completely stalled — zero transfers — for the whole batch. The callback fires per underlying S3 page so objects start transferring as soon as they're discovered; the outer per-batch `batchDone.Wait()` still bounds memory/pending count.
+- **Per-bucket transfer concurrency cap (`--max-workers-per-bucket`, default: half of `--workers`)** — the worker pool is shared across all buckets in a cycle. Without a cap, a bucket with many (often small) objects can occupy the whole pool via continuous submission, starving other buckets' transfers even though their discovery goroutines are actively queuing jobs. Enforced with a per-bucket semaphore acquired in `discoverAndSyncBucket`'s `onPage` callback and released in `Job.OnComplete`.
 
 ## Configuration Reference (YAML)
 
