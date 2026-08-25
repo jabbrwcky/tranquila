@@ -7,8 +7,36 @@ on:
     branches: ["main"]
 
 jobs:
+  # A push to a branch with an open PR would otherwise run this workflow twice
+  # (once for the push, once for the pull_request synchronize) against the
+  # same commit. On push, skip the real jobs when an open PR already covers
+  # the branch — the pull_request-triggered run covers it instead.
+  should-run-push:
+    name: Check for open PR (push dedup)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Skip if an open PR already covers this branch
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh pr list --repo "${{ github.repository }}" --head "${{ github.ref_name }}" --state open --json number --jq 'length')
+          if [ "$count" -gt 0 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping push-triggered run — PR already covers ${{ github.ref_name }}"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-and-test:
     name: Build & Test
+    needs: [should-run-push]
+    if: always() && (github.event_name != 'push' || needs.should-run-push.outputs.run == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -34,6 +62,8 @@ jobs:
 
   e2e:
     name: End-to-End (MinIO + Toxiproxy)
+    needs: [should-run-push]
+    if: always() && (github.event_name != 'push' || needs.should-run-push.outputs.run == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -53,6 +83,8 @@ jobs:
 
   vuln-check:
     name: Vulnerability Check
+    needs: [should-run-push]
+    if: always() && (github.event_name != 'push' || needs.should-run-push.outputs.run == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
