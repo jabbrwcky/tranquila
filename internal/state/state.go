@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,13 @@ const (
 	StatusFailed  = "failed"
 
 	scanBatchSize = 100
+
+	// statsBuiltKey marks that per-bucket counters have been seeded. Deliberately
+	// outside the tranquila:stats: prefix so it is never mistaken for a bucket.
+	statsBuiltKey = "tranquila:statsbuilt"
+
+	// bucketsKey indexes the buckets that have completed a discovery run.
+	bucketsKey = "tranquila:buckets"
 )
 
 type ObjectState struct {
@@ -72,15 +80,63 @@ func collKey(bucket string) string {
 	return "tranquila:collection:" + bucket
 }
 
+func statsKey(bucket string) string {
+	return "tranquila:stats:" + bucket
+}
+
+// setStatusScript writes an object's status (plus any extra field/value pairs)
+// and adjusts the bucket's counters in the same atomic step. Counting objects by
+// scanning them is O(keyspace) per bucket, which does not scale; these counters
+// make BucketStats a single HGETALL.
+//
+// KEYS: object key, stats key. ARGV: new status, then field/value pairs.
+var setStatusScript = redis.NewScript(`
+local old = redis.call('HGET', KEYS[1], 'status')
+redis.call('HSET', KEYS[1], 'status', ARGV[1])
+for i = 2, #ARGV, 2 do
+  redis.call('HSET', KEYS[1], ARGV[i], ARGV[i+1])
+end
+if old == false then
+  redis.call('HINCRBY', KEYS[2], 'total', 1)
+  redis.call('HINCRBY', KEYS[2], ARGV[1], 1)
+elseif old ~= ARGV[1] then
+  redis.call('HINCRBY', KEYS[2], old, -1)
+  redis.call('HINCRBY', KEYS[2], ARGV[1], 1)
+end
+return 1
+`)
+
+// deleteObjectScript removes an object and decrements its bucket's counters.
+// KEYS: object key, stats key.
+var deleteObjectScript = redis.NewScript(`
+local old = redis.call('HGET', KEYS[1], 'status')
+local removed = redis.call('DEL', KEYS[1])
+if removed == 1 then
+  redis.call('HINCRBY', KEYS[2], 'total', -1)
+  if old then
+    redis.call('HINCRBY', KEYS[2], old, -1)
+  end
+end
+return removed
+`)
+
+// setStatus applies a status transition and its counter update atomically.
+func (s *Store) setStatus(ctx context.Context, bucket, key, status string, extra ...string) error {
+	argv := make([]any, 0, len(extra)+1)
+	argv = append(argv, status)
+	for _, v := range extra {
+		argv = append(argv, v)
+	}
+	return setStatusScript.Run(ctx, s.client,
+		[]string{objKey(bucket, key), statsKey(bucket)}, argv...).Err()
+}
+
 func (s *Store) UpsertObject(ctx context.Context, bucket, key string, obj ObjectState) error {
-	fields := map[string]any{
-		"status":      obj.Status,
-		"modified_at": obj.ModifiedAt.UTC().Format(time.RFC3339Nano),
-	}
+	extra := []string{"modified_at", obj.ModifiedAt.UTC().Format(time.RFC3339Nano)}
 	if !obj.SyncedAt.IsZero() {
-		fields["synced_at"] = obj.SyncedAt.UTC().Format(time.RFC3339Nano)
+		extra = append(extra, "synced_at", obj.SyncedAt.UTC().Format(time.RFC3339Nano))
 	}
-	return s.client.HSet(ctx, objKey(bucket, key), fields).Err()
+	return s.setStatus(ctx, bucket, key, obj.Status, extra...)
 }
 
 func (s *Store) GetObject(ctx context.Context, bucket, key string) (*ObjectState, error) {
@@ -102,27 +158,24 @@ func (s *Store) GetObject(ctx context.Context, bucket, key string) (*ObjectState
 }
 
 func (s *Store) MarkSynced(ctx context.Context, bucket, key string) error {
-	return s.client.HSet(ctx, objKey(bucket, key), map[string]any{
-		"status":    StatusSynced,
-		"synced_at": time.Now().UTC().Format(time.RFC3339Nano),
-	}).Err()
+	return s.setStatus(ctx, bucket, key, StatusSynced,
+		"synced_at", time.Now().UTC().Format(time.RFC3339Nano))
 }
 
 func (s *Store) MarkFailed(ctx context.Context, bucket, key string) error {
-	return s.client.HSet(ctx, objKey(bucket, key), "status", StatusFailed).Err()
+	return s.setStatus(ctx, bucket, key, StatusFailed)
 }
 
 // RemoveObject deletes the tracking record for an object that has been fully
 // processed in burn-after-reading mode (source object deleted from source bucket).
 func (s *Store) RemoveObject(ctx context.Context, bucket, key string) error {
-	return s.client.Del(ctx, objKey(bucket, key)).Err()
+	return deleteObjectScript.Run(ctx, s.client,
+		[]string{objKey(bucket, key), statsKey(bucket)}).Err()
 }
 
 func (s *Store) MarkPending(ctx context.Context, bucket, key string, modifiedAt time.Time) error {
-	return s.client.HSet(ctx, objKey(bucket, key), map[string]any{
-		"status":      StatusPending,
-		"modified_at": modifiedAt.UTC().Format(time.RFC3339Nano),
-	}).Err()
+	return s.setStatus(ctx, bucket, key, StatusPending,
+		"modified_at", modifiedAt.UTC().Format(time.RFC3339Nano))
 }
 
 // ScanPending returns all object keys with status=pending for a bucket.
@@ -166,7 +219,12 @@ func (s *Store) ScanPending(ctx context.Context, bucket string) ([]string, error
 }
 
 func (s *Store) SetCollectionTime(ctx context.Context, bucket string, t time.Time) error {
-	return s.client.Set(ctx, collKey(bucket), t.UTC().Format(time.RFC3339Nano), 0).Err()
+	pipe := s.client.Pipeline()
+	pipe.Set(ctx, collKey(bucket), t.UTC().Format(time.RFC3339Nano), 0)
+	// Maintain the bucket index alongside, so ListBuckets need not scan.
+	pipe.SAdd(ctx, bucketsKey, bucket)
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 func (s *Store) GetCollectionTime(ctx context.Context, bucket string) (time.Time, error) {
@@ -186,7 +244,40 @@ func (s *Store) GetCollectionTime(ctx context.Context, bucket string) (time.Time
 
 // ListBuckets returns the names of all source buckets that have completed at
 // least one discovery run (i.e. have a stored collection timestamp).
+//
+// Served from a maintained index: scanning for the collection keys would
+// traverse the entire keyspace, which is dominated by object records.
 func (s *Store) ListBuckets(ctx context.Context) ([]string, error) {
+	indexed, err := s.client.Exists(ctx, bucketsKey).Result()
+	if err != nil {
+		return nil, fmt.Errorf("check bucket index: %w", err)
+	}
+	if indexed == 1 {
+		buckets, err := s.client.SMembers(ctx, bucketsKey).Result()
+		if err != nil {
+			return nil, fmt.Errorf("read bucket index: %w", err)
+		}
+		return buckets, nil
+	}
+	// No index yet (a keyspace written before it existed): fall back to the scan
+	// and seed it, so this happens at most once.
+	buckets, err := s.listBucketsByScan(ctx)
+	if err != nil || len(buckets) == 0 {
+		return buckets, err
+	}
+	members := make([]any, len(buckets))
+	for i, b := range buckets {
+		members[i] = b
+	}
+	if err := s.client.SAdd(ctx, bucketsKey, members...).Err(); err != nil {
+		return nil, fmt.Errorf("seed bucket index: %w", err)
+	}
+	return buckets, nil
+}
+
+// listBucketsByScan enumerates buckets from their collection keys. O(keyspace);
+// used only to seed or reconcile the index.
+func (s *Store) listBucketsByScan(ctx context.Context) ([]string, error) {
 	const prefix = "tranquila:collection:"
 	var buckets []string
 	iter := s.client.Scan(ctx, 0, prefix+"*", scanBatchSize).Iterator()
@@ -199,41 +290,169 @@ func (s *Store) ListBuckets(ctx context.Context) ([]string, error) {
 	return buckets, nil
 }
 
+// BucketStats reads a bucket's maintained counters. It is O(1): a single
+// HGETALL, rather than a scan of the whole keyspace.
 func (s *Store) BucketStats(ctx context.Context, bucket string) (BucketStats, error) {
-	pattern := "tranquila:obj:" + bucket + ":*"
-	var keys []string
-	iter := s.client.Scan(ctx, 0, pattern, scanBatchSize).Iterator()
-	for iter.Next(ctx) {
-		keys = append(keys, iter.Val())
+	if err := s.ensureStatsBuilt(ctx); err != nil {
+		return BucketStats{}, err
 	}
-	if err := iter.Err(); err != nil {
-		return BucketStats{}, fmt.Errorf("scan: %w", err)
+	vals, err := s.client.HGetAll(ctx, statsKey(bucket)).Result()
+	if err != nil {
+		return BucketStats{}, fmt.Errorf("hgetall stats for %s: %w", bucket, err)
 	}
+	n := func(field string) int64 {
+		v, _ := strconv.ParseInt(vals[field], 10, 64)
+		return v
+	}
+	return BucketStats{
+		Total:   n("total"),
+		Synced:  n(StatusSynced),
+		Pending: n(StatusPending),
+		Failed:  n(StatusFailed),
+	}, nil
+}
 
-	var stats BucketStats
-	for i := 0; i < len(keys); i += scanBatchSize {
-		end := min(i+scanBatchSize, len(keys))
-		batch := keys[i:end]
+// ensureStatsBuilt rebuilds the counters once, for keyspaces written before they
+// existed. The marker is checked per call rather than cached in memory so that a
+// failed rebuild is retried and every replica converges.
+func (s *Store) ensureStatsBuilt(ctx context.Context) error {
+	built, err := s.client.Exists(ctx, statsBuiltKey).Result()
+	if err != nil {
+		return fmt.Errorf("check stats marker: %w", err)
+	}
+	if built == 1 {
+		return nil
+	}
+	return s.RebuildStats(ctx)
+}
 
+// RebuildStats recomputes every bucket's counters from the object records in a
+// single pass over the keyspace, and marks them built.
+//
+// This is the expensive path — O(keyspace) — and exists to seed counters for
+// existing data and to reconcile drift. It deliberately scans once for all
+// buckets: SCAN with MATCH filters server-side after iterating, so a per-bucket
+// pattern would traverse the whole keyspace once per bucket.
+func (s *Store) RebuildStats(ctx context.Context) error {
+	const prefix = "tranquila:obj:"
+	counts := make(map[string]*BucketStats)
+
+	var batch []string
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
 		pipe := s.client.Pipeline()
 		cmds := make([]*redis.StringCmd, len(batch))
-		for j, k := range batch {
-			cmds[j] = pipe.HGet(ctx, k, "status")
+		for i, k := range batch {
+			cmds[i] = pipe.HGet(ctx, k, "status")
 		}
 		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
-			return BucketStats{}, fmt.Errorf("pipeline: %w", err)
+			return fmt.Errorf("pipeline hget: %w", err)
 		}
-		for _, cmd := range cmds {
-			stats.Total++
+		for i, cmd := range cmds {
+			// Bucket names cannot contain ":", but object keys can, so split on
+			// the first separator after the prefix.
+			bucket, _, ok := strings.Cut(strings.TrimPrefix(batch[i], prefix), ":")
+			if !ok {
+				continue
+			}
+			st, seen := counts[bucket]
+			if !seen {
+				st = &BucketStats{}
+				counts[bucket] = st
+			}
+			st.Total++
 			switch cmd.Val() {
 			case StatusSynced:
-				stats.Synced++
+				st.Synced++
 			case StatusPending:
-				stats.Pending++
+				st.Pending++
 			case StatusFailed:
-				stats.Failed++
+				st.Failed++
+			}
+		}
+		batch = batch[:0]
+		return nil
+	}
+
+	iter := s.client.Scan(ctx, 0, prefix+"*", scanBatchSize).Iterator()
+	for iter.Next(ctx) {
+		batch = append(batch, iter.Val())
+		if len(batch) >= scanBatchSize {
+			if err := flush(); err != nil {
+				return err
 			}
 		}
 	}
-	return stats, nil
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("scan object keys: %w", err)
+	}
+	if err := flush(); err != nil {
+		return err
+	}
+
+	// Include buckets that have been discovered but hold no objects, so their
+	// counters read as zero rather than as never-built. Read from the collection
+	// keys rather than the bucket index, since a reconcile must not trust the
+	// index it is also rebuilding.
+	buckets, err := s.listBucketsByScan(ctx)
+	if err != nil {
+		return err
+	}
+	for _, b := range buckets {
+		if _, ok := counts[b]; !ok {
+			counts[b] = &BucketStats{}
+		}
+	}
+
+	// Drop counters for buckets that no longer have objects or a collection
+	// record, so a reconcile clears stale entries instead of leaving them.
+	stale, err := s.staleStatsKeys(ctx, counts)
+	if err != nil {
+		return err
+	}
+
+	pipe := s.client.Pipeline()
+	for _, k := range stale {
+		pipe.Del(ctx, k)
+	}
+	// Reconcile the bucket index from the collection keys in the same pass.
+	pipe.Del(ctx, bucketsKey)
+	if len(buckets) > 0 {
+		members := make([]any, len(buckets))
+		for i, b := range buckets {
+			members[i] = b
+		}
+		pipe.SAdd(ctx, bucketsKey, members...)
+	}
+	for bucket, st := range counts {
+		pipe.HSet(ctx, statsKey(bucket), map[string]any{
+			"total":       st.Total,
+			StatusSynced:  st.Synced,
+			StatusPending: st.Pending,
+			StatusFailed:  st.Failed,
+		})
+	}
+	pipe.Set(ctx, statsBuiltKey, time.Now().UTC().Format(time.RFC3339Nano), 0)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("write stats: %w", err)
+	}
+	return nil
+}
+
+// staleStatsKeys returns counter keys whose bucket is absent from counts.
+func (s *Store) staleStatsKeys(ctx context.Context, counts map[string]*BucketStats) ([]string, error) {
+	const prefix = "tranquila:stats:"
+	var stale []string
+	iter := s.client.Scan(ctx, 0, prefix+"*", scanBatchSize).Iterator()
+	for iter.Next(ctx) {
+		if _, ok := counts[strings.TrimPrefix(iter.Val(), prefix)]; !ok {
+			stale = append(stale, iter.Val())
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("scan stats keys: %w", err)
+	}
+	return stale, nil
 }

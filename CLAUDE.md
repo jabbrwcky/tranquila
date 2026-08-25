@@ -11,7 +11,7 @@
 | Sync engine | `internal/sync/` | `Syncer`: discover → mark pending → transfer via worker pool. Redis state. |
 | Watchers | `internal/watcher/` | `Watcher` interface + poll/MinIO/SQS implementations. |
 | Storage | `internal/storage/` | `aws-sdk-go-v2` + transfermanager. Works with any S3-compatible endpoint. |
-| State | `internal/state/` | Redis. Keys: `tranquila:obj:{bucket}:{key}`, `tranquila:collection:{bucket}`. |
+| State | `internal/state/` | Redis. Keys: `tranquila:obj:{bucket}:{key}`, `tranquila:collection:{bucket}`, `tranquila:stats:{bucket}`, `tranquila:buckets`, `tranquila:statsbuilt`. |
 | API | `internal/api/` | Management HTTP API. `/api/v1/buckets`, `/api/v1/sync`. K8s probes: `/healthz` (liveness), `/readyz` (readiness, pings Redis). |
 
 ## Implemented Features
@@ -135,6 +135,35 @@ Gotchas worth not rediscovering: assertions use `HeadObject` because
 podman needs `DOCKER_HOST` pointed at a path containing `podman.sock` or Ryuk
 dies on the missing `bridge` network; Apple's `container` has no Docker API and
 cannot run testcontainers at all. Details in `e2e/README.md`.
+
+## Redis Key Design
+
+`SCAN ... MATCH` filters **server-side after iterating**: `COUNT` bounds keys
+examined per call, not keys returned. A pattern scan therefore costs
+O(whole keyspace) no matter how few keys match — and this keyspace is dominated
+by `tranquila:obj:*` records (~1.1M in production). Anything on a request path
+must avoid scanning.
+
+| Key | Purpose |
+| --- | --- |
+| `tranquila:obj:{bucket}:{key}` | Per-object record. Bucket names cannot contain `:`, object keys can — split on the first `:` after the prefix. |
+| `tranquila:collection:{bucket}` | Last discovery timestamp. |
+| `tranquila:stats:{bucket}` | Maintained counters (`total`/`synced`/`pending`/`failed`), so `BucketStats` is one HGETALL. |
+| `tranquila:buckets` | Set indexing discovered buckets, so `ListBuckets` is one SMEMBERS. |
+| `tranquila:statsbuilt` | Marker that counters have been seeded. |
+
+Counters are updated **atomically with the status write** by the Lua scripts in
+`state.go` (`setStatusScript`, `deleteObjectScript`), which read the previous
+status to decrement the right field. Every write path must go through
+`setStatus` / `deleteObjectScript` or counters will drift.
+
+`RebuildStats` recomputes everything from the object records in a **single**
+pass (not one per bucket) and reconciles both the counters and the bucket index.
+It runs automatically when `tranquila:statsbuilt` is absent, which seeds an
+upgraded keyspace on first read. **To force a reconcile, delete that marker** —
+that is the operator escape hatch for drift.
+
+`ScanPending` still scans per bucket, but currently has no callers.
 
 ## Failure Handling
 

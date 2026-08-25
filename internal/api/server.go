@@ -44,7 +44,16 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("GET /api/v1/buckets", s.listBuckets)
 	mux.HandleFunc("GET /api/v1/buckets/{name}", s.getBucket)
 	mux.HandleFunc("GET /api/v1/sync", s.getSyncStatus)
-	s.srv = &http.Server{Addr: cfg.Addr, Handler: mux}
+	s.srv = &http.Server{
+		Addr:    cfg.Addr,
+		Handler: mux,
+		// Bound every phase of a request so a slow or idle client cannot hold a
+		// connection open indefinitely. Generous enough for a probe or a curl.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	return s
 }
 

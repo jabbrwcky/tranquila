@@ -332,6 +332,23 @@ cause a pod restart. `/readyz` is a **readiness** probe: it pings Redis and retu
 `200 {"status":"ok"}` when reachable or `503 {"status":"unavailable","error":...}` when
 not, so traffic is only routed to pods that can serve requests.
 
+#### Bucket statistics
+
+The per-bucket counts are maintained incrementally in Redis and read with a single
+lookup, so the endpoints respond in milliseconds regardless of how many objects are
+tracked. They are updated atomically with each object's status, in the same operation.
+
+The counters are seeded automatically the first time they are read on a keyspace that
+predates them: that one request recomputes them from the object records and can take a
+few seconds on a large keyspace. Every request afterwards is served from the counters.
+
+If the counters ever drift from reality, force a reconcile by deleting the marker key —
+the next request recomputes everything from the object records:
+
+```shell
+redis-cli DEL tranquila:statsbuilt
+```
+
 #### Kubernetes probes
 
 Point both probes at the management API port (from `--mgmt-addr`, default `8080`):
