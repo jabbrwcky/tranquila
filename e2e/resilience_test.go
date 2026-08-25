@@ -165,7 +165,7 @@ func TestRateLimitDegradesAndRecovers(t *testing.T) {
 			fp.failAll(http.StatusGatewayTimeout, true)
 			// Two failing calls meet the threshold of 2.
 			for range 2 {
-				if _, _, err := c.HeadObject(ctx, "aimd-src", keys[0]); err == nil {
+				if _, _, _, err := c.HeadObject(ctx, "aimd-src", keys[0]); err == nil {
 					t.Fatal("expected HeadObject to fail while the endpoint returns 504")
 				}
 			}
@@ -184,7 +184,7 @@ func TestRateLimitDegradesAndRecovers(t *testing.T) {
 			// Recovery is additive: 10% of base per 20 healthy calls.
 			fp.clear()
 			eventually(t, 90*time.Second, "the rate limit to climb back to base", func() bool {
-				if _, _, err := c.HeadObject(ctx, "aimd-src", keys[0]); err != nil {
+				if _, _, _, err := c.HeadObject(ctx, "aimd-src", keys[0]); err != nil {
 					return false
 				}
 				return !c.LimitState().Degraded
@@ -206,13 +206,13 @@ func TestDestinationDegradesIndependently(t *testing.T) {
 
 	dstProxy.failAll(http.StatusGatewayTimeout, true)
 	for range 2 {
-		if _, _, err := dst.HeadObject(ctx, "indep-src", keys[0]); err == nil {
+		if _, _, _, err := dst.HeadObject(ctx, "indep-src", keys[0]); err == nil {
 			t.Fatal("expected the destination call to fail")
 		}
 	}
 	// Keep the source busy and healthy throughout.
 	for range 3 {
-		if _, _, err := src.HeadObject(ctx, "indep-src", keys[0]); err != nil {
+		if _, _, _, err := src.HeadObject(ctx, "indep-src", keys[0]); err != nil {
 			t.Fatalf("source call failed unexpectedly: %v", err)
 		}
 	}
@@ -240,7 +240,7 @@ func TestL4FaultsAreTransient(t *testing.T) {
 		t.Fatalf("add reset_peer toxic: %v", err)
 	}
 
-	_, _, err := c.HeadObject(ctx, "l4-src", keys[0])
+	_, _, _, err := c.HeadObject(ctx, "l4-src", keys[0])
 	if err == nil {
 		t.Fatal("expected a connection reset to surface as an error")
 	}
@@ -253,7 +253,7 @@ func TestL4FaultsAreTransient(t *testing.T) {
 		t.Fatalf("remove toxic: %v", err)
 	}
 	eventually(t, 30*time.Second, "the endpoint to recover after the reset", func() bool {
-		_, _, err := c.HeadObject(ctx, "l4-src", keys[0])
+		_, _, _, err := c.HeadObject(ctx, "l4-src", keys[0])
 		return err == nil
 	})
 }
@@ -328,7 +328,7 @@ func TestBurnAfterReadingVerifiesContentNotJustSize(t *testing.T) {
 			t.Fatalf("Run: %v", err)
 		}
 
-		if _, _, err := src.HeadObject(ctx, bucket, key); err == nil {
+		if _, _, _, err := src.HeadObject(ctx, bucket, key); err == nil {
 			t.Error("source object still exists after a verified matching sync")
 		}
 	})
@@ -362,8 +362,54 @@ func TestBurnAfterReadingVerifiesContentNotJustSize(t *testing.T) {
 		// must survive regardless of whether the caller checks the error.
 		_ = syncer.Run(ctx)
 
-		if _, _, err := src.HeadObject(ctx, bucket, key); err != nil {
+		if _, _, _, err := src.HeadObject(ctx, bucket, key); err != nil {
 			t.Fatalf("source object was deleted despite a content mismatch: %v", err)
+		}
+	})
+
+	t.Run("multipart_object_falls_back_to_content_and_deletes", func(t *testing.T) {
+		// Above the transfer manager's 16 MiB multipart threshold, so both
+		// uploads produce a composite ETag (a "-partCount" suffix) that the
+		// ETag fast path must recognize as incomparable and skip, falling
+		// back to downloading and hashing content instead.
+		const key = "already-synced-multipart.bin"
+		large := strings.Repeat("m", 17*1024*1024)
+		if _, err := src.PutObject(ctx, bucket, key, strings.NewReader(large), int64(len(large))); err != nil {
+			t.Fatalf("seed multipart source: %v", err)
+		}
+		const dstBucket3 = "bar-dst-multipart"
+		if err := dst.EnsureBucket(ctx, dstBucket3); err != nil {
+			t.Fatalf("ensure destination bucket: %v", err)
+		}
+		if _, err := dst.PutObject(ctx, dstBucket3, key, strings.NewReader(large), int64(len(large))); err != nil {
+			t.Fatalf("seed multipart destination: %v", err)
+		}
+
+		_, _, dstETag, err := dst.HeadObject(ctx, dstBucket3, key)
+		if err != nil {
+			t.Fatalf("head destination: %v", err)
+		}
+		if !strings.Contains(dstETag, "-") {
+			t.Fatalf("expected a composite (multipart) ETag, got %q — the 17 MiB body did not trigger multipart upload as this test assumes", dstETag)
+		}
+
+		store := s.store(t)
+		markAlreadySynced(t, ctx, store, src, bucket, key)
+
+		syncer, err := tsync.New(tsync.Config{
+			Source: src, Destination: dst, State: store,
+			Buckets: map[string]tsync.BucketConfig{bucket: {Destination: dstBucket3, BurnAfterReading: true}},
+			Workers: 2,
+		})
+		if err != nil {
+			t.Fatalf("create syncer: %v", err)
+		}
+		if err := syncer.Run(ctx); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+
+		if _, _, _, err := src.HeadObject(ctx, bucket, key); err == nil {
+			t.Error("multipart source object still exists after a verified matching sync")
 		}
 	})
 }

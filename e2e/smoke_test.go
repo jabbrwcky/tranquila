@@ -57,7 +57,7 @@ func TestHarnessSmoke(t *testing.T) {
 			c := s.client(t, "source", fp.URL(), 0, 0)
 			fp.failAll(tc.status, tc.xmlBody)
 
-			_, _, err := c.HeadObject(ctx, "smoke-src", keys[0])
+			_, _, _, err := c.HeadObject(ctx, "smoke-src", keys[0])
 			if err == nil {
 				t.Fatalf("expected an error while every request returns %d", tc.status)
 			}
@@ -73,7 +73,7 @@ func TestHarnessSmoke(t *testing.T) {
 		// Fewer failures than the SDK's attempt budget, so the call must succeed.
 		fp.failNext(2, http.StatusGatewayTimeout, true)
 
-		if _, _, err := c.HeadObject(ctx, "smoke-src", keys[0]); err != nil {
+		if _, _, _, err := c.HeadObject(ctx, "smoke-src", keys[0]); err != nil {
 			t.Errorf("HeadObject should have survived a 2-request 504 burst: %v", err)
 		}
 		if _, failed := fp.stats(); failed != 2 {

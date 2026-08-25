@@ -223,19 +223,32 @@ enabled, so there is no upload to checksum:
 
 1. `HeadObject` on the destination confirms the size matches (skipped when the
    job's recorded size is unknown).
-2. Both objects are **downloaded and hashed** (`crc32Checksum`, streamed through
-   `crc32.NewIEEE`, not buffered) rather than trusting S3-reported metadata:
-   the source was very likely uploaded by whatever put it there originally, not
-   by tranquila, so it usually carries no stored checksum at all; and a stored
-   *composite* checksum on a multipart object is not comparable to a
-   full-object hash computed the same way on both sides. Computing both from
-   content sidesteps that mismatch entirely.
-3. The two computed checksums must be equal, or the sync fails and the source
-   is kept — this is what catches a destination silently overwritten with
-   same-size content, which the size check alone would miss.
+2. **ETag fast path.** Every S3 object carries an ETag; for a single-part
+   upload it is the plain MD5 hex digest of the content, so identical content
+   produces an identical ETag on any S3-compatible backend — verifiable
+   without reading either object. The source's ETag comes from discovery
+   listing (`Job.SrcETag`, free); the destination's from the `HeadObject` call
+   above. `storage.SinglePartMD5` recognizes and rejects the one case where
+   ETag isn't comparable: a multipart upload's ETag is `md5-of-part-md5s` plus
+   a `-partCount` suffix, not a hash of the content at all.
+   - **Both parse as single-part and match** → verified, no download.
+   - **Both parse as single-part and differ** → refuse immediately, no
+     download. (An encrypted object's ETag is a hash of ciphertext, which
+     differs by encryption context even for identical plaintext — this can
+     produce a false *mismatch* under SSE-KMS, never a false match, so it
+     fails toward keeping data, not deleting it.)
+   - **Either is multipart or unparseable** → fall back to step 3.
+3. **Content fallback.** Both objects are downloaded and hashed
+   (`crc32Checksum`, streamed through `crc32.NewIEEE`, not buffered). Computing
+   both from content, rather than trusting any stored checksum, sidesteps the
+   same composite-checksum problem the ETag check has to guard against.
+4. The two checksums (from whichever step verified) must be equal, or the sync
+   fails and the source is kept — this is what catches a destination silently
+   overwritten with same-size content, which the size check alone would miss.
 
-No re-upload is performed either way; this path costs one full read of each
-object instead of one write plus one read.
+No re-upload is performed either way. For a single-part object this path costs
+two `HeadObject` calls (both cheap, the first one already required for the size
+check); a multipart object pays the full double-read that always accepted.
 
 `--dry-run` logs every planned deletion and performs none — including logging
 that it *would refuse* to delete on a checksum mismatch, so a rehearsal surfaces

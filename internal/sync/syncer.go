@@ -263,6 +263,7 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 				DstKey:           cfg.destKey(obj.Key),
 				Size:             obj.Size,
 				ModifiedAt:       obj.ModifiedAt,
+				SrcETag:          obj.ETag,
 				OnComplete:       batchDone.Done,
 				BurnAfterReading: cfg.BurnAfterReading,
 				DryRun:           s.cfg.DryRun,
@@ -338,7 +339,7 @@ func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Objec
 	}
 	// Optionally verify destination size matches source to catch incomplete uploads.
 	if s.cfg.CheckSizes && obj.Size > 0 {
-		dstSize, _, err := s.cfg.Destination.HeadObject(ctx, cfg.Destination, cfg.destKey(obj.Key))
+		dstSize, _, _, err := s.cfg.Destination.HeadObject(ctx, cfg.Destination, cfg.destKey(obj.Key))
 		if err != nil {
 			// Object missing or inaccessible on destination — re-sync.
 			return true, nil
@@ -563,7 +564,7 @@ func (s *Syncer) transfer(ctx context.Context, job Job) error {
 
 	// Verify destination size and capture stored CRC32 for burn-after-reading.
 	// Skip size check when srcSize is unknown (server did not provide Content-Length).
-	dstSize, storedCRC32, err := s.cfg.Destination.HeadObject(ctx, job.DstBucket, job.DstKey)
+	dstSize, storedCRC32, _, err := s.cfg.Destination.HeadObject(ctx, job.DstBucket, job.DstKey)
 	if err != nil {
 		return fmt.Errorf("verify %s/%s: %w", job.DstBucket, job.DstKey, err)
 	}
@@ -592,7 +593,7 @@ type objectGetter interface {
 // destinationVerifier is the narrow interface that performVerifyAndDelete needs from the destination client.
 type destinationVerifier interface {
 	objectGetter
-	HeadObject(ctx context.Context, bucket, key string) (size int64, checksumCRC32 string, err error)
+	HeadObject(ctx context.Context, bucket, key string) (size int64, checksumCRC32, etag string, err error)
 }
 
 // sourceReadDeleter is the narrow interface that performVerifyAndDelete needs from the source
@@ -624,12 +625,18 @@ func crc32Checksum(ctx context.Context, g objectGetter, bucket, key string) (str
 
 // performVerifyAndDelete handles the verify-and-delete path for objects that were already synced
 // before burn-after-reading mode was enabled. No re-upload is performed; instead it confirms the
-// destination still holds the object (size check) and that its content matches the source (a full
-// CRC32 comparison, computed by reading both objects), then deletes from source. The extra read of
-// both objects is the cost of verifying an irreversible delete when neither object is guaranteed to
-// carry a usable stored checksum.
+// destination still holds the object (size check) and that its content matches the source, then
+// deletes from source.
+//
+// Content is compared via ETag when possible: identical single-part uploads produce identical
+// ETags (S3's MD5-of-content convention) on any S3-compatible backend, at zero read cost — the
+// source's ETag comes from discovery listing, the destination's from the HeadObject call the size
+// check already makes. A multipart ETag is a composite of its parts' MD5s plus a "-partCount"
+// suffix and is never comparable this way, so that case (and any other unparseable ETag) falls
+// back to downloading and hashing both objects' full content — the cost of verifying an
+// irreversible delete when neither side is guaranteed to carry a usable stored checksum.
 func performVerifyAndDelete(ctx context.Context, job Job, dst destinationVerifier, src sourceReadDeleter) error {
-	dstSize, _, err := dst.HeadObject(ctx, job.DstBucket, job.DstKey)
+	dstSize, _, dstETag, err := dst.HeadObject(ctx, job.DstBucket, job.DstKey)
 	if err != nil {
 		return fmt.Errorf("burn-after-reading verify: destination check %s/%s: %w", job.DstBucket, job.DstKey, err)
 	}
@@ -638,24 +645,37 @@ func performVerifyAndDelete(ctx context.Context, job Job, dst destinationVerifie
 			job.DstBucket, job.DstKey, job.Size, dstSize)
 	}
 
-	srcChecksum, err := crc32Checksum(ctx, src, job.SrcBucket, job.Key)
-	if err != nil {
-		return fmt.Errorf("burn-after-reading verify: read source %s/%s: %w", job.SrcBucket, job.Key, err)
+	verifiedBy := "crc32"
+	verified := false
+	if srcMD5, srcOK := storage.SinglePartMD5(job.SrcETag); srcOK {
+		if dstMD5, dstOK := storage.SinglePartMD5(dstETag); dstOK {
+			if srcMD5 != dstMD5 {
+				return fmt.Errorf("burn-after-reading verify: ETag mismatch %s/%s: source=%s destination=%s, refusing to delete source",
+					job.DstBucket, job.DstKey, srcMD5, dstMD5)
+			}
+			verifiedBy, verified = "etag", true
+		}
 	}
-	dstChecksum, err := crc32Checksum(ctx, dst, job.DstBucket, job.DstKey)
-	if err != nil {
-		return fmt.Errorf("burn-after-reading verify: read destination %s/%s: %w", job.DstBucket, job.DstKey, err)
-	}
-	if srcChecksum != dstChecksum {
-		return fmt.Errorf("burn-after-reading verify: checksum mismatch %s/%s: source=%s destination=%s, refusing to delete source",
-			job.DstBucket, job.DstKey, srcChecksum, dstChecksum)
+	if !verified {
+		srcChecksum, err := crc32Checksum(ctx, src, job.SrcBucket, job.Key)
+		if err != nil {
+			return fmt.Errorf("burn-after-reading verify: read source %s/%s: %w", job.SrcBucket, job.Key, err)
+		}
+		dstChecksum, err := crc32Checksum(ctx, dst, job.DstBucket, job.DstKey)
+		if err != nil {
+			return fmt.Errorf("burn-after-reading verify: read destination %s/%s: %w", job.DstBucket, job.DstKey, err)
+		}
+		if srcChecksum != dstChecksum {
+			return fmt.Errorf("burn-after-reading verify: checksum mismatch %s/%s: source=%s destination=%s, refusing to delete source",
+				job.DstBucket, job.DstKey, srcChecksum, dstChecksum)
+		}
 	}
 
 	log.Info().
 		Str("bucket", job.SrcBucket).
 		Str("key", job.Key).
 		Int64("size", dstSize).
-		Str("crc32", dstChecksum).
+		Str("verified_by", verifiedBy).
 		Msg("burn-after-reading: destination verified")
 	if job.DryRun {
 		log.Info().

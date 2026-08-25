@@ -230,7 +230,7 @@ in about 8 seconds. See [Design notes](#design-notes).
 | `TestRateLimitDegradesAndRecovers` | Congestion control halves a configured limit, recovers additively, and never degrades an unlimited endpoint. |
 | `TestDestinationDegradesIndependently` | A sick destination throttles writes without slowing source reads. |
 | `TestL4FaultsAreTransient` | A TCP-level connection reset classifies as transient. |
-| `TestBurnAfterReadingVerifiesContentNotJustSize` | The verify-and-delete path checksums content, not just size — a same-size, tampered destination blocks the source delete. |
+| `TestBurnAfterReadingVerifiesContentNotJustSize` | The verify-and-delete path checksums content, not just size: a matching single-part object is verified by ETag alone (no download), a same-size tampered destination is caught by ETag mismatch (no download), and a multipart object correctly falls back to downloading and hashing both sides. |
 
 ## Design notes
 

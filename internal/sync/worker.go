@@ -15,6 +15,11 @@ type Job struct {
 	DstKey     string // destination object key (may differ via prefix rewrite)
 	Size       int64
 	ModifiedAt time.Time
+	// SrcETag is the source object's ETag from discovery listing, used by
+	// verify-and-delete to compare against the destination's ETag without a
+	// download when both sides are single-part uploads. Empty for jobs not
+	// built from a listing (e.g. watch-mode events).
+	SrcETag string
 	// OnComplete is called exactly once after the job is either transferred,
 	// failed, or skipped due to context cancellation. Used by discoverAndSyncBucket
 	// to wait for a batch to drain before continuing discovery.

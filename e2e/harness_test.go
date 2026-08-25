@@ -250,7 +250,7 @@ func (s *stack) countObjects(t *testing.T, bucket string, keys []string) int {
 	c := s.client(t, "verify", s.minioEndpoint, 0, 0)
 	var n int
 	for _, k := range keys {
-		if _, _, err := c.HeadObject(ctx, bucket, k); err == nil {
+		if _, _, _, err := c.HeadObject(ctx, bucket, k); err == nil {
 			n++
 		}
 	}

@@ -456,12 +456,16 @@ func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {
 	return nil
 }
 
-// HeadObject returns the content length and CRC32 checksum of an object.
+// HeadObject returns the content length, CRC32 checksum, and ETag of an object.
 // The CRC32 is populated only when the object was stored with a checksum algorithm;
-// it is empty string otherwise.
-func (c *Client) HeadObject(ctx context.Context, bucket, key string) (size int64, checksumCRC32 string, err error) {
+// it is empty string otherwise. The ETag is always present: for a single-part
+// upload it is the object's MD5 hex digest, comparable across independent
+// uploads of identical content; for a multipart upload it is a composite of the
+// parts' MD5s plus a "-partCount" suffix, comparable only to another upload
+// that used the exact same part boundaries — see storage.SinglePartMD5.
+func (c *Client) HeadObject(ctx context.Context, bucket, key string) (size int64, checksumCRC32, etag string, err error) {
 	if err := c.wait(ctx); err != nil {
-		return 0, "", err
+		return 0, "", "", err
 	}
 	start := time.Now()
 	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{
@@ -471,9 +475,9 @@ func (c *Client) HeadObject(ctx context.Context, bucket, key string) (size int64
 	})
 	c.recordOp(ctx, "HeadObject", bucket, start, err)
 	if err != nil {
-		return 0, "", fmt.Errorf("head object %s/%s: %w", bucket, key, err)
+		return 0, "", "", fmt.Errorf("head object %s/%s: %w", bucket, key, err)
 	}
-	return aws.ToInt64(out.ContentLength), aws.ToString(out.ChecksumCRC32), nil
+	return aws.ToInt64(out.ContentLength), aws.ToString(out.ChecksumCRC32), aws.ToString(out.ETag), nil
 }
 
 func (c *Client) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, int64, error) {

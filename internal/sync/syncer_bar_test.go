@@ -34,14 +34,15 @@ func (f *fakeDeleter) GetObject(_ context.Context, _, _ string) (io.ReadCloser, 
 // fakeVerifier implements destinationVerifier for testing performVerifyAndDelete.
 type fakeVerifier struct {
 	size   int64
+	etag   string
 	retErr error
 
 	body   []byte
 	getErr error
 }
 
-func (f *fakeVerifier) HeadObject(_ context.Context, _, _ string) (int64, string, error) {
-	return f.size, "", f.retErr
+func (f *fakeVerifier) HeadObject(_ context.Context, _, _ string) (int64, string, string, error) {
+	return f.size, "", f.etag, f.retErr
 }
 
 func (f *fakeVerifier) GetObject(_ context.Context, _, _ string) (io.ReadCloser, int64, error) {
@@ -158,6 +159,8 @@ func TestPerformVerifyAndDelete(t *testing.T) {
 		name        string
 		jobSize     int64 // 0 = skip size check
 		dstSize     int64
+		srcETag     string // "" = no ETag fast path; falls back to content comparison
+		dstETag     string
 		srcBody     []byte // defaults (nil) match on both sides: CRC32 of empty content is equal
 		dstBody     []byte
 		headErr     error
@@ -245,11 +248,63 @@ func TestPerformVerifyAndDelete(t *testing.T) {
 			wantDeleted: false,
 			wantErr:     true,
 		},
+		{
+			// Matching single-part ETags must skip content comparison entirely:
+			// forcing both GetObject calls to fail proves they were never made.
+			name:        "matching_etags_skip_content_read",
+			jobSize:     1024,
+			dstSize:     1024,
+			srcETag:     "d41d8cd98f00b204e9800998ecf8427e",
+			dstETag:     `"d41d8cd98f00b204e9800998ecf8427e"`, // S3 quotes ETags; must be stripped
+			srcGetErr:   errors.New("must not be called"),
+			dstGetErr:   errors.New("must not be called"),
+			wantDeleted: true,
+		},
+		{
+			// Different single-part ETags conclusively prove different content:
+			// refuse immediately, again without reading either object.
+			name:        "mismatched_etags_refuse_without_content_read",
+			jobSize:     1024,
+			dstSize:     1024,
+			srcETag:     "d41d8cd98f00b204e9800998ecf8427e",
+			dstETag:     "5d41402abc4b2a76b9719d911017c592",
+			srcGetErr:   errors.New("must not be called"),
+			dstGetErr:   errors.New("must not be called"),
+			wantDeleted: false,
+			wantErr:     true,
+		},
+		{
+			// A multipart (composite) ETag is never comparable to another
+			// object's ETag; this must fall back to hashing content, which
+			// here agrees, so the delete proceeds.
+			name:        "multipart_etag_falls_back_to_matching_content",
+			jobSize:     5,
+			dstSize:     5,
+			srcETag:     "d41d8cd98f00b204e9800998ecf8427e-3", // composite: 3 parts
+			dstETag:     "d41d8cd98f00b204e9800998ecf8427e-3",
+			srcBody:     []byte("hello"),
+			dstBody:     []byte("hello"),
+			wantDeleted: true,
+		},
+		{
+			// A multipart ETag must never be compared even when byte-identical
+			// to the other side's composite value; content still disagrees here,
+			// which the ETag shape alone could not have caught.
+			name:        "multipart_etag_falls_back_and_catches_mismatch",
+			jobSize:     5,
+			dstSize:     5,
+			srcETag:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-2",
+			dstETag:     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-2",
+			srcBody:     []byte("hello"),
+			dstBody:     []byte("world"),
+			wantDeleted: false,
+			wantErr:     true,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			fv := &fakeVerifier{size: tc.dstSize, retErr: tc.headErr, body: tc.dstBody, getErr: tc.dstGetErr}
+			fv := &fakeVerifier{size: tc.dstSize, etag: tc.dstETag, retErr: tc.headErr, body: tc.dstBody, getErr: tc.dstGetErr}
 			fd := &fakeDeleter{retErr: tc.deleteErr, body: tc.srcBody, getErr: tc.srcGetErr}
 			job := Job{
 				SrcBucket: "src",
@@ -257,6 +312,7 @@ func TestPerformVerifyAndDelete(t *testing.T) {
 				Key:       "data/file.bin",
 				DstKey:    "data/file.bin",
 				Size:      tc.jobSize,
+				SrcETag:   tc.srcETag,
 				DryRun:    tc.dryRun,
 			}
 			err := performVerifyAndDelete(context.Background(), job, fv, fd)
