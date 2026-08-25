@@ -317,16 +317,16 @@ func (c *Client) ListObjects(ctx context.Context, bucket, prefix string) (<-chan
 }
 
 // ListObjectsPage fetches up to maxObjects from bucket starting after token,
-// invoking onPage after each underlying S3 API page so callers can act on
-// (e.g. transfer) objects as they are discovered instead of waiting for the
-// full batch to accumulate. Returns the number of objects delivered, the
-// continuation token for the next call (nil when the listing is exhausted),
-// and any error — either from S3 or returned by onPage, which aborts the scan.
-func (c *Client) ListObjectsPage(ctx context.Context, bucket, prefix string, token *string, maxObjects int, onPage func([]Object) error) (int, *string, error) {
+// accumulating complete S3 API pages. Returns the objects, the continuation
+// token for the next call (nil when the listing is exhausted), and any error.
+// Callers can use repeated calls with the returned token to page through a
+// large bucket in bounded-memory batches.
+func (c *Client) ListObjectsPage(ctx context.Context, bucket, prefix string, token *string, maxObjects int) ([]Object, *string, error) {
+	var collected []Object
 	current := token
-	var pageNum, collected int
+	var pageNum int
 
-	for collected < maxObjects {
+	for len(collected) < maxObjects {
 		input := &s3.ListObjectsV2Input{
 			Bucket:            aws.String(bucket),
 			ContinuationToken: current,
@@ -337,11 +337,18 @@ func (c *Client) ListObjectsPage(ctx context.Context, bucket, prefix string, tok
 
 		page, err := c.listPageWithRetry(ctx, input)
 		if err != nil {
-			return collected, nil, fmt.Errorf("list objects in %s: %w", bucket, err)
+			return nil, nil, fmt.Errorf("list objects in %s: %w", bucket, err)
 		}
 
 		pageNum++
-		objs := make([]Object, 0, len(page.Contents))
+		log.Debug().
+			Str("bucket", bucket).
+			Str("prefix", prefix).
+			Int("page", pageNum).
+			Int("page_objects", len(page.Contents)).
+			Int("total", len(collected)+len(page.Contents)).
+			Msg("discovery page complete")
+
 		for _, item := range page.Contents {
 			if item.Key == nil {
 				continue
@@ -357,22 +364,7 @@ func (c *Client) ListObjectsPage(ctx context.Context, bucket, prefix string, tok
 			if item.ETag != nil {
 				obj.ETag = *item.ETag
 			}
-			objs = append(objs, obj)
-		}
-		collected += len(objs)
-
-		log.Debug().
-			Str("bucket", bucket).
-			Str("prefix", prefix).
-			Int("page", pageNum).
-			Int("page_objects", len(objs)).
-			Int("total", collected).
-			Msg("discovery page complete")
-
-		if len(objs) > 0 {
-			if err := onPage(objs); err != nil {
-				return collected, nil, err
-			}
+			collected = append(collected, obj)
 		}
 
 		if !aws.ToBool(page.IsTruncated) {
@@ -380,7 +372,7 @@ func (c *Client) ListObjectsPage(ctx context.Context, bucket, prefix string, tok
 		}
 		current = page.NextContinuationToken
 
-		if collected >= maxObjects {
+		if len(collected) >= maxObjects {
 			return collected, current, nil
 		}
 	}
@@ -419,7 +411,7 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 		delay := min(time.Duration(1<<uint(attempt))*time.Second, listMaxDelay)
 		// Jitter keeps replicas sharing an endpoint from retrying in lockstep.
 		delay += rand.N(delay / 2)
-		log.Warn().Err(err).Str("bucket", bucket).Int("attempt", attempt+1).Dur("retry_in", delay).Msg("transient list error, retrying")
+		log.Warn().Err(err).Int("attempt", attempt+1).Dur("retry_in", delay).Msg("transient list error, retrying")
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
