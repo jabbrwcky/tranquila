@@ -8,6 +8,7 @@ import (
 	"time"
 
 	toxiproxy "github.com/Shopify/toxiproxy/v2/client"
+	"github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -30,6 +31,70 @@ const (
 	// Port inside the toxiproxy container that fronts MinIO.
 	toxicMinioPort = "8666"
 )
+
+// kvEngines are the Redis-compatible engines the state layer is verified
+// against. It drives Lua scripts, so compatibility with forks is tested rather
+// than assumed.
+var kvEngines = []struct{ name, image string }{
+	{"redis7", redisImage},
+	{"valkey8", "valkey/valkey:8-alpine"},
+	{"valkey9", "valkey/valkey:9-alpine"},
+}
+
+// newKV starts a single key-value container and returns a Store bound to it
+// plus a raw client. Much lighter than newStack: the state layer needs neither
+// S3 nor a proxy.
+func newKV(t *testing.T, image string) (*state.Store, *redis.Client) {
+	t.Helper()
+	requireContainerRuntime(t)
+	ctx := context.Background()
+
+	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        image,
+			ExposedPorts: []string{"6379/tcp"},
+			WaitingFor:   wait.ForListeningPort("6379/tcp").WithStartupTimeout(time.Minute),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start %s: %v", image, err)
+	}
+	t.Cleanup(func() { _ = testcontainers.TerminateContainer(c) })
+
+	addr, err := c.PortEndpoint(ctx, "6379/tcp", "")
+	if err != nil {
+		t.Fatalf("endpoint: %v", err)
+	}
+	st, err := state.NewStore(state.RedisConfig{Addr: addr})
+	if err != nil {
+		t.Fatalf("connect to %s: %v", image, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	// Record what actually answered, so a passing run names the engine it proved.
+	if info, err := rdb.InfoMap(ctx, "server").Result(); err == nil {
+		if srv, ok := info["Server"]; ok {
+			t.Logf("engine: %s (redis_version=%s valkey_version=%s)",
+				image, srv["redis_version"], srv["valkey_version"])
+		}
+	}
+	return st, rdb
+}
+
+// forEachEngine runs fn against every supported key-value engine.
+func forEachEngine(t *testing.T, fn func(t *testing.T, st *state.Store, rdb *redis.Client)) {
+	t.Helper()
+	for _, e := range kvEngines {
+		t.Run(e.name, func(t *testing.T) {
+			st, rdb := newKV(t, e.image)
+			fn(t, st, rdb)
+		})
+	}
+}
 
 // stack is the container fixture shared by a test: MinIO for object storage,
 // Redis for sync state, and Toxiproxy in front of MinIO for L4 fault injection.

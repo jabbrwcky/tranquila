@@ -332,6 +332,17 @@ cause a pod restart. `/readyz` is a **readiness** probe: it pings Redis and retu
 `200 {"status":"ok"}` when reachable or `503 {"status":"unavailable","error":...}` when
 not, so traffic is only routed to pods that can serve requests.
 
+#### Redis and Valkey
+
+Sync state is held in Redis. **Valkey works as a drop-in replacement** — the
+state layer maintains its counters with Lua scripts, and the end-to-end suite
+runs them against Redis 7, Valkey 8 and Valkey 9 on every CI run, so fork
+compatibility is verified rather than assumed. Point `--redis-addr` at either.
+
+Other Redis-compatible engines (KeyDB, Dragonfly, ElastiCache, MemoryDB) are
+untested; Dragonfly in particular implements Lua differently. See
+[e2e/README.md](e2e/README.md#key-value-engines) for how to verify one.
+
 #### Bucket statistics
 
 The per-bucket counts are maintained incrementally in Redis and read with a single

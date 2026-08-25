@@ -157,6 +157,11 @@ Counters are updated **atomically with the status write** by the Lua scripts in
 status to decrement the right field. Every write path must go through
 `setStatus` / `deleteObjectScript` or counters will drift.
 
+Because those scripts run via `EVALSHA`, engine compatibility is tested rather
+than assumed: `e2e/harness_test.go` defines `kvEngines`, and every state test
+runs against Redis 7, Valkey 8 and Valkey 9 (all green, including recovery from
+`SCRIPT FLUSH` via the `NOSCRIPT` fallback). Add an engine there to check it.
+
 `RebuildStats` recomputes everything from the object records in a **single**
 pass (not one per bucket) and reconciles both the counters and the bucket index.
 It runs automatically when `tranquila:statsbuilt` is absent, which seeds an

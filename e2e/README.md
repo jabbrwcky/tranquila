@@ -222,6 +222,7 @@ in about 8 seconds. See [Design notes](#design-notes).
 
 | Test | Guarantee |
 | --- | --- |
+| `TestBucketStats*`, `TestListBuckets*`, `TestRebuildStats*`, `TestScriptsUseEvalsha` | The Redis state layer, **run against Redis and Valkey** — see [Key-value engines](#key-value-engines). |
 | `TestHarnessSmoke` | The fixture itself: SigV4 survives the proxy, and real SDK errors for 504/502/500/503/403 land in the intended `storage.ErrClass`. |
 | `TestSyncCompletesDespiteTransient504` | Regression for the production incident: a 504 burst during discovery is absorbed and every object still syncs. |
 | `TestWatchSurvivesSustainedOutage` | Watch mode does not exit while an endpoint is hard down, and syncs once it recovers. |
@@ -231,6 +232,33 @@ in about 8 seconds. See [Design notes](#design-notes).
 | `TestL4FaultsAreTransient` | A TCP-level connection reset classifies as transient. |
 
 ## Design notes
+
+### Key-value engines
+
+The state layer maintains its per-bucket counters with **Lua scripts**, executed
+via `EVALSHA`. Scripting is the most likely place for a Redis-compatible fork to
+diverge, so compatibility is tested rather than assumed: every state test runs
+against each engine in `kvEngines` (`harness_test.go`).
+
+Verified green:
+
+| Engine | Image | Reported version |
+| --- | --- | --- |
+| Redis | `redis:7-alpine` | `redis_version=7.4.11` |
+| Valkey 8 | `valkey/valkey:8-alpine` | `valkey_version=8.1.9` (`redis_version=7.2.4`) |
+| Valkey 9 | `valkey/valkey:9-alpine` | `valkey_version=9.1.1` (`redis_version=7.2.4`) |
+
+Valkey reports a compatibility `redis_version` alongside its own `valkey_version`;
+the tests log both, so a passing run names the engine it actually proved.
+
+`TestScriptsUseEvalsha` covers the mechanism rather than just the results: it
+exercises the initial script load, a second call served from the cached SHA, and
+recovery through the `NOSCRIPT` fallback after a `SCRIPT FLUSH`. An engine with a
+subtly different script cache fails there rather than in production.
+
+Not tested, so not claimed: KeyDB, Dragonfly (whose Lua support differs
+materially), and managed services such as ElastiCache or MemoryDB. To check
+another engine, add it to `kvEngines` and run `go test -run TestBucketStats ./...`.
 
 ### A separate Go module
 
