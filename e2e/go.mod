@@ -6,7 +6,7 @@ go 1.25.0
 
 require (
 	github.com/Shopify/toxiproxy/v2 v2.12.0
-	github.com/jabbrwcky/tranquila v0.0.0
+	github.com/jabbrwcky/tranquila v0.2.1
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 )
