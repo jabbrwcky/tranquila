@@ -219,8 +219,23 @@ Normal path — the object is uploaded in this run:
    fails and the source object is kept.
 
 Verify-and-delete path — the object was already synced before the mode was
-enabled, so there is no upload to checksum: the destination is confirmed to still
-hold the object at the expected size, then the source is deleted. No re-upload.
+enabled, so there is no upload to checksum:
+
+1. `HeadObject` on the destination confirms the size matches (skipped when the
+   job's recorded size is unknown).
+2. Both objects are **downloaded and hashed** (`crc32Checksum`, streamed through
+   `crc32.NewIEEE`, not buffered) rather than trusting S3-reported metadata:
+   the source was very likely uploaded by whatever put it there originally, not
+   by tranquila, so it usually carries no stored checksum at all; and a stored
+   *composite* checksum on a multipart object is not comparable to a
+   full-object hash computed the same way on both sides. Computing both from
+   content sidesteps that mismatch entirely.
+3. The two computed checksums must be equal, or the sync fails and the source
+   is kept — this is what catches a destination silently overwritten with
+   same-size content, which the size check alone would miss.
+
+No re-upload is performed either way; this path costs one full read of each
+object instead of one write plus one read.
 
 `--dry-run` logs every planned deletion and performs none — including logging
 that it *would refuse* to delete on a checksum mismatch, so a rehearsal surfaces

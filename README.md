@@ -135,10 +135,10 @@ sync:
       burn-after-reading: true
 ```
 
-**Verification.** Deletion is irreversible, so it only happens behind a check. Which check depends on whether this run uploaded the object:
+**Verification.** Deletion is irreversible, so it only happens behind a checksum check. Which checksums are compared depends on whether this run uploaded the object:
 
 - **Uploaded in this run** — tranquila compares the CRC32 returned by the upload response with the CRC32 stored by S3 (via `HeadObject`), having already confirmed the destination size matches the source. If either checksum is absent or they differ, the source object is **not** deleted and the job is marked failed for retry.
-- **Already synced before the mode was enabled** — there is no upload to checksum, so tranquila confirms the destination still holds the object at the expected size and then deletes the source. No re-upload is performed. Note this path verifies *existence and size only*; if you need checksum-verified deletion for previously synced objects, force a re-sync with `--check-sizes` or clear their Redis state first.
+- **Already synced before the mode was enabled** — there is no upload to checksum, so tranquila confirms the destination size matches, then downloads and computes a CRC32 of both the source and the destination content and compares them directly. This catches a destination that was overwritten or corrupted with same-size content, which a size check alone would miss. The extra full read of both objects is the cost of verifying an irreversible delete when neither side is guaranteed to carry a usable stored checksum.
 
 **Dry-run mode:** pass `--dry-run` (or set `TRANQUILA_DRY_RUN=true`) to log what would be deleted without actually removing anything:
 

@@ -1,15 +1,22 @@
 package sync
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"testing"
 )
 
-// fakeDeleter records DeleteObject calls for assertion.
+// fakeDeleter records DeleteObject calls for assertion. It also implements
+// GetObject (returning body) so it satisfies sourceReadDeleter for
+// TestPerformVerifyAndDelete; TestPerformBurnAfterReading never calls it.
 type fakeDeleter struct {
 	calls  []string // "bucket/key" per call
 	retErr error
+
+	body   []byte
+	getErr error
 }
 
 func (f *fakeDeleter) DeleteObject(_ context.Context, bucket, key string) error {
@@ -17,15 +24,31 @@ func (f *fakeDeleter) DeleteObject(_ context.Context, bucket, key string) error 
 	return f.retErr
 }
 
+func (f *fakeDeleter) GetObject(_ context.Context, _, _ string) (io.ReadCloser, int64, error) {
+	if f.getErr != nil {
+		return nil, 0, f.getErr
+	}
+	return io.NopCloser(bytes.NewReader(f.body)), int64(len(f.body)), nil
+}
+
 // fakeVerifier implements destinationVerifier for testing performVerifyAndDelete.
 type fakeVerifier struct {
 	size   int64
-	crc32  string
 	retErr error
+
+	body   []byte
+	getErr error
 }
 
 func (f *fakeVerifier) HeadObject(_ context.Context, _, _ string) (int64, string, error) {
-	return f.size, f.crc32, f.retErr
+	return f.size, "", f.retErr
+}
+
+func (f *fakeVerifier) GetObject(_ context.Context, _, _ string) (io.ReadCloser, int64, error) {
+	if f.getErr != nil {
+		return nil, 0, f.getErr
+	}
+	return io.NopCloser(bytes.NewReader(f.body)), int64(len(f.body)), nil
 }
 
 func TestPerformBurnAfterReading(t *testing.T) {
@@ -135,7 +158,11 @@ func TestPerformVerifyAndDelete(t *testing.T) {
 		name        string
 		jobSize     int64 // 0 = skip size check
 		dstSize     int64
+		srcBody     []byte // defaults (nil) match on both sides: CRC32 of empty content is equal
+		dstBody     []byte
 		headErr     error
+		srcGetErr   error
+		dstGetErr   error
 		deleteErr   error
 		dryRun      bool
 		wantDeleted bool
@@ -183,12 +210,47 @@ func TestPerformVerifyAndDelete(t *testing.T) {
 			wantDeleted: true, // call was attempted
 			wantErr:     true,
 		},
+		{
+			// Same size, different content: the destination has been overwritten
+			// since it was synced. Size alone would have let this through.
+			name:        "checksum_mismatch_same_size_refuses_delete",
+			jobSize:     5,
+			dstSize:     5,
+			srcBody:     []byte("hello"),
+			dstBody:     []byte("world"),
+			wantDeleted: false,
+			wantErr:     true,
+		},
+		{
+			name:        "checksum_match_deletes",
+			jobSize:     5,
+			dstSize:     5,
+			srcBody:     []byte("hello"),
+			dstBody:     []byte("hello"),
+			wantDeleted: true,
+		},
+		{
+			name:        "source_read_error_propagates",
+			jobSize:     1024,
+			dstSize:     1024,
+			srcGetErr:   errors.New("source unreachable"),
+			wantDeleted: false,
+			wantErr:     true,
+		},
+		{
+			name:        "destination_read_error_propagates",
+			jobSize:     1024,
+			dstSize:     1024,
+			dstGetErr:   errors.New("destination unreachable"),
+			wantDeleted: false,
+			wantErr:     true,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			fv := &fakeVerifier{size: tc.dstSize, retErr: tc.headErr}
-			fd := &fakeDeleter{retErr: tc.deleteErr}
+			fv := &fakeVerifier{size: tc.dstSize, retErr: tc.headErr, body: tc.dstBody, getErr: tc.dstGetErr}
+			fd := &fakeDeleter{retErr: tc.deleteErr, body: tc.srcBody, getErr: tc.srcGetErr}
 			job := Job{
 				SrcBucket: "src",
 				DstBucket: "dst",

@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jabbrwcky/tranquila/internal/state"
 	"github.com/jabbrwcky/tranquila/internal/storage"
 	tsync "github.com/jabbrwcky/tranquila/internal/sync"
 )
@@ -252,5 +255,115 @@ func TestL4FaultsAreTransient(t *testing.T) {
 	eventually(t, 30*time.Second, "the endpoint to recover after the reset", func() bool {
 		_, _, err := c.HeadObject(ctx, "l4-src", keys[0])
 		return err == nil
+	})
+}
+
+// markAlreadySynced records key as synced exactly the way a real sync run does
+// (status=synced, modified_at=the source object's real mtime), so needsSync
+// takes the verify-and-delete path instead of re-uploading. MarkSynced alone
+// leaves modified_at unset, which needsSync reads as "source changed since
+// last sync" and forces a re-upload instead.
+func markAlreadySynced(t *testing.T, ctx context.Context, store *state.Store, src *storage.Client, bucket, key string) {
+	t.Helper()
+	objs, _, err := src.ListObjectsPage(ctx, bucket, "", nil, 100)
+	if err != nil {
+		t.Fatalf("list source objects: %v", err)
+	}
+	idx := slices.IndexFunc(objs, func(o storage.Object) bool { return o.Key == key })
+	if idx < 0 {
+		t.Fatalf("source object %s/%s not found", bucket, key)
+	}
+	err = store.UpsertObject(ctx, bucket, key, state.ObjectState{
+		Status:     state.StatusSynced,
+		ModifiedAt: objs[idx].ModifiedAt,
+		SyncedAt:   time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("upsert synced state: %v", err)
+	}
+}
+
+// TestBurnAfterReadingVerifiesContentNotJustSize covers the verify-and-delete
+// path: an object already synced before burn-after-reading was enabled must be
+// checksum-verified against the source before its source copy is deleted, not
+// merely size-checked. A destination silently corrupted or overwritten with
+// same-size content must block the delete.
+func TestBurnAfterReadingVerifiesContentNotJustSize(t *testing.T) {
+	ctx := context.Background()
+	s := newStack(t)
+	const bucket = "bar-src"
+	const dstBucket = "bar-dst"
+
+	src := s.client(t, "source", s.minioEndpoint, 0, 0)
+	dst := s.client(t, "destination", s.minioEndpoint, 0, 0)
+
+	if err := src.EnsureBucket(ctx, bucket); err != nil {
+		t.Fatalf("ensure source bucket: %v", err)
+	}
+	const content = "original content, byte-identical on both sides"
+
+	t.Run("matching_content_deletes_source", func(t *testing.T) {
+		const key = "already-synced-match.txt"
+		if _, err := src.PutObject(ctx, bucket, key, strings.NewReader(content), int64(len(content))); err != nil {
+			t.Fatalf("seed source: %v", err)
+		}
+		if err := dst.EnsureBucket(ctx, dstBucket); err != nil {
+			t.Fatalf("ensure destination bucket: %v", err)
+		}
+		if _, err := dst.PutObject(ctx, dstBucket, key, strings.NewReader(content), int64(len(content))); err != nil {
+			t.Fatalf("seed destination: %v", err)
+		}
+		store := s.store(t)
+		markAlreadySynced(t, ctx, store, src, bucket, key)
+
+		syncer, err := tsync.New(tsync.Config{
+			Source: src, Destination: dst, State: store,
+			Buckets: map[string]tsync.BucketConfig{bucket: {Destination: dstBucket, BurnAfterReading: true}},
+			Workers: 2,
+		})
+		if err != nil {
+			t.Fatalf("create syncer: %v", err)
+		}
+		if err := syncer.Run(ctx); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+
+		if _, _, err := src.HeadObject(ctx, bucket, key); err == nil {
+			t.Error("source object still exists after a verified matching sync")
+		}
+	})
+
+	t.Run("tampered_destination_same_size_blocks_delete", func(t *testing.T) {
+		const key = "already-synced-tampered.txt"
+		if _, err := src.PutObject(ctx, bucket, key, strings.NewReader(content), int64(len(content))); err != nil {
+			t.Fatalf("seed source: %v", err)
+		}
+		const dstBucket2 = "bar-dst-tampered"
+		if err := dst.EnsureBucket(ctx, dstBucket2); err != nil {
+			t.Fatalf("ensure destination bucket: %v", err)
+		}
+		// Same length as content, different bytes: a size check alone would pass.
+		tampered := strings.Repeat("X", len(content))
+		if _, err := dst.PutObject(ctx, dstBucket2, key, strings.NewReader(tampered), int64(len(tampered))); err != nil {
+			t.Fatalf("seed tampered destination: %v", err)
+		}
+		store := s.store(t)
+		markAlreadySynced(t, ctx, store, src, bucket, key)
+
+		syncer, err := tsync.New(tsync.Config{
+			Source: src, Destination: dst, State: store,
+			Buckets: map[string]tsync.BucketConfig{bucket: {Destination: dstBucket2, BurnAfterReading: true}},
+			Workers: 2,
+		})
+		if err != nil {
+			t.Fatalf("create syncer: %v", err)
+		}
+		// The job fails (checksum mismatch), so Run reports it, but the source
+		// must survive regardless of whether the caller checks the error.
+		_ = syncer.Run(ctx)
+
+		if _, _, err := src.HeadObject(ctx, bucket, key); err != nil {
+			t.Fatalf("source object was deleted despite a content mismatch: %v", err)
+		}
 	})
 }
