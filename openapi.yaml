@@ -12,6 +12,44 @@ servers:
     description: Default local management server
 
 paths:
+  /healthz:
+    get:
+      operationId: livenessProbe
+      summary: Liveness probe
+      description: >
+        Returns 200 whenever the process is serving HTTP. Checks no external
+        dependencies, so an unreachable Redis does not fail this probe (that is
+        the readiness probe's job). Intended for a Kubernetes livenessProbe.
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /readyz:
+    get:
+      operationId: readinessProbe
+      summary: Readiness probe
+      description: >
+        Verifies the API's dependencies (Redis) are reachable. Returns 200 when
+        ready to serve requests and 503 when a dependency is unavailable.
+        Intended for a Kubernetes readinessProbe.
+      responses:
+        "200":
+          description: Ready to serve requests
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          description: A dependency is unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
   /api/v1/buckets:
     get:
       operationId: listBuckets
@@ -160,11 +198,51 @@ components:
           format: date-time
           nullable: true
           description: When the current (or most recent) sync run started
+        source:
+          $ref: "#/components/schemas/EndpointState"
+        destination:
+          $ref: "#/components/schemas/EndpointState"
         buckets:
           type: array
           description: Status of each bucket that is part of the active sync run
           items:
             $ref: "#/components/schemas/BucketStatus"
+
+    EndpointState:
+      type: object
+      description: >
+        Rate-limit pacing for one S3 endpoint. Congestion control halves the
+        limit after repeated transient failures and restores it additively.
+        Only endpoints with a configured rate limit are degraded.
+      required: [degraded]
+      properties:
+        rate_limit:
+          type: number
+          format: double
+          description: Effective S3 API calls/sec; omitted when unlimited
+        base_rate_limit:
+          type: number
+          format: double
+          description: Configured ceiling in S3 API calls/sec; omitted when unlimited
+        degraded:
+          type: boolean
+          description: Whether the limit is currently reduced below its configured base
+        degraded_since:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the current degraded episode began
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          description: '"ok" when healthy/ready, "unavailable" when a dependency is down'
+        error:
+          type: string
+          description: Present only when status is "unavailable"
 
     Error:
       type: object

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -16,7 +17,7 @@ import (
 )
 
 type StatusCmd struct {
-	APIAddr string   `kong:"name='api-addr',env='MGMT_ADDR',default=':8080',help='Management API address'"`
+	Server  string   `kong:"name='server',env='MGMT_ADDR',default=':8080',help='Management API base URL, e.g. https://host:port. A bare host:port is assumed http://.'"`
 	Buckets []string `kong:"arg,optional,help='Buckets to show (empty = all)'"`
 }
 
@@ -24,7 +25,11 @@ func (cmd *StatusCmd) Run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	baseURL := "http://" + cmd.APIAddr
+	baseURL := cmd.Server
+	if !strings.Contains(baseURL, "://") {
+		baseURL = "http://" + baseURL
+	}
+	baseURL = strings.TrimSuffix(baseURL, "/")
 
 	var statuses []api.BucketStatus
 	if len(cmd.Buckets) == 0 {

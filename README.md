@@ -12,6 +12,16 @@ Tranquila pipelines discovery and sync per bucket:
 
 State is persisted in Redis using object-level keys, so interrupted or failed transfers are automatically retried on the next run.
 
+Key properties:
+
+- **Resumable** — Redis tracks every object, so an interrupted run picks up where it left off.
+- **Provider-agnostic** — works against AWS S3 or any S3-compatible endpoint (MinIO, Ceph, …) on either side, with Redis or Valkey for state.
+- **Survives flaky endpoints** — transient failures are retried with backoff, and a struggling endpoint is automatically paced down and recovered, without the process exiting.
+- **Continuous or one-shot** — run once as a `Job`, or `--watch` continuously via polling, MinIO notifications or SQS.
+- **Observable** — Prometheus/OTLP metrics, a management API, and Kubernetes probes.
+
+For the internals — data flow, the Redis key design, the resilience machinery and the concurrency model — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
 ## Commands
 
 ### `tranquila sync`
@@ -30,7 +40,12 @@ Prints per-bucket statistics from the management API (requires a running `tranqu
 ```shell
 tranquila status
 tranquila status bucket1 bucket2
+tranquila status --server https://tranquila.example.svc:8080 bucket1
 ```
+
+`--server` (env `MGMT_ADDR`) takes the management API's base URL. A bare
+`host:port` is assumed `http://` for local/dev use; in a cluster where the
+API is fronted by TLS, pass the full `https://...` URL.
 
 Output columns: `BUCKET | LAST COLLECTED | TOTAL | SYNCED | PENDING | FAILED`
 
@@ -96,6 +111,11 @@ sync:
   watch-interval: 60s       # inter-cycle sleep (poll mode only)
   sqs-queue-url: ""         # SQS queue URL (sqs mode only)
 
+  # Retry pacing after a failed cycle in watch mode (exponential, jittered)
+  cycle-backoff: 5s
+  cycle-backoff-max: 10m
+  endpoint-fail-threshold: 5  # transient failures before an endpoint's rate is halved
+
   telemetry:
     exporter: "prometheus"  # prometheus | otlp | none
     addr: ":8081"
@@ -120,7 +140,10 @@ sync:
       burn-after-reading: true
 ```
 
-**Verification:** after each upload, tranquila compares the CRC32 checksum returned by the S3 upload response with the CRC32 stored by S3 (retrieved via `HeadObject`). If either value is absent or the checksums do not match, the source object is **not** deleted and the job is marked failed for retry.
+**Verification.** Deletion is irreversible, so it only happens behind a checksum check. Which checksums are compared depends on whether this run uploaded the object:
+
+- **Uploaded in this run** — tranquila compares the CRC32 returned by the upload response with the CRC32 stored by S3 (via `HeadObject`), having already confirmed the destination size matches the source. If either checksum is absent or they differ, the source object is **not** deleted and the job is marked failed for retry.
+- **Already synced before the mode was enabled** — there is no upload to checksum, so tranquila confirms the destination size matches, then tries an ETag comparison before falling back to reading content. Every S3 object's ETag is present in metadata already fetched for the size check (destination) or already known from discovery (source), so this catches a destination overwritten or corrupted with same-size content — something a size check alone would miss — **without downloading either object**, for any object that wasn't uploaded as multipart. For a multipart object (ETag contains a `-partCount` suffix, since S3 computes it as a checksum-of-part-checksums rather than a checksum of the content), tranquila falls back to downloading and CRC32-hashing both objects directly, as it always has. The extra full read in that case is the cost of verifying an irreversible delete when a multipart object's own checksum isn't comparable across independent uploads.
 
 **Dry-run mode:** pass `--dry-run` (or set `TRANQUILA_DRY_RUN=true`) to log what would be deleted without actually removing anything:
 
@@ -174,6 +197,9 @@ tranquila sync --prefix-mappings "bucket/src-prefix=dst-prefix"
 | `TRANQUILA_WATCH_MODE`            | `poll`           | Watch backend: `poll`, `minio`, or `sqs`             |
 | `TRANQUILA_WATCH_INTERVAL`        | `60s`            | Idle time between poll cycles                        |
 | `TRANQUILA_SQS_QUEUE_URL`         |                  | SQS queue URL (sqs watch mode)                       |
+| `TRANQUILA_CYCLE_BACKOFF`         | `5s`             | Base retry delay after a failed cycle (watch mode)   |
+| `TRANQUILA_CYCLE_BACKOFF_MAX`     | `10m`            | Maximum retry delay after a failed cycle             |
+| `TRANQUILA_ENDPOINT_FAIL_THRESHOLD` | `5`            | Transient failures before an endpoint's rate is halved |
 | `TELEMETRY_EXPORTER`              | `prometheus`     | Metrics exporter: `prometheus`, `otlp`, or `none`    |
 | `TELEMETRY_ADDR`                  | `:8081`          | Prometheus metrics listen address                    |
 | `TELEMETRY_OTLP_ENDPOINT`         |                  | OTLP gRPC endpoint                                   |
@@ -204,6 +230,67 @@ tranquila sync --watch --watch-mode=minio --source-endpoint=http://minio:9000
 tranquila sync --watch --watch-mode=sqs \
   --sqs-queue-url=https://sqs.eu-west-1.amazonaws.com/123/my-queue
 ```
+
+### Failure handling in watch mode
+
+Watch mode is a long-lived service, so a transient endpoint fault must not become
+a pod restart. Failed cycles are retried with exponential backoff plus jitter
+(`--cycle-backoff`, `--cycle-backoff-max`) and the process stays alive, keeping
+`/healthz` answering.
+
+| Failure | Watch mode | One-shot |
+| --- | --- | --- |
+| Transient (504, 502, 500, timeouts, dropped connections) | Retried forever with backoff | Exits non-zero |
+| Throttle (503, `SlowDown`, 429) | Retried forever with backoff | Exits non-zero |
+| Permanent (`AccessDenied`, `NoSuchBucket`, bad credentials) | Exits non-zero | Exits non-zero |
+
+Misconfiguration stays loud: only a cycle whose failures are *all* permanent
+terminates. A cycle mixing permanent and transient failures is treated as
+transient, so a flaky endpoint can never be misread as misconfiguration.
+
+One-shot runs (no `--watch`) are unchanged and still exit non-zero on any
+failure, so a Kubernetes `Job` or CI invocation reports it.
+
+### Adaptive rate limiting
+
+Each endpoint's rate limit is governed by additive-increase/multiplicative-decrease
+congestion control, fed by the outcome of every S3 API call:
+
+- After `--endpoint-fail-threshold` consecutive transient failures (default `5`)
+  the endpoint's rate limit is **halved**, down to a floor of 1 call/sec.
+- An explicit throttle (`503`, `SlowDown`, `429`) is unambiguous back-pressure
+  and halves the rate on the **first** signal, without waiting for the threshold.
+- After 20 consecutive healthy calls the limit climbs back by 10% of the
+  configured base, until it is fully restored. Decrease fast, recover slowly.
+- A permanent error counts as *healthy* for pacing purposes: the endpoint
+  answered, so it is not congested.
+
+Source and destination are paced independently and symmetrically: a source-side
+`504` throttles source reads only, and a destination-side `504` throttles
+destination writes only. Every S3 operation feeds the controller, including the
+destination's `PutObject`, `HeadObject`, `DeleteObject` and bucket creation.
+
+> **Requires a configured rate limit.** Only endpoints with an explicit
+> `--source-rate-limit` / `--dest-rate-limit` are degraded. An endpoint left
+> unlimited (the default, `0`) has no ceiling to reduce, and inventing one would
+> throttle a healthy endpoint — so it keeps running unlimited and gets only the
+> cycle backoff above. To protect the destination, set `--dest-rate-limit`.
+
+Note that the limiter paces *operations*, not HTTP requests: an upload above the
+transfer manager's 16 MiB multipart threshold issues several requests but spends
+one token, and a failure anywhere in it is one congestion signal. Pacing is
+therefore approximate for workloads dominated by large objects.
+
+Current pacing is exposed on `GET /api/v1/sync` as `source` and `destination`
+(`rate_limit`, `base_rate_limit`, `degraded`, `degraded_since`) and as the
+metrics `tranquila_s3_rate_limit`, `tranquila_s3_rate_limit_degraded`,
+`tranquila_s3_rate_limit_changes` and `tranquila_s3_errors`.
+
+`/readyz` stays green while degraded: degraded operation is the designed correct
+response to a flaky endpoint, and reporting it as unready would stall rolling
+updates without shedding any load. Alert on
+`tranquila_s3_rate_limit_degraded == 1` and `tranquila_sync_cycle_failures`
+instead.
 
 ## Required IAM Permissions
 
@@ -236,14 +323,29 @@ tranquila sync --telemetry-exporter=otlp --telemetry-otlp-endpoint=localhost:431
 
 ### Metrics
 
-| Metric                            | Type           | Description                            |
-| --------------------------------- | -------------- | -------------------------------------- |
-| `tranquila.objects.synced`        | Counter        | Objects successfully copied            |
-| `tranquila.objects.failed`        | Counter        | Objects that failed to copy            |
-| `tranquila.bytes.transferred`     | Counter        | Bytes transferred                      |
-| `tranquila.transfer.duration`     | Histogram (s)  | Per-object transfer duration           |
-| `tranquila.workers.active`        | Gauge.         | Workers currently executing a transfer |
-| `tranquila.s3.operation.duration` | Histogram (ms) | Duration of individual S3 API calls    |
+| Metric                             | Type            | Attributes            | Description                                        |
+| ---------------------------------- | --------------- | --------------------- | -------------------------------------------------- |
+| `tranquila.objects.synced`         | Counter         | `bucket`              | Objects successfully copied                        |
+| `tranquila.objects.failed`         | Counter         | `bucket`              | Objects that failed to copy                        |
+| `tranquila.bytes.transferred`      | Counter         | `bucket`              | Bytes transferred                                  |
+| `tranquila.transfer.duration`      | Histogram (s)   | `bucket`              | Per-object transfer duration                       |
+| `tranquila.workers.active`         | UpDownCounter   | —                     | Workers currently executing a transfer             |
+| `tranquila.sync.cycle.failures`    | Counter         | —                     | Watch cycles that failed and were retried          |
+| `tranquila.s3.operation.duration`  | Histogram (ms)  | `operation`, `bucket`, `status` | Duration of individual S3 API calls      |
+| `tranquila.s3.errors`              | Counter         | `endpoint`, `class`   | S3 failures by class (transient/throttle/permanent) |
+| `tranquila.s3.rate_limit`          | Gauge ({call}/s)| `endpoint`            | Effective rate limit; 0 when unlimited             |
+| `tranquila.s3.rate_limit.degraded` | Gauge           | `endpoint`            | 1 while congestion control has reduced the limit   |
+| `tranquila.s3.rate_limit.changes`  | Counter         | `endpoint`, `direction` | Rate-limit adjustments; detects oscillation      |
+
+Useful alerts:
+
+```promql
+# An endpoint has been throttled by congestion control for a sustained period
+tranquila_s3_rate_limit_degraded == 1
+
+# Watch cycles are failing: the process is alive but not making progress
+rate(tranquila_sync_cycle_failures[15m]) > 0
+```
 
 ### Management API
 
@@ -254,6 +356,61 @@ A lightweight HTTP API is available at `http://localhost:8080` while sync is run
 | `GET /api/v1/buckets`        | List all buckets with Redis state statistics  |
 | `GET /api/v1/buckets/{name}` | Per-bucket statistics with live progress      |
 | `GET /api/v1/sync`           | Overall sync run progress                     |
+| `GET /healthz`               | Liveness probe (always 200 while serving)     |
+| `GET /readyz`                | Readiness probe (200 ready / 503 Redis down)  |
+
+`/healthz` is a **liveness** probe: it returns `200 {"status":"ok"}` whenever the process
+is serving HTTP and checks no dependencies — so a temporarily unreachable Redis will not
+cause a pod restart. `/readyz` is a **readiness** probe: it pings Redis and returns
+`200 {"status":"ok"}` when reachable or `503 {"status":"unavailable","error":...}` when
+not, so traffic is only routed to pods that can serve requests.
+
+#### Redis and Valkey
+
+Sync state is held in Redis. **Valkey works as a drop-in replacement** — the
+state layer maintains its counters with Lua scripts, and the end-to-end suite
+runs them against Redis 7, Valkey 8 and Valkey 9 on every CI run, so fork
+compatibility is verified rather than assumed. Point `--redis-addr` at either.
+
+Other Redis-compatible engines (KeyDB, Dragonfly, ElastiCache, MemoryDB) are
+untested; Dragonfly in particular implements Lua differently. See
+[e2e/README.md](e2e/README.md#key-value-engines) for how to verify one.
+
+#### Bucket statistics
+
+The per-bucket counts are maintained incrementally in Redis and read with a single
+lookup, so the endpoints respond in milliseconds regardless of how many objects are
+tracked. They are updated atomically with each object's status, in the same operation.
+
+The counters are seeded automatically the first time they are read on a keyspace that
+predates them: that one request recomputes them from the object records and can take a
+few seconds on a large keyspace. Every request afterwards is served from the counters.
+
+If the counters ever drift from reality, force a reconcile by deleting the marker key —
+the next request recomputes everything from the object records:
+
+```shell
+redis-cli DEL tranquila:statsbuilt
+```
+
+#### Kubernetes probes
+
+Point both probes at the management API port (from `--mgmt-addr`, default `8080`):
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+```
 
 ## Build
 
@@ -261,7 +418,34 @@ A lightweight HTTP API is available at `http://localhost:8080` while sync is run
 go build -v
 ```
 
-Requires Go 1.22 or later.
+Requires Go 1.25 or later, as declared in `go.mod`.
+
+## Tests
+
+```bash
+go test ./...             # unit tests, no containers
+cd e2e && go test ./...    # end-to-end, container-backed (~3-4 min)
+```
+
+The end-to-end suite drives the resilience behaviour above against a real MinIO,
+injecting HTTP faults (504/503/500) and TCP faults (connection resets) to prove
+that transient failures are absorbed, watch mode survives an outage, and rate
+limits degrade and recover. It is a separate Go module, so it neither slows the
+unit suite nor adds container dependencies to the production module.
+
+It needs a container runtime. Docker works as-is; on macOS, Podman works without
+Docker Desktop, but the machine must be **rootful**:
+
+```bash
+brew install podman
+podman machine init --rootful && podman machine start
+cd e2e && go test ./...
+```
+
+No environment variables are needed — the suite configures the runtime itself,
+and skips with an explanation if none is reachable. Apple's native `container`
+CLI is **not** supported (it exposes no Docker-compatible API). Full setup,
+configuration reference and troubleshooting: **[e2e/README.md](e2e/README.md)**.
 
 ## Usage Examples
 

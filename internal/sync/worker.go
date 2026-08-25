@@ -15,6 +15,11 @@ type Job struct {
 	DstKey     string // destination object key (may differ via prefix rewrite)
 	Size       int64
 	ModifiedAt time.Time
+	// SrcETag is the source object's ETag from discovery listing, used by
+	// verify-and-delete to compare against the destination's ETag without a
+	// download when both sides are single-part uploads. Empty for jobs not
+	// built from a listing (e.g. watch-mode events).
+	SrcETag string
 	// OnComplete is called exactly once after the job is either transferred,
 	// failed, or skipped due to context cancellation. Used by discoverAndSyncBucket
 	// to wait for a batch to drain before continuing discovery.
@@ -32,6 +37,10 @@ type Result struct {
 
 type transferFn func(ctx context.Context, job Job) error
 
+// transferGrace bounds a single detached transfer so a degraded rate limiter
+// cannot stall shutdown indefinitely.
+const transferGrace = 30 * time.Minute
+
 type workerPool struct {
 	jobs          chan Job
 	results       chan Result
@@ -46,7 +55,7 @@ func newWorkerPool(ctx context.Context, n int, fn transferFn, activeWorkers metr
 		activeWorkers: activeWorkers,
 	}
 
-	for i := 0; i < n; i++ {
+	for range n {
 		p.wg.Add(1)
 		go p.runWorker(ctx, fn)
 	}
@@ -73,11 +82,14 @@ func (p *workerPool) runWorker(ctx context.Context, fn transferFn) {
 			continue
 		}
 		p.activeWorkers.Add(context.Background(), 1)
-		// Use background context for the transfer itself so in-flight
-		// transfers complete even after the signal context is cancelled.
-		// Rate limiting is applied inside the storage client methods.
+		// Detach from the signal context so in-flight transfers complete after
+		// SIGTERM, but bound it: rate limiting happens inside the storage client,
+		// and a congestion-degraded limiter would otherwise pace an uncancellable
+		// transfer past terminationGracePeriodSeconds.
 		start := time.Now()
-		err := fn(context.Background(), job)
+		transferCtx, cancelTransfer := context.WithTimeout(context.WithoutCancel(ctx), transferGrace)
+		err := fn(transferCtx, job)
+		cancelTransfer()
 		p.activeWorkers.Add(context.Background(), -1)
 		p.results <- Result{Job: job, Duration: time.Since(start), Err: err}
 	}

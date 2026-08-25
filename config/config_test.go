@@ -7,16 +7,16 @@ import (
 func TestDecodeBucketMappings(t *testing.T) {
 	tests := []struct {
 		name    string
-		raw     interface{}
+		raw     any
 		want    []BucketMapping
 		wantErr bool
 	}{
 		{
 			name: "source_and_destination_with_prefixes",
-			raw: []interface{}{
-				map[string]interface{}{
-					"source":      map[string]interface{}{"bucket": "src-bucket", "prefix": "foo/"},
-					"destination": map[string]interface{}{"bucket": "dst-bucket", "prefix": "bar/"},
+			raw: []any{
+				map[string]any{
+					"source":      map[string]any{"bucket": "src-bucket", "prefix": "foo/"},
+					"destination": map[string]any{"bucket": "dst-bucket", "prefix": "bar/"},
 				},
 			},
 			want: []BucketMapping{{
@@ -26,10 +26,10 @@ func TestDecodeBucketMappings(t *testing.T) {
 		},
 		{
 			name: "optional_prefixes_omitted",
-			raw: []interface{}{
-				map[string]interface{}{
-					"source":      map[string]interface{}{"bucket": "my-bucket"},
-					"destination": map[string]interface{}{"bucket": "my-bucket-copy"},
+			raw: []any{
+				map[string]any{
+					"source":      map[string]any{"bucket": "my-bucket"},
+					"destination": map[string]any{"bucket": "my-bucket-copy"},
 				},
 			},
 			want: []BucketMapping{{
@@ -39,14 +39,14 @@ func TestDecodeBucketMappings(t *testing.T) {
 		},
 		{
 			name: "multiple_mappings",
-			raw: []interface{}{
-				map[string]interface{}{
-					"source":      map[string]interface{}{"bucket": "bucket-a"},
-					"destination": map[string]interface{}{"bucket": "bucket-a-backup"},
+			raw: []any{
+				map[string]any{
+					"source":      map[string]any{"bucket": "bucket-a"},
+					"destination": map[string]any{"bucket": "bucket-a-backup"},
 				},
-				map[string]interface{}{
-					"source":      map[string]interface{}{"bucket": "bucket-b", "prefix": "logs/"},
-					"destination": map[string]interface{}{"bucket": "archive", "prefix": "bucket-b-logs/"},
+				map[string]any{
+					"source":      map[string]any{"bucket": "bucket-b", "prefix": "logs/"},
+					"destination": map[string]any{"bucket": "archive", "prefix": "bucket-b-logs/"},
 				},
 			},
 			want: []BucketMapping{
@@ -68,7 +68,7 @@ func TestDecodeBucketMappings(t *testing.T) {
 		},
 		{
 			name:    "empty_slice",
-			raw:     []interface{}{},
+			raw:     []any{},
 			want:    []BucketMapping{},
 			wantErr: false,
 		},

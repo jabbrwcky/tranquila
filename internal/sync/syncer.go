@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 const defaultDiscoveryBatchSize = 100_000
@@ -39,7 +42,7 @@ type Config struct {
 	Source             *storage.Client
 	Destination        *storage.Client
 	State              *state.Store
-	Meter              metric.Meter
+	Meter              metric.Meter            // optional; zero value produces no-op instruments
 	Buckets            map[string]BucketConfig // src → config; nil = auto-discover all
 	DestBucketPrefix   string                  // prefix for auto-discovered destination bucket names
 	Workers            int
@@ -47,6 +50,9 @@ type Config struct {
 	DryRun             bool      // log planned burn-after-reading deletions without executing them
 	Progress           *Progress // optional; enables live progress tracking for the management API
 	DiscoveryBatchSize int       // max objects to discover per bucket before syncing (0 = default 100 000)
+
+	CycleBackoff    time.Duration // base delay before retrying a failed watch cycle (0 = 5s)
+	CycleBackoffMax time.Duration // ceiling for the retry delay (0 = 10m)
 }
 
 type metrics struct {
@@ -55,6 +61,7 @@ type metrics struct {
 	bytesTransferred metric.Int64Counter
 	duration         metric.Float64Histogram
 	activeWorkers    metric.Int64UpDownCounter
+	cycleFailures    metric.Int64Counter
 }
 
 type Syncer struct {
@@ -71,6 +78,10 @@ func New(cfg Config) (*Syncer, error) {
 }
 
 func newMetrics(meter metric.Meter) (metrics, error) {
+	// metric.Meter is an interface, so its zero value is nil rather than a no-op.
+	if meter == nil {
+		meter = noop.Meter{}
+	}
 	synced, err := meter.Int64Counter("tranquila.objects.synced",
 		metric.WithDescription("Total objects successfully synced"))
 	if err != nil {
@@ -98,12 +109,18 @@ func newMetrics(meter metric.Meter) (metrics, error) {
 	if err != nil {
 		return metrics{}, err
 	}
+	cycleFailures, err := meter.Int64Counter("tranquila.sync.cycle.failures",
+		metric.WithDescription("Watch cycles that failed and were retried with backoff"))
+	if err != nil {
+		return metrics{}, err
+	}
 	return metrics{
 		synced:           synced,
 		failed:           failed,
 		bytesTransferred: bytes,
 		duration:         dur,
 		activeWorkers:    activeWorkers,
+		cycleFailures:    cycleFailures,
 	}, nil
 }
 
@@ -140,11 +157,9 @@ func (s *Syncer) Run(ctx context.Context) error {
 	pool := newWorkerPool(ctx, s.cfg.Workers, s.transfer, s.m.activeWorkers)
 
 	var resultWg sync.WaitGroup
-	resultWg.Add(1)
-	go func() {
-		defer resultWg.Done()
+	resultWg.Go(func() {
 		s.processResults(ctx, pool.resultsCh())
-	}()
+	})
 
 	collectionTime := time.Now().UTC()
 	sem := make(chan struct{}, s.cfg.Workers)
@@ -172,7 +187,14 @@ func (s *Syncer) Run(ctx context.Context) error {
 	pool.close()
 	resultWg.Wait()
 	close(errc)
-	return <-errc
+
+	var errs []error
+	for err := range errc {
+		errs = append(errs, err)
+	}
+	// Join rather than first-error: every bucket's failure stays visible, and a
+	// mixed cycle is not misread as pure misconfiguration by isFatalCycleErr.
+	return errors.Join(errs...)
 }
 
 // discoverAndSyncBucket lists the source bucket in batches of DiscoveryBatchSize
@@ -241,6 +263,7 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 				DstKey:           cfg.destKey(obj.Key),
 				Size:             obj.Size,
 				ModifiedAt:       obj.ModifiedAt,
+				SrcETag:          obj.ETag,
 				OnComplete:       batchDone.Done,
 				BurnAfterReading: cfg.BurnAfterReading,
 				DryRun:           s.cfg.DryRun,
@@ -316,7 +339,7 @@ func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Objec
 	}
 	// Optionally verify destination size matches source to catch incomplete uploads.
 	if s.cfg.CheckSizes && obj.Size > 0 {
-		dstSize, _, err := s.cfg.Destination.HeadObject(ctx, cfg.Destination, cfg.destKey(obj.Key))
+		dstSize, _, _, err := s.cfg.Destination.HeadObject(ctx, cfg.Destination, cfg.destKey(obj.Key))
 		if err != nil {
 			// Object missing or inaccessible on destination — re-sync.
 			return true, nil
@@ -370,24 +393,42 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 }
 
 // RunWatch repeatedly calls Run until ctx is cancelled, sleeping interval between
-// each completed cycle. The sleep is context-aware: cancellation during the sleep
-// exits immediately and cleanly.
+// each completed cycle. A transient failure is retried with exponential backoff
+// rather than aborting: watch mode is a long-lived service and must survive a
+// flaky endpoint without exiting into a crash-loop. Misconfiguration still returns.
 func (s *Syncer) RunWatch(ctx context.Context, interval time.Duration) error {
-	return s.runWatch(ctx, interval, s.Run)
+	return s.runWatch(ctx, interval, s.Run, waitOrDone)
 }
 
-// runWatch is the testable core of RunWatch; cycleFn replaces s.Run so tests can
-// inject controlled behaviour without requiring real S3 or Redis connections.
-func (s *Syncer) runWatch(ctx context.Context, interval time.Duration, cycleFn func(context.Context) error) error {
+// runWatch is the testable core of RunWatch; cycleFn replaces s.Run and sleep
+// replaces waitOrDone so tests can inject controlled behaviour without requiring
+// real S3 or Redis connections, or real delays.
+func (s *Syncer) runWatch(ctx context.Context, interval time.Duration, cycleFn func(context.Context) error, sleep sleeper) error {
+	var fails int
 	for {
-		if err := cycleFn(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		err := cycleFn(ctx)
+		switch {
+		case err == nil || errors.Is(err, context.Canceled):
+			if fails > 0 {
+				log.Info().Int("after_failures", fails).Msg("watch: cycle recovered")
+				fails = 0
+			}
+		case isFatalCycleErr(err):
 			return err
+		default:
+			fails++
+			delay := s.cycleBackoff(fails)
+			s.m.cycleFailures.Add(ctx, 1)
+			log.Error().Err(err).Int("consecutive_failures", fails).Dur("retry_in", delay).
+				Msg("watch: cycle failed, backing off")
+			if !sleep(ctx, delay) {
+				return nil
+			}
+			continue
 		}
 		log.Info().Dur("interval", interval).Msg("watch: cycle complete, waiting before next discovery")
-		select {
-		case <-ctx.Done():
+		if !sleep(ctx, interval) {
 			return nil
-		case <-time.After(interval):
 		}
 	}
 }
@@ -396,7 +437,7 @@ func (s *Syncer) runWatch(ctx context.Context, interval time.Duration, cycleFn f
 // the program was down, then switches to event-driven mode consuming events from w.
 // In-flight transfers complete before returning on context cancellation.
 func (s *Syncer) RunWatcher(ctx context.Context, w watcher.Watcher) error {
-	if err := s.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+	if err := s.initialSync(ctx, s.Run, waitOrDone); err != nil {
 		return err
 	}
 	if ctx.Err() != nil {
@@ -419,7 +460,41 @@ func (s *Syncer) RunWatcher(ctx context.Context, w watcher.Watcher) error {
 		srcBuckets = append(srcBuckets, b)
 	}
 
-	return s.runWatcher(ctx, w, srcBuckets, bucketMap)
+	// The event stream can close without error (a MinIO notification stream that
+	// drops is not reconnected by the watcher). Returning here would exit 0 and
+	// let K8s restart the pod, so reconnect with the same backoff instead.
+	for n := 1; ; n++ {
+		err := s.runWatcher(ctx, w, srcBuckets, bucketMap)
+		if err != nil || ctx.Err() != nil {
+			return err
+		}
+		delay := s.cycleBackoff(n)
+		log.Warn().Int("attempt", n).Dur("retry_in", delay).Msg("watch: event stream closed, reconnecting")
+		if !waitOrDone(ctx, delay) {
+			return nil
+		}
+	}
+}
+
+// initialSync retries the catch-up cycle with backoff so a gateway that is flaky
+// at startup does not kill an event-driven watcher before it reaches its event loop.
+func (s *Syncer) initialSync(ctx context.Context, cycleFn func(context.Context) error, sleep sleeper) error {
+	for n := 1; ; n++ {
+		err := cycleFn(ctx)
+		if err == nil || errors.Is(err, context.Canceled) {
+			return nil
+		}
+		if isFatalCycleErr(err) {
+			return err
+		}
+		delay := s.cycleBackoff(n)
+		s.m.cycleFailures.Add(ctx, 1)
+		log.Error().Err(err).Int("attempt", n).Dur("retry_in", delay).
+			Msg("watch: initial sync failed, backing off")
+		if !sleep(ctx, delay) {
+			return nil
+		}
+	}
 }
 
 // runWatcher is the testable event-loop core of RunWatcher; it accepts a pre-resolved
@@ -433,11 +508,9 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 	pool := newWorkerPool(ctx, s.cfg.Workers, s.transfer, s.m.activeWorkers)
 
 	var resultWg sync.WaitGroup
-	resultWg.Add(1)
-	go func() {
-		defer resultWg.Done()
+	resultWg.Go(func() {
 		s.processResults(ctx, pool.resultsCh())
-	}()
+	})
 
 	log.Info().Strs("buckets", srcBuckets).Msg("watch: listening for object events")
 
@@ -472,7 +545,7 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 
 func (s *Syncer) transfer(ctx context.Context, job Job) error {
 	// VerifyAndDelete: object was already synced before BAR mode was enabled.
-	// Skip re-upload; confirm destination still has it (size check), then delete source.
+	// Skip re-upload; confirm destination content matches source (checksum), then delete source.
 	if job.VerifyAndDelete {
 		return performVerifyAndDelete(ctx, job, s.cfg.Destination, s.cfg.Source)
 	}
@@ -491,7 +564,7 @@ func (s *Syncer) transfer(ctx context.Context, job Job) error {
 
 	// Verify destination size and capture stored CRC32 for burn-after-reading.
 	// Skip size check when srcSize is unknown (server did not provide Content-Length).
-	dstSize, storedCRC32, err := s.cfg.Destination.HeadObject(ctx, job.DstBucket, job.DstKey)
+	dstSize, storedCRC32, _, err := s.cfg.Destination.HeadObject(ctx, job.DstBucket, job.DstKey)
 	if err != nil {
 		return fmt.Errorf("verify %s/%s: %w", job.DstBucket, job.DstKey, err)
 	}
@@ -511,16 +584,59 @@ type objectDeleter interface {
 	DeleteObject(ctx context.Context, bucket, key string) error
 }
 
+// objectGetter is the narrow interface needed to read an object's content, so its
+// checksum can be computed rather than trusted from possibly-absent S3 metadata.
+type objectGetter interface {
+	GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, int64, error)
+}
+
 // destinationVerifier is the narrow interface that performVerifyAndDelete needs from the destination client.
 type destinationVerifier interface {
-	HeadObject(ctx context.Context, bucket, key string) (size int64, checksumCRC32 string, err error)
+	objectGetter
+	HeadObject(ctx context.Context, bucket, key string) (size int64, checksumCRC32, etag string, err error)
+}
+
+// sourceReadDeleter is the narrow interface that performVerifyAndDelete needs from the source
+// client: read (to checksum) and delete.
+type sourceReadDeleter interface {
+	objectGetter
+	DeleteObject(ctx context.Context, bucket, key string) error
+}
+
+// crc32Checksum streams an object's full content through CRC32 (IEEE) and returns
+// the result as a lowercase hex string. Used to compare source and destination
+// content directly, rather than relying on S3-reported checksum metadata: an
+// object's own upload path may not have stored one (e.g. the source in
+// verify-and-delete was uploaded by whatever put it there originally, not by
+// tranquila), and a stored composite checksum for a multipart object is not
+// comparable to a full-object checksum computed the same way on both sides.
+func crc32Checksum(ctx context.Context, g objectGetter, bucket, key string) (string, error) {
+	body, _, err := g.GetObject(ctx, bucket, key)
+	if err != nil {
+		return "", err
+	}
+	defer body.Close()
+	h := crc32.NewIEEE()
+	if _, err := io.Copy(h, body); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%08x", h.Sum32()), nil
 }
 
 // performVerifyAndDelete handles the verify-and-delete path for objects that were already synced
-// before burn-after-reading mode was enabled. It confirms the destination still has the object
-// (existence + size check), then deletes from source. No re-upload is performed.
-func performVerifyAndDelete(ctx context.Context, job Job, dst destinationVerifier, src objectDeleter) error {
-	dstSize, _, err := dst.HeadObject(ctx, job.DstBucket, job.DstKey)
+// before burn-after-reading mode was enabled. No re-upload is performed; instead it confirms the
+// destination still holds the object (size check) and that its content matches the source, then
+// deletes from source.
+//
+// Content is compared via ETag when possible: identical single-part uploads produce identical
+// ETags (S3's MD5-of-content convention) on any S3-compatible backend, at zero read cost — the
+// source's ETag comes from discovery listing, the destination's from the HeadObject call the size
+// check already makes. A multipart ETag is a composite of its parts' MD5s plus a "-partCount"
+// suffix and is never comparable this way, so that case (and any other unparseable ETag) falls
+// back to downloading and hashing both objects' full content — the cost of verifying an
+// irreversible delete when neither side is guaranteed to carry a usable stored checksum.
+func performVerifyAndDelete(ctx context.Context, job Job, dst destinationVerifier, src sourceReadDeleter) error {
+	dstSize, _, dstETag, err := dst.HeadObject(ctx, job.DstBucket, job.DstKey)
 	if err != nil {
 		return fmt.Errorf("burn-after-reading verify: destination check %s/%s: %w", job.DstBucket, job.DstKey, err)
 	}
@@ -528,10 +644,38 @@ func performVerifyAndDelete(ctx context.Context, job Job, dst destinationVerifie
 		return fmt.Errorf("burn-after-reading verify: size mismatch %s/%s: expected=%d got=%d",
 			job.DstBucket, job.DstKey, job.Size, dstSize)
 	}
+
+	verifiedBy := "crc32"
+	verified := false
+	if srcMD5, srcOK := storage.SinglePartMD5(job.SrcETag); srcOK {
+		if dstMD5, dstOK := storage.SinglePartMD5(dstETag); dstOK {
+			if srcMD5 != dstMD5 {
+				return fmt.Errorf("burn-after-reading verify: ETag mismatch %s/%s: source=%s destination=%s, refusing to delete source",
+					job.DstBucket, job.DstKey, srcMD5, dstMD5)
+			}
+			verifiedBy, verified = "etag", true
+		}
+	}
+	if !verified {
+		srcChecksum, err := crc32Checksum(ctx, src, job.SrcBucket, job.Key)
+		if err != nil {
+			return fmt.Errorf("burn-after-reading verify: read source %s/%s: %w", job.SrcBucket, job.Key, err)
+		}
+		dstChecksum, err := crc32Checksum(ctx, dst, job.DstBucket, job.DstKey)
+		if err != nil {
+			return fmt.Errorf("burn-after-reading verify: read destination %s/%s: %w", job.DstBucket, job.DstKey, err)
+		}
+		if srcChecksum != dstChecksum {
+			return fmt.Errorf("burn-after-reading verify: checksum mismatch %s/%s: source=%s destination=%s, refusing to delete source",
+				job.DstBucket, job.DstKey, srcChecksum, dstChecksum)
+		}
+	}
+
 	log.Info().
 		Str("bucket", job.SrcBucket).
 		Str("key", job.Key).
 		Int64("size", dstSize).
+		Str("verified_by", verifiedBy).
 		Msg("burn-after-reading: destination verified")
 	if job.DryRun {
 		log.Info().
@@ -564,16 +708,23 @@ func performBurnAfterReading(ctx context.Context, job Job, src objectDeleter, up
 		Bool("checksum_match", checksumMatch).
 		Msg("burn-after-reading: checksum verification")
 
+	if !checksumMatch {
+		if job.DryRun {
+			log.Info().
+				Str("bucket", job.SrcBucket).
+				Str("key", job.Key).
+				Msg("burn-after-reading: DRY-RUN would refuse to delete source object (checksum mismatch)")
+			return nil
+		}
+		return fmt.Errorf("burn-after-reading: checksum mismatch for %s/%s (upload=%q stored=%q), refusing to delete source",
+			job.SrcBucket, job.Key, uploadCRC32, storedCRC32)
+	}
 	if job.DryRun {
 		log.Info().
 			Str("bucket", job.SrcBucket).
 			Str("key", job.Key).
 			Msg("burn-after-reading: DRY-RUN would delete source object")
 		return nil
-	}
-	if !checksumMatch {
-		return fmt.Errorf("burn-after-reading: checksum mismatch for %s/%s (upload=%q stored=%q), refusing to delete source",
-			job.SrcBucket, job.Key, uploadCRC32, storedCRC32)
 	}
 	if err := src.DeleteObject(ctx, job.SrcBucket, job.Key); err != nil {
 		return fmt.Errorf("burn-after-reading: delete source %s/%s: %w", job.SrcBucket, job.Key, err)
