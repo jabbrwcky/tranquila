@@ -40,7 +40,12 @@ Prints per-bucket statistics from the management API (requires a running `tranqu
 ```shell
 tranquila status
 tranquila status bucket1 bucket2
+tranquila status --server https://tranquila.example.svc:8080 bucket1
 ```
+
+`--server` (env `MGMT_ADDR`) takes the management API's base URL. A bare
+`host:port` is assumed `http://` for local/dev use; in a cluster where the
+API is fronted by TLS, pass the full `https://...` URL.
 
 Output columns: `BUCKET | LAST COLLECTED | TOTAL | SYNCED | PENDING | FAILED`
 
