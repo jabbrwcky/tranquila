@@ -26,6 +26,7 @@
   "ignoreTests": true,
   "timezone": "Europe/Berlin",
   "assignAutomerge": true,
+  "ignoreDeps": ["github.com/jabbrwcky/tranquila"],
   "packageRules": [
     {
       "matchManagers": ["gomod"],
