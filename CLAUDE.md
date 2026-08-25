@@ -2,6 +2,12 @@
 
 @AGENTS.md
 
+Human-facing docs: [README.md](README.md) for usage,
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for internals,
+[e2e/README.md](e2e/README.md) for the container-backed test suite. Keep this
+file for agent-specific context and the decisions behind the code; do not
+duplicate the reference material there.
+
 ## Architecture
 
 | Layer | Package | Notes |

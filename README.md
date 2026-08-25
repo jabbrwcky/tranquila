@@ -12,6 +12,16 @@ Tranquila pipelines discovery and sync per bucket:
 
 State is persisted in Redis using object-level keys, so interrupted or failed transfers are automatically retried on the next run.
 
+Key properties:
+
+- **Resumable** — Redis tracks every object, so an interrupted run picks up where it left off.
+- **Provider-agnostic** — works against AWS S3 or any S3-compatible endpoint (MinIO, Ceph, …) on either side, with Redis or Valkey for state.
+- **Survives flaky endpoints** — transient failures are retried with backoff, and a struggling endpoint is automatically paced down and recovered, without the process exiting.
+- **Continuous or one-shot** — run once as a `Job`, or `--watch` continuously via polling, MinIO notifications or SQS.
+- **Observable** — Prometheus/OTLP metrics, a management API, and Kubernetes probes.
+
+For the internals — data flow, the Redis key design, the resilience machinery and the concurrency model — see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
 ## Commands
 
 ### `tranquila sync`
@@ -125,7 +135,10 @@ sync:
       burn-after-reading: true
 ```
 
-**Verification:** after each upload, tranquila compares the CRC32 checksum returned by the S3 upload response with the CRC32 stored by S3 (retrieved via `HeadObject`). If either value is absent or the checksums do not match, the source object is **not** deleted and the job is marked failed for retry.
+**Verification.** Deletion is irreversible, so it only happens behind a check. Which check depends on whether this run uploaded the object:
+
+- **Uploaded in this run** — tranquila compares the CRC32 returned by the upload response with the CRC32 stored by S3 (via `HeadObject`), having already confirmed the destination size matches the source. If either checksum is absent or they differ, the source object is **not** deleted and the job is marked failed for retry.
+- **Already synced before the mode was enabled** — there is no upload to checksum, so tranquila confirms the destination still holds the object at the expected size and then deletes the source. No re-upload is performed. Note this path verifies *existence and size only*; if you need checksum-verified deletion for previously synced objects, force a re-sync with `--check-sizes` or clear their Redis state first.
 
 **Dry-run mode:** pass `--dry-run` (or set `TRANQUILA_DRY_RUN=true`) to log what would be deleted without actually removing anything:
 
@@ -305,14 +318,29 @@ tranquila sync --telemetry-exporter=otlp --telemetry-otlp-endpoint=localhost:431
 
 ### Metrics
 
-| Metric                            | Type           | Description                            |
-| --------------------------------- | -------------- | -------------------------------------- |
-| `tranquila.objects.synced`        | Counter        | Objects successfully copied            |
-| `tranquila.objects.failed`        | Counter        | Objects that failed to copy            |
-| `tranquila.bytes.transferred`     | Counter        | Bytes transferred                      |
-| `tranquila.transfer.duration`     | Histogram (s)  | Per-object transfer duration           |
-| `tranquila.workers.active`        | Gauge.         | Workers currently executing a transfer |
-| `tranquila.s3.operation.duration` | Histogram (ms) | Duration of individual S3 API calls    |
+| Metric                             | Type            | Attributes            | Description                                        |
+| ---------------------------------- | --------------- | --------------------- | -------------------------------------------------- |
+| `tranquila.objects.synced`         | Counter         | `bucket`              | Objects successfully copied                        |
+| `tranquila.objects.failed`         | Counter         | `bucket`              | Objects that failed to copy                        |
+| `tranquila.bytes.transferred`      | Counter         | `bucket`              | Bytes transferred                                  |
+| `tranquila.transfer.duration`      | Histogram (s)   | `bucket`              | Per-object transfer duration                       |
+| `tranquila.workers.active`         | UpDownCounter   | —                     | Workers currently executing a transfer             |
+| `tranquila.sync.cycle.failures`    | Counter         | —                     | Watch cycles that failed and were retried          |
+| `tranquila.s3.operation.duration`  | Histogram (ms)  | `operation`, `bucket`, `status` | Duration of individual S3 API calls      |
+| `tranquila.s3.errors`              | Counter         | `endpoint`, `class`   | S3 failures by class (transient/throttle/permanent) |
+| `tranquila.s3.rate_limit`          | Gauge ({call}/s)| `endpoint`            | Effective rate limit; 0 when unlimited             |
+| `tranquila.s3.rate_limit.degraded` | Gauge           | `endpoint`            | 1 while congestion control has reduced the limit   |
+| `tranquila.s3.rate_limit.changes`  | Counter         | `endpoint`, `direction` | Rate-limit adjustments; detects oscillation      |
+
+Useful alerts:
+
+```promql
+# An endpoint has been throttled by congestion control for a sustained period
+tranquila_s3_rate_limit_degraded == 1
+
+# Watch cycles are failing: the process is alive but not making progress
+rate(tranquila_sync_cycle_failures[15m]) > 0
+```
 
 ### Management API
 
