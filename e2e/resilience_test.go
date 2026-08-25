@@ -265,7 +265,11 @@ func TestL4FaultsAreTransient(t *testing.T) {
 // last sync" and forces a re-upload instead.
 func markAlreadySynced(t *testing.T, ctx context.Context, store *state.Store, src *storage.Client, bucket, key string) {
 	t.Helper()
-	objs, _, err := src.ListObjectsPage(ctx, bucket, "", nil, 100)
+	var objs []storage.Object
+	_, _, err := src.ListObjectsPage(ctx, bucket, "", nil, 100, func(page []storage.Object) error {
+		objs = append(objs, page...)
+		return nil
+	})
 	if err != nil {
 		t.Fatalf("list source objects: %v", err)
 	}
