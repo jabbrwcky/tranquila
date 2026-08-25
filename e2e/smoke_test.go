@@ -25,12 +25,12 @@ func TestHarnessSmoke(t *testing.T) {
 	t.Run("sigv4_survives_reverse_proxy", func(t *testing.T) {
 		fp := newFaultProxy(t, s.minioEndpoint)
 		c := s.client(t, "source", fp.URL(), 0, 0)
-		objs, _, err := c.ListObjectsPage(ctx, "smoke-src", "", nil, 100)
+		count, _, err := c.ListObjectsPage(ctx, "smoke-src", "", nil, 100, func([]storage.Object) error { return nil })
 		if err != nil {
 			t.Fatalf("list through fault proxy: %v", err)
 		}
-		if len(objs) != len(keys) {
-			t.Errorf("listed %d objects, want %d", len(objs), len(keys))
+		if count != len(keys) {
+			t.Errorf("listed %d objects, want %d", count, len(keys))
 		}
 	})
 
@@ -83,7 +83,7 @@ func TestHarnessSmoke(t *testing.T) {
 
 	t.Run("toxiproxy_l4_path_is_reachable", func(t *testing.T) {
 		c := s.client(t, "source", s.toxicEndpoint, 0, 0)
-		if _, _, err := c.ListObjectsPage(ctx, "smoke-src", "", nil, 100); err != nil {
+		if _, _, err := c.ListObjectsPage(ctx, "smoke-src", "", nil, 100, func([]storage.Object) error { return nil }); err != nil {
 			t.Fatalf("list through toxiproxy: %v", err)
 		}
 	})

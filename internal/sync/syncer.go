@@ -39,17 +39,18 @@ func (bc BucketConfig) destKey(srcKey string) string {
 }
 
 type Config struct {
-	Source             *storage.Client
-	Destination        *storage.Client
-	State              *state.Store
-	Meter              metric.Meter            // optional; zero value produces no-op instruments
-	Buckets            map[string]BucketConfig // src → config; nil = auto-discover all
-	DestBucketPrefix   string                  // prefix for auto-discovered destination bucket names
-	Workers            int
-	CheckSizes         bool      // re-queue synced objects whose destination size differs from source
-	DryRun             bool      // log planned burn-after-reading deletions without executing them
-	Progress           *Progress // optional; enables live progress tracking for the management API
-	DiscoveryBatchSize int       // max objects to discover per bucket before syncing (0 = default 100 000)
+	Source              *storage.Client
+	Destination         *storage.Client
+	State               *state.Store
+	Meter               metric.Meter            // optional; zero value produces no-op instruments
+	Buckets             map[string]BucketConfig // src → config; nil = auto-discover all
+	DestBucketPrefix    string                  // prefix for auto-discovered destination bucket names
+	Workers             int
+	CheckSizes          bool      // re-queue synced objects whose destination size differs from source
+	DryRun              bool      // log planned burn-after-reading deletions without executing them
+	Progress            *Progress // optional; enables live progress tracking for the management API
+	DiscoveryBatchSize  int       // max objects to discover per bucket before syncing (0 = default 100 000)
+	MaxWorkersPerBucket int       // cap on concurrent transfers for a single bucket (0 = default: half of Workers)
 
 	CycleBackoff    time.Duration // base delay before retrying a failed watch cycle (0 = 5s)
 	CycleBackoffMax time.Duration // ceiling for the retry delay (0 = 10m)
@@ -132,6 +133,20 @@ func (s *Syncer) discoveryBatchSize() int {
 	return defaultDiscoveryBatchSize
 }
 
+// maxWorkersPerBucket returns the effective per-bucket transfer concurrency cap:
+// cfg value if positive, otherwise half of Workers (min 1). This keeps one
+// bucket with a large or slow listing (e.g. many small objects) from occupying
+// the whole shared worker pool and starving other buckets' transfers.
+func (s *Syncer) maxWorkersPerBucket() int {
+	if s.cfg.MaxWorkersPerBucket > 0 {
+		return s.cfg.MaxWorkersPerBucket
+	}
+	if n := (s.cfg.Workers + 1) / 2; n > 0 {
+		return n
+	}
+	return 1
+}
+
 // Run performs discovery and sync for all configured buckets. Each bucket's
 // discovery runs concurrently with other buckets; sync starts as soon as a
 // bucket's discovery batch is ready. Large buckets are processed in batches of
@@ -198,10 +213,14 @@ func (s *Syncer) Run(ctx context.Context) error {
 }
 
 // discoverAndSyncBucket lists the source bucket in batches of DiscoveryBatchSize
-// objects, marks each pending in Redis, submits them to the worker pool, and
-// waits for the batch to finish syncing before fetching the next page. This
-// keeps memory bounded and starts transferring objects without waiting for the
-// full listing to complete. Called concurrently by Run for each bucket.
+// objects, marks each pending in Redis, and submits them to the worker pool as
+// each underlying S3 listing page arrives (not after the whole batch is
+// collected), so transfers start immediately rather than waiting on a slow or
+// large listing. It waits for the batch to finish syncing before fetching the
+// next one, which keeps memory bounded. A per-bucket semaphore caps how many
+// of this bucket's transfers may be in flight at once, so a bucket with many
+// (small) objects cannot occupy the whole shared worker pool and starve other
+// buckets. Called concurrently by Run for each bucket.
 func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg BucketConfig, collectionTime time.Time, pool *workerPool) error {
 	logger := log.With().Str("bucket", bucket).Str("prefix", cfg.SrcPrefix).Logger()
 
@@ -214,6 +233,7 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 	}
 
 	batchSize := s.discoveryBatchSize()
+	bucketSem := make(chan struct{}, s.maxWorkersPerBucket())
 	var token *string
 	var batchNum, totalCount, totalPending int
 
@@ -222,63 +242,77 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 			return ctx.Err()
 		}
 
-		page, nextToken, err := s.cfg.Source.ListObjectsPage(ctx, bucket, cfg.SrcPrefix, token, batchSize)
-		if err != nil {
-			return fmt.Errorf("list objects: %w", err)
-		}
-
 		batchNum++
 		var batchPending int
 		var batchDone sync.WaitGroup
 
-		for _, obj := range page {
-			totalCount++
-			needsFullSync, err := s.needsSync(ctx, bucket, obj, cfg)
-			if err != nil {
-				logger.Warn().Err(err).Str("key", obj.Key).Msg("state check failed, marking pending")
-				needsFullSync = true
-			}
-
-			// For non-BAR buckets: skip objects that don't need sync.
-			// For BAR buckets: even already-synced objects need verify-and-delete
-			// (source was not deleted when the bucket was previously in normal mode).
-			if !needsFullSync && !cfg.BurnAfterReading {
-				continue
-			}
-
-			verifyAndDelete := !needsFullSync // already-synced; skip re-upload, just verify+delete
-
-			if needsFullSync && s.cfg.State != nil {
-				if err := s.cfg.State.MarkPending(ctx, bucket, obj.Key, obj.ModifiedAt); err != nil {
-					return fmt.Errorf("mark pending %s: %w", obj.Key, err)
+		onPage := func(page []storage.Object) error {
+			var pagePending int
+			for _, obj := range page {
+				totalCount++
+				needsFullSync, err := s.needsSync(ctx, bucket, obj, cfg)
+				if err != nil {
+					logger.Warn().Err(err).Str("key", obj.Key).Msg("state check failed, marking pending")
+					needsFullSync = true
 				}
+
+				// For non-BAR buckets: skip objects that don't need sync.
+				// For BAR buckets: even already-synced objects need verify-and-delete
+				// (source was not deleted when the bucket was previously in normal mode).
+				if !needsFullSync && !cfg.BurnAfterReading {
+					continue
+				}
+
+				verifyAndDelete := !needsFullSync // already-synced; skip re-upload, just verify+delete
+
+				if needsFullSync && s.cfg.State != nil {
+					if err := s.cfg.State.MarkPending(ctx, bucket, obj.Key, obj.ModifiedAt); err != nil {
+						return fmt.Errorf("mark pending %s: %w", obj.Key, err)
+					}
+				}
+
+				select {
+				case bucketSem <- struct{}{}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+
+				totalPending++
+				batchPending++
+				pagePending++
+				batchDone.Add(1)
+				pool.submit(Job{
+					SrcBucket:  bucket,
+					DstBucket:  cfg.Destination,
+					Key:        obj.Key,
+					DstKey:     cfg.destKey(obj.Key),
+					Size:       obj.Size,
+					ModifiedAt: obj.ModifiedAt,
+					SrcETag:    obj.ETag,
+					OnComplete: func() {
+						batchDone.Done()
+						<-bucketSem
+					},
+					BurnAfterReading: cfg.BurnAfterReading,
+					DryRun:           s.cfg.DryRun,
+					VerifyAndDelete:  verifyAndDelete,
+				})
 			}
-			totalPending++
-			batchPending++
-			batchDone.Add(1)
-			pool.submit(Job{
-				SrcBucket:        bucket,
-				DstBucket:        cfg.Destination,
-				Key:              obj.Key,
-				DstKey:           cfg.destKey(obj.Key),
-				Size:             obj.Size,
-				ModifiedAt:       obj.ModifiedAt,
-				SrcETag:          obj.ETag,
-				OnComplete:       batchDone.Done,
-				BurnAfterReading: cfg.BurnAfterReading,
-				DryRun:           s.cfg.DryRun,
-				VerifyAndDelete:  verifyAndDelete,
-			})
+			if s.cfg.Progress != nil && pagePending > 0 {
+				s.cfg.Progress.addPending(bucket, int64(pagePending))
+			}
+			return nil
 		}
 
-		if s.cfg.Progress != nil {
-			s.cfg.Progress.addPending(bucket, int64(batchPending))
+		discovered, nextToken, err := s.cfg.Source.ListObjectsPage(ctx, bucket, cfg.SrcPrefix, token, batchSize, onPage)
+		if err != nil {
+			return fmt.Errorf("list objects: %w", err)
 		}
 
 		if nextToken != nil {
 			logger.Info().
 				Int("batch", batchNum).
-				Int("discovered", len(page)).
+				Int("discovered", discovered).
 				Int("queued", batchPending).
 				Msg("batch queued, waiting for sync before continuing discovery")
 			batchDone.Wait()
