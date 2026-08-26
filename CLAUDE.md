@@ -61,6 +61,10 @@ Processed in `cmd_sync.go:resolveBuckets()`. Structured config loaded first; CLI
 - **`runWatch`/`runWatcher` private helpers** — public methods delegate to injectable private versions; enables unit tests without real S3/Redis.
 - **`ListObjectsPage` streams via an `onPage` callback, not a return slice** — the old signature accumulated up to `DiscoveryBatchSize` (default 100k) objects in memory across many S3 pages before returning, so `discoverAndSyncBucket` submitted nothing to the worker pool until the *entire* batch was listed. A bucket that's large or hitting transient S3 errors (e.g. 504s) mid-listing looked completely stalled — zero transfers — for the whole batch. The callback fires per underlying S3 page so objects start transferring as soon as they're discovered; the outer per-batch `batchDone.Wait()` still bounds memory/pending count.
 - **Per-bucket transfer concurrency cap (`--max-workers-per-bucket`, default: half of `--workers`)** — the worker pool is shared across all buckets in a cycle. Without a cap, a bucket with many (often small) objects can occupy the whole pool via continuous submission, starving other buckets' transfers even though their discovery goroutines are actively queuing jobs. Enforced with a per-bucket semaphore acquired in `discoverAndSyncBucket`'s `onPage` callback and released in `Job.OnComplete`.
+- **Delete propagation (`propagate-deletes`) uses two different mechanisms per watch mode** — `minio`/`sqs` already receive an `ObjectRemoved` notification, so `ObjectEvent.IsDelete` (set from `EventName` in `minio.go`/`sqs.go`) drives an immediate destination delete via `runWatcher`'s `eventDispatch`. `poll` mode has no such notification, so it relies on reconciliation: `discoverAndSyncBucket` calls `state.TouchSeen` for every object seen in a listing (only for `PropagateDeletes` buckets, to avoid the extra write for everyone else), and `Syncer.reconcileDeletes` (called at the end of `Run`) finds synced objects whose `seen_at` predates the cycle via `state.ScanStaleObjects`.
+- **Reconciliation never deletes on an inconclusive answer** — before deleting the destination, `reconcileDeletes` re-checks the candidate against the *source* with `HeadObject`, classified through `classifyHeadErr`/`storage.Classify`. Only a confirmed `ClassOK` 404 (`NoSuchKey`) counts as "genuinely deleted"; any other error class (transient, throttled, permanent-but-not-404) is treated as inconclusive and retried next pass — a listing gap or a flaky `HeadObject` must never cause a live destination object to be deleted.
+- **`--delete-reconcile-interval` is decoupled from `--watch-interval`** — `ScanStaleObjects` is `SCAN`-based (see Redis Key Design), so it pays the same O(whole-keyspace) cost as `RebuildStats` every time it runs, independent of how small the reconciled bucket is. `Syncer.reconcileDue`/`dueForReconcile` throttle it per-bucket; `0` (default) means "every `Run()` call" for consistency with this codebase's other `0 = no throttling` flags, not "disabled".
+- **A failed destination delete does not call `state.MarkFailed`** — unlike a failed upload, `needsSync` would then retry a full sync of a source object that no longer exists. `processResults` leaves the record's status untouched on a delete failure so it is picked up again by the next reconcile pass (or the next watcher event, for event-driven modes) instead of looping on a doomed re-upload.
 
 ## Configuration Reference (YAML)
 
@@ -109,6 +113,10 @@ sync:
   cycle-backoff: 5s
   cycle-backoff-max: 10m
   endpoint-fail-threshold: 5
+
+  # Cadence for propagate-deletes reconciliation (poll mode + initial
+  # catch-up sync; see "Key Design Decisions"). 0 = every Run() call.
+  delete-reconcile-interval: 0s
 
   telemetry:
     exporter: prometheus     # prometheus | otlp | none
@@ -177,6 +185,8 @@ upgraded keyspace on first read. **To force a reconcile, delete that marker** �
 that is the operator escape hatch for drift.
 
 `ScanPending` still scans per bucket, but currently has no callers.
+
+`propagate-deletes` reconciliation adds a `seen_at` field to `tranquila:obj:{bucket}:{key}` (written by `TouchSeen`, a plain `HSET` — no counter mutation, not a status transition) and a second per-bucket scan, `ScanStaleObjects`, that pays the same keyspace-wide `SCAN` cost as `ScanPending`/`RebuildStats`. Both `TouchSeen` and `ScanStaleObjects` only run for buckets with `PropagateDeletes` enabled, so buckets that don't opt in pay neither the extra write nor the scan.
 
 ## Failure Handling
 

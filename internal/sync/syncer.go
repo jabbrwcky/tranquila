@@ -28,6 +28,7 @@ type BucketConfig struct {
 	SrcPrefix        string // list/filter prefix applied when scanning the source; empty = all objects
 	DstPrefix        string // replaces SrcPrefix in the destination key; empty = keep original key
 	BurnAfterReading bool   // delete source object after verified sync
+	PropagateDeletes bool   // delete destination object when the source object is deleted
 }
 
 // destKey returns the destination object key for srcKey, applying prefix replacement when configured.
@@ -54,6 +55,12 @@ type Config struct {
 
 	CycleBackoff    time.Duration // base delay before retrying a failed watch cycle (0 = 5s)
 	CycleBackoffMax time.Duration // ceiling for the retry delay (0 = 10m)
+
+	// DeleteReconcileInterval throttles how often propagate-deletes reconciliation
+	// (an O(keyspace) Redis scan per bucket, see ScanStaleObjects) runs per bucket,
+	// independent of the sync/discovery cadence. 0 = reconcile at the end of every
+	// Run().
+	DeleteReconcileInterval time.Duration
 }
 
 type metrics struct {
@@ -68,6 +75,9 @@ type metrics struct {
 type Syncer struct {
 	cfg Config
 	m   metrics
+
+	reconcileMu   sync.Mutex
+	lastReconcile map[string]time.Time // bucket -> last propagate-deletes reconcile
 }
 
 func New(cfg Config) (*Syncer, error) {
@@ -75,7 +85,7 @@ func New(cfg Config) (*Syncer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init metrics: %w", err)
 	}
-	return &Syncer{cfg: cfg, m: m}, nil
+	return &Syncer{cfg: cfg, m: m, lastReconcile: make(map[string]time.Time)}, nil
 }
 
 func newMetrics(meter metric.Meter) (metrics, error) {
@@ -207,6 +217,19 @@ func (s *Syncer) Run(ctx context.Context) error {
 	for err := range errc {
 		errs = append(errs, err)
 	}
+
+	if ctx.Err() == nil && s.cfg.State != nil {
+		now := time.Now().UTC()
+		for bucket, bc := range bucketMap {
+			if !bc.PropagateDeletes || !s.reconcileDue(bucket, now) {
+				continue
+			}
+			if err := s.reconcileDeletes(ctx, bucket, bc, collectionTime); err != nil && !errors.Is(err, context.Canceled) {
+				errs = append(errs, fmt.Errorf("reconcile deletes %s: %w", bucket, err))
+			}
+		}
+	}
+
 	// Join rather than first-error: every bucket's failure stays visible, and a
 	// mixed cycle is not misread as pure misconfiguration by isFatalCycleErr.
 	return errors.Join(errs...)
@@ -254,6 +277,17 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 				if err != nil {
 					logger.Warn().Err(err).Str("key", obj.Key).Msg("state check failed, marking pending")
 					needsFullSync = true
+				}
+
+				// Record that this object is still present in source, so a later
+				// reconcileDeletes pass can tell "still present" apart from "no
+				// longer seen" for objects needsSync otherwise never touches again.
+				// Done after needsSync reads prior state, so this write doesn't
+				// change what that read observed.
+				if cfg.PropagateDeletes && s.cfg.State != nil {
+					if err := s.cfg.State.TouchSeen(ctx, bucket, obj.Key, collectionTime); err != nil {
+						logger.Warn().Err(err).Str("key", obj.Key).Msg("touch seen failed")
+					}
 				}
 
 				// For non-BAR buckets: skip objects that don't need sync.
@@ -341,6 +375,133 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 	return nil
 }
 
+// eventDecision is how runWatcher should handle a single watcher.ObjectEvent.
+type eventDecision int
+
+const (
+	dispatchUpload     eventDecision = iota // created/modified: sync as usual
+	dispatchDelete                          // removed + propagate-deletes enabled: delete destination
+	dispatchSkipDelete                      // removed but propagate-deletes disabled: ignore
+)
+
+// eventDispatch decides how to handle a watcher event for its bucket, decoupled
+// from job submission so the routing logic is unit-testable without a live
+// worker pool.
+func eventDispatch(event watcher.ObjectEvent, bc BucketConfig) eventDecision {
+	if !event.IsDelete {
+		return dispatchUpload
+	}
+	if !bc.PropagateDeletes {
+		return dispatchSkipDelete
+	}
+	return dispatchDelete
+}
+
+// dueForReconcile reports whether enough time has passed since last for a
+// propagate-deletes reconcile pass to run again. interval <= 0 means "every
+// call", matching this codebase's other "0 = no throttling" flags (e.g.
+// MaxWorkersPerBucket). A pure function so the boundary logic is testable
+// without a real clock.
+func dueForReconcile(last time.Time, interval time.Duration, now time.Time) bool {
+	if interval <= 0 {
+		return true
+	}
+	return last.IsZero() || now.Sub(last) >= interval
+}
+
+// reconcileDue checks and, if due, atomically claims this cycle's reconcile
+// slot for bucket so concurrent callers don't double-run it.
+func (s *Syncer) reconcileDue(bucket string, now time.Time) bool {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+	if !dueForReconcile(s.lastReconcile[bucket], s.cfg.DeleteReconcileInterval, now) {
+		return false
+	}
+	s.lastReconcile[bucket] = now
+	return true
+}
+
+// reconcileVerdict is the outcome of checking a reconcile candidate against
+// the source, decoupled from the HeadObject call itself so the classification
+// logic is unit-testable without a live S3 client.
+type reconcileVerdict int
+
+const (
+	reconcileInconclusive     reconcileVerdict = iota // transient/throttle/permanent error; retry later
+	reconcileStillPresent                             // no error: object exists, listing gap not a deletion
+	reconcileConfirmedDeleted                         // a genuine 404/NoSuchKey: safe to delete destination
+)
+
+// classifyHeadErr turns a source HeadObject error (nil on success) into a
+// reconcileVerdict. Only a healthy negative answer (storage.ClassOK for a
+// non-nil err, i.e. 404/NoSuchKey) confirms a deletion — any other error class
+// is inconclusive and must not be treated as proof the object is gone.
+func classifyHeadErr(err error) reconcileVerdict {
+	if err == nil {
+		return reconcileStillPresent
+	}
+	if storage.Classify(err) == storage.ClassOK {
+		return reconcileConfirmedDeleted
+	}
+	return reconcileInconclusive
+}
+
+// reconcileDeletes finds objects tracked for bucket that were not observed in
+// the most recent source listing (candidates from ScanStaleObjects) and, after
+// confirming each is genuinely gone from source via HeadObject, deletes the
+// corresponding destination object. A candidate still present in source (a
+// listing gap, not a real deletion) is left alone and its seen_at refreshed
+// rather than deleted — propagate-deletes must never delete a live object.
+func (s *Syncer) reconcileDeletes(ctx context.Context, bucket string, cfg BucketConfig, before time.Time) error {
+	candidates, err := s.cfg.State.ScanStaleObjects(ctx, bucket, before)
+	if err != nil {
+		return fmt.Errorf("scan stale objects: %w", err)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	log.Info().Str("bucket", bucket).Int("candidates", len(candidates)).Msg("propagate-deletes: reconciling")
+
+	var errs []error
+	for _, key := range candidates {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		_, _, _, headErr := s.cfg.Source.HeadObject(ctx, bucket, key)
+		switch classifyHeadErr(headErr) {
+		case reconcileInconclusive:
+			// A transient/throttled/permanent error tells us nothing about whether
+			// the source object is actually gone. Skip; re-evaluated next pass.
+			log.Warn().Err(headErr).Str("bucket", bucket).Str("key", key).
+				Msg("propagate-deletes: source check inconclusive, skipping candidate")
+			continue
+		case reconcileStillPresent:
+			// A listing gap, not a deletion. Refresh seen_at so this candidate
+			// isn't repeatedly re-evaluated every pass.
+			log.Warn().Str("bucket", bucket).Str("key", key).
+				Msg("propagate-deletes: reconcile candidate still present in source, skipping delete")
+			if err := s.cfg.State.TouchSeen(ctx, bucket, key, time.Now()); err != nil {
+				log.Warn().Err(err).Str("bucket", bucket).Str("key", key).Msg("touch seen failed")
+			}
+			continue
+		}
+
+		job := Job{SrcBucket: bucket, DstBucket: cfg.Destination, Key: key, DstKey: cfg.destKey(key), DryRun: s.cfg.DryRun}
+		if err := performDelete(ctx, job, s.cfg.Destination); err != nil {
+			errs = append(errs, fmt.Errorf("delete %s/%s: %w", cfg.Destination, cfg.destKey(key), err))
+			continue
+		}
+		if s.cfg.DryRun {
+			continue
+		}
+		if err := s.cfg.State.RemoveObject(ctx, bucket, key); err != nil {
+			errs = append(errs, fmt.Errorf("remove state %s/%s: %w", bucket, key, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (s *Syncer) resolveBuckets(ctx context.Context) (map[string]BucketConfig, error) {
 	if len(s.cfg.Buckets) > 0 {
 		return s.cfg.Buckets, nil
@@ -388,6 +549,27 @@ func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Objec
 func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 	for r := range results {
 		attrs := []attribute.KeyValue{attribute.String("bucket", r.Job.SrcBucket)}
+		if r.Job.IsDelete {
+			if r.Err != nil {
+				// Leave the tracking record untouched (rather than MarkFailed) so a
+				// future reconcile pass or restart's initial sync can retry the
+				// propagated delete; MarkFailed would make needsSync retry an upload
+				// of a source object that no longer exists.
+				log.Error().
+					Err(r.Err).
+					Str("bucket", r.Job.SrcBucket).
+					Str("key", r.Job.Key).
+					Msg("propagate-deletes: destination delete failed")
+				s.m.failed.Add(ctx, 1, metric.WithAttributes(attrs...))
+			} else {
+				_ = s.cfg.State.RemoveObject(ctx, r.Job.SrcBucket, r.Job.Key)
+				s.m.synced.Add(ctx, 1, metric.WithAttributes(attrs...))
+			}
+			if r.Job.OnComplete != nil {
+				r.Job.OnComplete()
+			}
+			continue
+		}
 		if r.Err != nil {
 			log.Error().
 				Err(r.Err).
@@ -554,6 +736,24 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 			log.Warn().Str("bucket", event.Bucket).Msg("watch: received event for unknown bucket, skipping")
 			continue
 		}
+
+		switch eventDispatch(event, bc) {
+		case dispatchSkipDelete:
+			log.Debug().Str("bucket", event.Bucket).Str("key", event.Key).
+				Msg("watch: source deletion event, propagate-deletes disabled for bucket, ignoring")
+			continue
+		case dispatchDelete:
+			pool.submit(Job{
+				SrcBucket: event.Bucket,
+				DstBucket: bc.Destination,
+				Key:       event.Key,
+				DstKey:    bc.destKey(event.Key),
+				IsDelete:  true,
+				DryRun:    s.cfg.DryRun,
+			})
+			continue
+		}
+
 		if s.cfg.State != nil {
 			if err := s.cfg.State.MarkPending(ctx, event.Bucket, event.Key, event.ModifiedAt); err != nil {
 				log.Error().Err(err).Str("bucket", event.Bucket).Str("key", event.Key).Msg("watch: mark pending failed")
@@ -578,6 +778,10 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 }
 
 func (s *Syncer) transfer(ctx context.Context, job Job) error {
+	if job.IsDelete {
+		return performDelete(ctx, job, s.cfg.Destination)
+	}
+
 	// VerifyAndDelete: object was already synced before BAR mode was enabled.
 	// Skip re-upload; confirm destination content matches source (checksum), then delete source.
 	if job.VerifyAndDelete {
@@ -725,6 +929,29 @@ func performVerifyAndDelete(ctx context.Context, job Job, dst destinationVerifie
 		Str("bucket", job.SrcBucket).
 		Str("key", job.Key).
 		Msg("burn-after-reading: source object deleted")
+	return nil
+}
+
+// performDelete deletes the destination object mirroring a source deletion
+// (propagate-deletes). Unlike burn-after-reading, no verification is needed
+// here beyond what already gated the job: an event-driven delete came from a
+// watcher notification, and a poll-mode reconciliation delete was already
+// verified against the source via HeadObject before this job was submitted.
+func performDelete(ctx context.Context, job Job, dst objectDeleter) error {
+	if job.DryRun {
+		log.Info().
+			Str("bucket", job.DstBucket).
+			Str("key", job.DstKey).
+			Msg("propagate-deletes: DRY-RUN would delete destination object")
+		return nil
+	}
+	if err := dst.DeleteObject(ctx, job.DstBucket, job.DstKey); err != nil {
+		return fmt.Errorf("propagate-deletes: delete destination %s/%s: %w", job.DstBucket, job.DstKey, err)
+	}
+	log.Info().
+		Str("bucket", job.DstBucket).
+		Str("key", job.DstKey).
+		Msg("propagate-deletes: destination object deleted")
 	return nil
 }
 

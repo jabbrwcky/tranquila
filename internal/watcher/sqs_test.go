@@ -37,6 +37,10 @@ func (f *fakeSQSClient) DeleteMessage(_ context.Context, params *sqs.DeleteMessa
 }
 
 func sqsBody(bucket, key string, size int64) string {
+	return sqsBodyWithEvent(bucket, key, size, "s3:ObjectCreated:Put")
+}
+
+func sqsBodyWithEvent(bucket, key string, size int64, eventName string) string {
 	type obj struct {
 		Key  string `json:"key"`
 		Size int64  `json:"size"`
@@ -56,7 +60,7 @@ func sqsBody(bucket, key string, size int64) string {
 		Records []record `json:"Records"`
 	}
 	b, _ := json.Marshal(envelope{Records: []record{{
-		EventName: "s3:ObjectCreated:Put",
+		EventName: eventName,
 		S3:        s3rec{Bucket: bkt{Name: bucket}, Object: obj{Key: key, Size: size}},
 	}}})
 	return string(b)
@@ -193,6 +197,14 @@ func TestSQSWatcher(t *testing.T) {
 				}(),
 			}},
 			wantEvents:   []ObjectEvent{{Bucket: "b", Key: "k1", Size: 10}, {Bucket: "b", Key: "k2", Size: 20}},
+			wantDeletedN: 1,
+		},
+		{
+			name: "delete event sets IsDelete and message still deleted",
+			messages: []types.Message{
+				{Body: aws.String(sqsBodyWithEvent("my-bucket", "dir/file.txt", 0, "ObjectRemoved:Delete")), ReceiptHandle: aws.String("rh5")},
+			},
+			wantEvents:   []ObjectEvent{{Bucket: "my-bucket", Key: "dir/file.txt", IsDelete: true}},
 			wantDeletedN: 1,
 		},
 	}

@@ -218,6 +218,76 @@ func (s *Store) ScanPending(ctx context.Context, bucket string) ([]string, error
 	return pending, nil
 }
 
+// TouchSeen records that an object was observed in the source bucket during a
+// discovery pass, without altering its status or bucket counters. Used by
+// propagate-deletes reconciliation to tell "still present in source" apart
+// from "no longer seen" for objects that needsSync otherwise never touches
+// again once synced.
+func (s *Store) TouchSeen(ctx context.Context, bucket, key string, seenAt time.Time) error {
+	return s.client.HSet(ctx, objKey(bucket, key), "seen_at", seenAt.UTC().Format(time.RFC3339Nano)).Err()
+}
+
+// ScanStaleObjects returns keys for a bucket whose status is "synced" and
+// whose seen_at is missing or predates `before` — i.e. objects propagate-deletes
+// reconciliation has not observed in the most recent source listing and so
+// suspects were deleted from source. Callers must verify against the source
+// before deleting the destination object; this only reports candidates.
+//
+// Like ScanPending, this scans tranquila:obj:{bucket}:* — SCAN filters MATCH
+// server-side after walking the whole keyspace, so this call costs O(total
+// keyspace) regardless of the bucket's size (see RebuildStats and this
+// project's Redis Key Design notes). Only call it for buckets that opted into
+// propagate-deletes, and no more often than the configured reconcile interval.
+func (s *Store) ScanStaleObjects(ctx context.Context, bucket string, before time.Time) ([]string, error) {
+	pattern := "tranquila:obj:" + bucket + ":*"
+	prefix := "tranquila:obj:" + bucket + ":"
+
+	var keys []string
+	iter := s.client.Scan(ctx, 0, pattern, scanBatchSize).Iterator()
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("scan keys for bucket %s: %w", bucket, err)
+	}
+
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	var stale []string
+	for i := 0; i < len(keys); i += scanBatchSize {
+		end := min(i+scanBatchSize, len(keys))
+		batch := keys[i:end]
+
+		pipe := s.client.Pipeline()
+		cmds := make([]*redis.SliceCmd, len(batch))
+		for j, k := range batch {
+			cmds[j] = pipe.HMGet(ctx, k, "status", "seen_at")
+		}
+		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("pipeline hmget: %w", err)
+		}
+		for j, cmd := range cmds {
+			vals := cmd.Val()
+			status, _ := vals[0].(string)
+			if status != StatusSynced {
+				continue
+			}
+			seenAtStr, _ := vals[1].(string)
+			if seenAtStr == "" {
+				stale = append(stale, strings.TrimPrefix(batch[j], prefix))
+				continue
+			}
+			seenAt, err := time.Parse(time.RFC3339Nano, seenAtStr)
+			if err != nil || seenAt.Before(before) {
+				stale = append(stale, strings.TrimPrefix(batch[j], prefix))
+			}
+		}
+	}
+	return stale, nil
+}
+
 func (s *Store) SetCollectionTime(ctx context.Context, bucket string, t time.Time) error {
 	pipe := s.client.Pipeline()
 	pipe.Set(ctx, collKey(bucket), t.UTC().Format(time.RFC3339Nano), 0)

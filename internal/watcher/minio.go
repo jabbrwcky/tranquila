@@ -3,6 +3,7 @@ package watcher
 import (
 	"context"
 	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/minio/minio-go/v7"
@@ -83,9 +84,10 @@ func (w *MinIOWatcher) watchBucket(ctx context.Context, bucket string, out chan<
 		}
 		for _, rec := range info.Records {
 			out <- ObjectEvent{
-				Bucket: rec.S3.Bucket.Name,
-				Key:    rec.S3.Object.Key,
-				Size:   rec.S3.Object.Size,
+				Bucket:   rec.S3.Bucket.Name,
+				Key:      rec.S3.Object.Key,
+				Size:     rec.S3.Object.Size,
+				IsDelete: strings.HasPrefix(rec.EventName, "s3:ObjectRemoved"),
 			}
 		}
 	}

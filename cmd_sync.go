@@ -61,6 +61,8 @@ type SyncCmd struct {
 	CycleBackoff          time.Duration `name:"cycle-backoff" env:"TRANQUILA_CYCLE_BACKOFF" default:"5s" help:"Base delay before retrying a failed sync cycle in watch mode (exponential with jitter)"`
 	CycleBackoffMax       time.Duration `name:"cycle-backoff-max" env:"TRANQUILA_CYCLE_BACKOFF_MAX" default:"10m" help:"Maximum delay between failed sync cycles in watch mode"`
 
+	DeleteReconcileInterval time.Duration `name:"delete-reconcile-interval" env:"TRANQUILA_DELETE_RECONCILE_INTERVAL" default:"0s" help:"Cadence for detecting source deletions via a full Redis scan and propagating them to destinations with propagate-deletes enabled (0 = every cycle)"`
+
 	TelemetryExporter     string `name:"telemetry-exporter" env:"TELEMETRY_EXPORTER" default:"prometheus" enum:"prometheus,otlp,none" help:"Metrics exporter"`
 	TelemetryAddr         string `name:"telemetry-addr" env:"TELEMETRY_ADDR" default:":8081" help:"Prometheus metrics listen address"`
 	TelemetryOTLPEndpoint string `name:"telemetry-otlp-endpoint" env:"TELEMETRY_OTLP_ENDPOINT" help:"OTLP gRPC endpoint"`
@@ -106,6 +108,7 @@ func (cmd *SyncCmd) resolveBuckets() (map[string]internalsync.BucketConfig, erro
 			SrcPrefix:        bm.Source.Prefix,
 			DstPrefix:        bm.Destination.Prefix,
 			BurnAfterReading: bm.BurnAfterReading,
+			PropagateDeletes: bm.PropagateDeletes,
 		}
 	}
 
@@ -269,20 +272,21 @@ func (cmd *SyncCmd) Run() error {
 	defer mgmt.Shutdown(context.Background())
 
 	syncer, err := internalsync.New(internalsync.Config{
-		Source:              src,
-		Destination:         dst,
-		State:               store,
-		Meter:               tel.Meter,
-		Buckets:             bucketMap,
-		DestBucketPrefix:    cmd.DestBucketPrefix,
-		Workers:             cmd.Workers,
-		CheckSizes:          cmd.CheckSizes,
-		DryRun:              cmd.DryRun,
-		Progress:            progress,
-		DiscoveryBatchSize:  cmd.DiscoveryBatchSize,
-		MaxWorkersPerBucket: cmd.MaxWorkersPerBucket,
-		CycleBackoff:        cmd.CycleBackoff,
-		CycleBackoffMax:     cmd.CycleBackoffMax,
+		Source:                  src,
+		Destination:             dst,
+		State:                   store,
+		Meter:                   tel.Meter,
+		Buckets:                 bucketMap,
+		DestBucketPrefix:        cmd.DestBucketPrefix,
+		Workers:                 cmd.Workers,
+		CheckSizes:              cmd.CheckSizes,
+		DryRun:                  cmd.DryRun,
+		Progress:                progress,
+		DiscoveryBatchSize:      cmd.DiscoveryBatchSize,
+		MaxWorkersPerBucket:     cmd.MaxWorkersPerBucket,
+		CycleBackoff:            cmd.CycleBackoff,
+		CycleBackoffMax:         cmd.CycleBackoffMax,
+		DeleteReconcileInterval: cmd.DeleteReconcileInterval,
 	})
 	if err != nil {
 		return fmt.Errorf("create syncer: %w", err)

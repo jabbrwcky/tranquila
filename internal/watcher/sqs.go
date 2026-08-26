@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
@@ -128,9 +129,10 @@ func (w *SQSWatcher) processMessage(ctx context.Context, body *string, receiptHa
 	}
 	for _, rec := range notification.Records {
 		out <- ObjectEvent{
-			Bucket: rec.S3.Bucket.Name,
-			Key:    rec.S3.Object.Key,
-			Size:   rec.S3.Object.Size,
+			Bucket:   rec.S3.Bucket.Name,
+			Key:      rec.S3.Object.Key,
+			Size:     rec.S3.Object.Size,
+			IsDelete: strings.HasPrefix(rec.EventName, "ObjectRemoved"),
 		}
 	}
 }

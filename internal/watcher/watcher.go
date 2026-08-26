@@ -13,6 +13,7 @@ type ObjectEvent struct {
 	Key        string
 	Size       int64
 	ModifiedAt time.Time
+	IsDelete   bool // true for an object-removed notification, false for created/modified
 }
 
 // Watcher streams object-change events for a set of source buckets.

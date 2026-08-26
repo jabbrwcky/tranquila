@@ -188,3 +188,54 @@ func TestRunWatcherUnknownBucketSkipped(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+func TestRunWatcherDeleteEventPropagateDeletesDisabled(t *testing.T) {
+	s := &Syncer{}
+	w := &fakeWatcher{events: []watcher.ObjectEvent{
+		{Bucket: "b1", Key: "k1", IsDelete: true},
+	}}
+	// PropagateDeletes not set on the bucket config — the delete event must be
+	// ignored (never reach pool.submit, which would block forever with the
+	// zero-worker pool this test's zero-value Syncer creates).
+	err := s.runWatcher(context.Background(), w, []string{"b1"}, map[string]BucketConfig{
+		"b1": {Destination: "dst1"},
+	})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestEventDispatch(t *testing.T) {
+	tests := []struct {
+		name  string
+		event watcher.ObjectEvent
+		bc    BucketConfig
+		want  eventDecision
+	}{
+		{
+			name:  "created_event_is_upload",
+			event: watcher.ObjectEvent{IsDelete: false},
+			bc:    BucketConfig{PropagateDeletes: true},
+			want:  dispatchUpload,
+		},
+		{
+			name:  "delete_event_with_propagate_enabled",
+			event: watcher.ObjectEvent{IsDelete: true},
+			bc:    BucketConfig{PropagateDeletes: true},
+			want:  dispatchDelete,
+		},
+		{
+			name:  "delete_event_with_propagate_disabled",
+			event: watcher.ObjectEvent{IsDelete: true},
+			bc:    BucketConfig{PropagateDeletes: false},
+			want:  dispatchSkipDelete,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := eventDispatch(tc.event, tc.bc); got != tc.want {
+				t.Errorf("eventDispatch() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

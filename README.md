@@ -116,6 +116,10 @@ sync:
   cycle-backoff-max: 10m
   endpoint-fail-threshold: 5  # transient failures before an endpoint's rate is halved
 
+  # Cadence for propagate-deletes reconciliation (poll mode / initial catch-up
+  # sync only; see "Propagate Deletes"). 0 = every cycle.
+  delete-reconcile-interval: 0s
+
   telemetry:
     exporter: "prometheus"  # prometheus | otlp | none
     addr: ":8081"
@@ -152,6 +156,36 @@ tranquila sync --dry-run -c tranquila.yaml
 ```
 
 Dry-run logs include the object key, CRC32 comparison result, and the planned deletion for every object that would be removed.
+
+#### Propagate Deletes
+
+Set `propagate-deletes: true` on a bucket mapping to delete the destination object when the corresponding source object is deleted:
+
+```yaml
+sync:
+  buckets:
+    - source:
+        bucket: my-bucket
+      destination:
+        bucket: backup-my-bucket
+      propagate-deletes: true
+```
+
+Like `burn-after-reading`, this is only available via structured `buckets:` config — the legacy `--bucket-mappings`/`--bucket-mapping-file`/`--prefix-mappings` flags cannot set it.
+
+**How deletions are detected** depends on `--watch-mode`:
+
+- **`minio` / `sqs`** — the watcher's own delete notification (`s3:ObjectRemoved:*` / `ObjectRemoved:*`) drives the deletion directly, as soon as it arrives. If a bucket doesn't have `propagate-deletes` set, a delete notification for it is simply ignored.
+- **`poll`, and the initial catch-up sync in `minio`/`sqs` mode** — there is no delete notification to rely on, so tranquila periodically reconciles: every discovered object's "last seen" timestamp is recorded, and any previously-synced object not seen in the most recent listing is a deletion candidate. Before actually deleting the destination object, tranquila re-checks the candidate against the **source** with `HeadObject`; only a confirmed 404/`NoSuchKey` triggers the delete. A candidate that still exists in source (a listing gap, not a real deletion) or a check that fails for any other reason (network error, permission error, etc.) is left alone and re-evaluated on the next pass — propagate-deletes never deletes on an inconclusive answer.
+
+**Cost tradeoff:** the reconciliation scan is `SCAN ... MATCH tranquila:obj:{bucket}:*`, and Redis's `SCAN` filters `MATCH` *after* walking the whole keyspace — so this costs one full-keyspace pass (in a production deployment with ~1M+ tracked objects across all buckets, that's ~1M+ keys examined) every time it runs, regardless of how large the reconciled bucket actually is. Use `--delete-reconcile-interval` to decouple how often this runs from `--watch-interval`:
+
+```yaml
+sync:
+  delete-reconcile-interval: 30m   # 0 (default) = reconcile at the end of every sync cycle
+```
+
+A one-shot run (no `--watch`) always reconciles once, since there's no repeated cycle to throttle.
 
 #### Bucket mappings via CLI / file
 
@@ -200,6 +234,7 @@ tranquila sync --prefix-mappings "bucket/src-prefix=dst-prefix"
 | `TRANQUILA_CYCLE_BACKOFF`         | `5s`             | Base retry delay after a failed cycle (watch mode)   |
 | `TRANQUILA_CYCLE_BACKOFF_MAX`     | `10m`            | Maximum retry delay after a failed cycle             |
 | `TRANQUILA_ENDPOINT_FAIL_THRESHOLD` | `5`            | Transient failures before an endpoint's rate is halved |
+| `TRANQUILA_DELETE_RECONCILE_INTERVAL` | `0s`         | Cadence for propagate-deletes reconciliation (0 = every cycle) |
 | `TELEMETRY_EXPORTER`              | `prometheus`     | Metrics exporter: `prometheus`, `otlp`, or `none`    |
 | `TELEMETRY_ADDR`                  | `:8081`          | Prometheus metrics listen address                    |
 | `TELEMETRY_OTLP_ENDPOINT`         |                  | OTLP gRPC endpoint                                   |
@@ -298,12 +333,14 @@ instead.
 
 - `s3:ListBucket`
 - `s3:GetObject`
+- `s3:DeleteObject` — only required if using `burn-after-reading`
 
 **Destination account:**
 
 - `s3:PutObject`
 - `s3:HeadBucket`
 - `s3:CreateBucket`
+- `s3:DeleteObject` — only required if using `propagate-deletes`
 
 ## Observability
 

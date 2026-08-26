@@ -348,3 +348,85 @@ func TestScriptsUseEvalsha(t *testing.T) {
 		}
 	})
 }
+
+// TestTouchSeenDoesNotAffectCounters pins that TouchSeen (propagate-deletes'
+// "still present in source" marker) is a plain field write, not a status
+// transition — it must never move an object's bucket counters.
+func TestTouchSeenDoesNotAffectCounters(t *testing.T) {
+	forEachEngine(t, func(t *testing.T, st *state.Store, _ *redis.Client) {
+		ctx := context.Background()
+		const bucket = "seen"
+
+		if err := st.MarkSynced(ctx, bucket, "a"); err != nil {
+			t.Fatal(err)
+		}
+		before, err := st.BucketStats(ctx, bucket)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := st.TouchSeen(ctx, bucket, "a", time.Now()); err != nil {
+			t.Fatalf("TouchSeen: %v", err)
+		}
+		// TouchSeen on a key with no prior record must not create a phantom
+		// counted object either.
+		if err := st.TouchSeen(ctx, bucket, "never-synced", time.Now()); err != nil {
+			t.Fatalf("TouchSeen on new key: %v", err)
+		}
+
+		after, err := st.BucketStats(ctx, bucket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after != before {
+			t.Errorf("TouchSeen changed counters: before=%+v after=%+v", before, after)
+		}
+	})
+}
+
+// TestScanStaleObjects covers the candidate selection propagate-deletes
+// reconciliation relies on: only synced objects whose seen_at predates the
+// cutoff (or is missing) are reported; pending/failed objects and objects
+// seen after the cutoff are not.
+func TestScanStaleObjects(t *testing.T) {
+	forEachEngine(t, func(t *testing.T, st *state.Store, _ *redis.Client) {
+		ctx := context.Background()
+		const bucket = "stale"
+		cutoff := time.Now()
+
+		if err := st.MarkSynced(ctx, bucket, "stale-no-seen"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.MarkSynced(ctx, bucket, "stale-old-seen"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.TouchSeen(ctx, bucket, "stale-old-seen", cutoff.Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.MarkSynced(ctx, bucket, "fresh"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.TouchSeen(ctx, bucket, "fresh", cutoff.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.MarkPending(ctx, bucket, "pending-no-seen", time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.MarkFailed(ctx, bucket, "failed-old-seen"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.TouchSeen(ctx, bucket, "failed-old-seen", cutoff.Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := st.ScanStaleObjects(ctx, bucket, cutoff)
+		if err != nil {
+			t.Fatalf("ScanStaleObjects: %v", err)
+		}
+		slices.Sort(got)
+		want := []string{"stale-no-seen", "stale-old-seen"}
+		if !slices.Equal(got, want) {
+			t.Errorf("ScanStaleObjects() = %v, want %v", got, want)
+		}
+	})
+}

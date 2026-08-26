@@ -13,6 +13,10 @@ import (
 // makeNotifyInfo builds a notification.Info by JSON round-trip, avoiding the
 // unexported eventMeta type from minio-go.
 func makeNotifyInfo(bucket, key string, size int64) notification.Info {
+	return makeNotifyInfoWithEvent(bucket, key, size, "s3:ObjectCreated:Put")
+}
+
+func makeNotifyInfoWithEvent(bucket, key string, size int64, eventName string) notification.Info {
 	type obj struct {
 		Key  string `json:"key"`
 		Size int64  `json:"size,omitempty"`
@@ -25,13 +29,15 @@ func makeNotifyInfo(bucket, key string, size int64) notification.Info {
 		Object obj `json:"object"`
 	}
 	type eventJSON struct {
-		S3 s3meta `json:"s3"`
+		EventName string `json:"eventName"`
+		S3        s3meta `json:"s3"`
 	}
 	type infoJSON struct {
 		Records []eventJSON `json:"Records"`
 	}
 	raw, _ := json.Marshal(infoJSON{Records: []eventJSON{{
-		S3: s3meta{Bucket: bkt{Name: bucket}, Object: obj{Key: key, Size: size}},
+		EventName: eventName,
+		S3:        s3meta{Bucket: bkt{Name: bucket}, Object: obj{Key: key, Size: size}},
 	}}})
 	var info notification.Info
 	_ = json.Unmarshal(raw, &info)
@@ -122,6 +128,21 @@ func TestMinIOWatchBucket(t *testing.T) {
 			name:       "no_events",
 			infos:      nil,
 			wantEvents: nil,
+		},
+		{
+			name:       "delete_event_sets_isdelete",
+			infos:      []notification.Info{makeNotifyInfoWithEvent("b1", "k3", 0, "s3:ObjectRemoved:Delete")},
+			wantEvents: []ObjectEvent{{Bucket: "b1", Key: "k3", IsDelete: true}},
+		},
+		{
+			name:       "delete_marker_event_sets_isdelete",
+			infos:      []notification.Info{makeNotifyInfoWithEvent("b1", "k4", 0, "s3:ObjectRemoved:DeleteMarkerCreated")},
+			wantEvents: []ObjectEvent{{Bucket: "b1", Key: "k4", IsDelete: true}},
+		},
+		{
+			name:       "created_event_leaves_isdelete_false",
+			infos:      []notification.Info{makeNotifyInfoWithEvent("b1", "k5", 5, "s3:ObjectCreated:Put")},
+			wantEvents: []ObjectEvent{{Bucket: "b1", Key: "k5", Size: 5, IsDelete: false}},
 		},
 	}
 
