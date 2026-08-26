@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -21,7 +22,7 @@ type CLI struct {
 	LogLevel         string           `name:"log-level" help:"Log level (trace,debug,info,warn,error)" env:"TRANQUILA_LOG_LEVEL" default:"info"`
 	LogJSON          bool             `name:"log-json" help:"Output logs as JSON" env:"TRANQUILA_LOG_JSON"`
 	MemLimitRatio    float64          `name:"memlimit-ratio" help:"Ratio of the detected memory limit to set as GOMEMLIMIT" env:"TRANQUILA_MEMLIMIT_RATIO" default:"0.9"`
-	MemLimitProvider string           `name:"memlimit-provider" help:"Memory limit provider" enum:"cgroup,cgroupv1,cgroupv2,system" env:"TRANQUILA_MEMLIMIT_PROVIDER" default:"cgroup"`
+	MemLimitProvider string           `name:"memlimit-provider" help:"Memory limit provider (cgroupv1/cgroupv2 are deprecated aliases for cgroup, which now auto-detects the version)" enum:"cgroup,cgroupv1,cgroupv2,system" env:"TRANQUILA_MEMLIMIT_PROVIDER" default:"cgroup"`
 	MemLimitRefresh  time.Duration    `name:"memlimit-refresh-interval" help:"Interval to refresh GOMEMLIMIT from the provider (0 disables refresh)" env:"TRANQUILA_MEMLIMIT_REFRESH_INTERVAL" default:"0s"`
 	Version          kong.VersionFlag `name:"version" short:"V" help:"Show version and exit"`
 	Sync             SyncCmd          `cmd:"" default:"" help:"Synchronize S3 buckets (default)"`
@@ -73,11 +74,11 @@ func setupMemLimit(cli *CLI) {
 	}
 
 	logger := slog.New(zerolog.NewSlogHandler(log.Logger))
-	if _, err := memlimit.SetGoMemLimitWithOpts(
+	if _, err := memlimit.Set(
 		memlimit.WithLogger(logger),
 		memlimit.WithRatio(cli.MemLimitRatio),
 		memlimit.WithProvider(memLimitProvider(cli.MemLimitProvider)),
-		memlimit.WithRefreshInterval(cli.MemLimitRefresh),
+		memlimit.WithRefreshInterval(context.Background(), cli.MemLimitRefresh),
 	); err != nil {
 		log.Warn().Err(err).Msg("failed to set GOMEMLIMIT")
 	}
@@ -88,12 +89,16 @@ func memLimitConfigured(cli *CLI) bool {
 	return cli.MemLimitRatio != 0.9 || cli.MemLimitProvider != "cgroup" || cli.MemLimitRefresh != 0
 }
 
+// memLimitProvider returns the automemlimit Provider for name. automemlimit
+// v1.0.0 removed FromCgroupV1/FromCgroupV2 in favor of FromCgroup's built-in
+// cgroup v1/v2 auto-detection — forcing a specific cgroup version is no
+// longer possible, so cgroupv1/cgroupv2 fall back to auto-detection.
 func memLimitProvider(name string) memlimit.Provider {
 	switch name {
-	case "cgroupv1":
-		return memlimit.FromCgroupV1
-	case "cgroupv2":
-		return memlimit.FromCgroupV2
+	case "cgroupv1", "cgroupv2":
+		log.Warn().Str("memlimit-provider", name).
+			Msg("forcing a specific cgroup version is no longer supported (automemlimit v1.0.0 removed it); using cgroup auto-detection")
+		return memlimit.FromCgroup
 	case "system":
 		return memlimit.FromSystem
 	default:
