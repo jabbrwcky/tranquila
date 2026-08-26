@@ -62,13 +62,19 @@ func TestPerformBurnAfterReading(t *testing.T) {
 		name        string
 		uploadCRC32 string
 		storedCRC32 string
+		srcETag     string // job.SrcETag; "" = no ETag fast path
+		dstETag     string
+		srcBody     []byte // content fallback tier; nil on both sides matches (both empty)
+		dstBody     []byte
+		srcGetErr   error
+		dstGetErr   error
 		dryRun      bool
 		deleteErr   error
 		wantDeleted bool
 		wantErr     bool
 	}{
 		{
-			name:        "matching_checksums_live",
+			name:        "matching_crc32_metadata_deletes",
 			uploadCRC32: crc32A,
 			storedCRC32: crc32A,
 			wantDeleted: true,
@@ -81,30 +87,99 @@ func TestPerformBurnAfterReading(t *testing.T) {
 			wantDeleted: false,
 		},
 		{
-			name:        "mismatch_refuses_delete",
+			name:        "crc32_mismatch_refuses_delete_without_reading_content",
 			uploadCRC32: crc32A,
 			storedCRC32: crc32B,
+			srcGetErr:   errors.New("must not be called"),
+			dstGetErr:   errors.New("must not be called"),
 			wantDeleted: false,
 			wantErr:     true,
 		},
 		{
-			name:        "empty_upload_crc32_refuses_delete",
-			uploadCRC32: "",
-			storedCRC32: crc32A,
-			wantDeleted: false,
-			wantErr:     true,
-		},
-		{
-			name:        "empty_stored_crc32_refuses_delete",
+			name:        "dry_run_with_mismatched_crc32_still_no_delete",
 			uploadCRC32: crc32A,
+			storedCRC32: crc32B,
+			dryRun:      true,
+			wantDeleted: false,
+			wantErr:     false, // dry-run never errors; logs a refusal instead of "would delete"
+		},
+		{
+			// The bug this test guards against: a destination that never echoes
+			// flexible checksums (common on non-AWS S3-compatible backends) must
+			// not permanently refuse to delete — it should fall back to ETag.
+			name:        "empty_crc32_falls_back_to_matching_etag",
+			uploadCRC32: "",
 			storedCRC32: "",
+			srcETag:     "d41d8cd98f00b204e9800998ecf8427e",
+			dstETag:     `"d41d8cd98f00b204e9800998ecf8427e"`, // S3 quotes ETags; must be stripped
+			srcGetErr:   errors.New("must not be called"),
+			dstGetErr:   errors.New("must not be called"),
+			wantDeleted: true,
+		},
+		{
+			name:        "empty_crc32_with_mismatched_etag_refuses_delete",
+			uploadCRC32: "",
+			storedCRC32: "",
+			srcETag:     "d41d8cd98f00b204e9800998ecf8427e",
+			dstETag:     "5d41402abc4b2a76b9719d911017c592",
+			srcGetErr:   errors.New("must not be called"),
+			dstGetErr:   errors.New("must not be called"),
 			wantDeleted: false,
 			wantErr:     true,
 		},
 		{
-			name:        "both_empty_refuses_delete",
+			// One side reported no checksum at all (e.g. destination doesn't
+			// support flexible checksums), the other side has no usable ETag
+			// either (multipart): falls all the way back to content hashing.
+			name:        "empty_crc32_and_multipart_etag_falls_back_to_content_match",
 			uploadCRC32: "",
 			storedCRC32: "",
+			srcETag:     "d41d8cd98f00b204e9800998ecf8427e-3",
+			dstETag:     "d41d8cd98f00b204e9800998ecf8427e-3",
+			srcBody:     []byte("hello"),
+			dstBody:     []byte("hello"),
+			wantDeleted: true,
+		},
+		{
+			name:        "empty_crc32_no_etag_falls_back_to_content_match",
+			uploadCRC32: "",
+			storedCRC32: "",
+			srcBody:     []byte("hello"),
+			dstBody:     []byte("hello"),
+			wantDeleted: true,
+		},
+		{
+			name:        "content_fallback_mismatch_refuses_delete",
+			uploadCRC32: "",
+			storedCRC32: "",
+			srcBody:     []byte("hello"),
+			dstBody:     []byte("world"),
+			wantDeleted: false,
+			wantErr:     true,
+		},
+		{
+			name:        "content_fallback_dry_run_mismatch_no_delete",
+			uploadCRC32: "",
+			storedCRC32: "",
+			srcBody:     []byte("hello"),
+			dstBody:     []byte("world"),
+			dryRun:      true,
+			wantDeleted: false,
+			wantErr:     false,
+		},
+		{
+			name:        "content_fallback_source_read_error_propagates",
+			uploadCRC32: "",
+			storedCRC32: "",
+			srcGetErr:   errors.New("source unreachable"),
+			wantDeleted: false,
+			wantErr:     true,
+		},
+		{
+			name:        "content_fallback_destination_read_error_propagates",
+			uploadCRC32: "",
+			storedCRC32: "",
+			dstGetErr:   errors.New("destination unreachable"),
 			wantDeleted: false,
 			wantErr:     true,
 		},
@@ -116,26 +191,21 @@ func TestPerformBurnAfterReading(t *testing.T) {
 			wantDeleted: true, // call was attempted
 			wantErr:     true,
 		},
-		{
-			name:        "dry_run_with_mismatched_checksums_still_no_delete",
-			uploadCRC32: crc32A,
-			storedCRC32: crc32B,
-			dryRun:      true,
-			wantDeleted: false,
-			wantErr:     false, // dry-run never errors; logs a refusal instead of "would delete"
-		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			fd := &fakeDeleter{retErr: tc.deleteErr}
+			fd := &fakeDeleter{retErr: tc.deleteErr, body: tc.srcBody, getErr: tc.srcGetErr}
+			fv := &fakeVerifier{body: tc.dstBody, getErr: tc.dstGetErr}
 			job := Job{
 				SrcBucket: "src",
 				DstBucket: "dst",
 				Key:       "some/object.dat",
+				DstKey:    "some/object.dat",
+				SrcETag:   tc.srcETag,
 				DryRun:    tc.dryRun,
 			}
-			err := performBurnAfterReading(context.Background(), job, fd, tc.uploadCRC32, tc.storedCRC32)
+			err := performBurnAfterReading(context.Background(), job, fd, fv, tc.uploadCRC32, tc.storedCRC32, tc.dstETag)
 
 			if tc.wantErr && err == nil {
 				t.Error("expected error, got nil")

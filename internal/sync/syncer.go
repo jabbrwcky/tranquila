@@ -571,11 +571,17 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 			continue
 		}
 		if r.Err != nil {
-			log.Error().
+			ev := log.Error().
 				Err(r.Err).
 				Str("bucket", r.Job.SrcBucket).
-				Str("key", r.Job.Key).
-				Msg("transfer failed")
+				Str("key", r.Job.Key)
+			var mismatch *verifyMismatchError
+			if errors.As(r.Err, &mismatch) {
+				ev = ev.Str("verify_method", mismatch.Method).
+					Str("source_value", mismatch.Source).
+					Str("dest_value", mismatch.Destination)
+			}
+			ev.Msg("transfer failed")
 			_ = s.cfg.State.MarkFailed(ctx, r.Job.SrcBucket, r.Job.Key)
 			s.m.failed.Add(ctx, 1, metric.WithAttributes(attrs...))
 			if s.cfg.Progress != nil {
@@ -800,9 +806,9 @@ func (s *Syncer) transfer(ctx context.Context, job Job) error {
 		return err
 	}
 
-	// Verify destination size and capture stored CRC32 for burn-after-reading.
+	// Verify destination size and capture stored CRC32/ETag for burn-after-reading.
 	// Skip size check when srcSize is unknown (server did not provide Content-Length).
-	dstSize, storedCRC32, _, err := s.cfg.Destination.HeadObject(ctx, job.DstBucket, job.DstKey)
+	dstSize, storedCRC32, dstETag, err := s.cfg.Destination.HeadObject(ctx, job.DstBucket, job.DstKey)
 	if err != nil {
 		return fmt.Errorf("verify %s/%s: %w", job.DstBucket, job.DstKey, err)
 	}
@@ -814,12 +820,28 @@ func (s *Syncer) transfer(ctx context.Context, job Job) error {
 	if !job.BurnAfterReading {
 		return nil
 	}
-	return performBurnAfterReading(ctx, job, s.cfg.Source, uploadCRC32, storedCRC32)
+	return performBurnAfterReading(ctx, job, s.cfg.Source, s.cfg.Destination, uploadCRC32, storedCRC32, dstETag)
 }
 
 // objectDeleter is the narrow interface that performBurnAfterReading needs from the source client.
 type objectDeleter interface {
 	DeleteObject(ctx context.Context, bucket, key string) error
+}
+
+// verifyMismatchError reports that source and destination content did not
+// match during burn-after-reading/verify-and-delete verification. The compared
+// values are structured fields rather than baked into the error string, so a
+// caller logging this error (see processResults) can attach them as their own
+// log fields instead of parsing them back out of free text.
+type verifyMismatchError struct {
+	Bucket, Key string
+	Method      string // "crc32" | "etag" | "content"
+	Source      string
+	Destination string
+}
+
+func (e *verifyMismatchError) Error() string {
+	return fmt.Sprintf("burn-after-reading: %s mismatch for %s/%s, refusing to delete source", e.Method, e.Bucket, e.Key)
 }
 
 // objectGetter is the narrow interface needed to read an object's content, so its
@@ -883,13 +905,26 @@ func performVerifyAndDelete(ctx context.Context, job Job, dst destinationVerifie
 			job.DstBucket, job.DstKey, job.Size, dstSize)
 	}
 
-	verifiedBy := "crc32"
+	// refuseMismatch reports a verification mismatch as a structured error, or —
+	// during a dry run — logs the same fields and lets the cycle continue rather
+	// than failing it, matching performBurnAfterReading's dry-run behavior.
+	refuseMismatch := func(method, srcVal, dstVal string) error {
+		if job.DryRun {
+			log.Warn().
+				Str("bucket", job.SrcBucket).Str("key", job.Key).
+				Str("verify_method", method).Str("source_value", srcVal).Str("dest_value", dstVal).
+				Msg("burn-after-reading: DRY-RUN would refuse to delete source object (verification failed)")
+			return nil
+		}
+		return &verifyMismatchError{Bucket: job.SrcBucket, Key: job.Key, Method: method, Source: srcVal, Destination: dstVal}
+	}
+
+	verifiedBy := "content"
 	verified := false
 	if srcMD5, srcOK := storage.SinglePartMD5(job.SrcETag); srcOK {
 		if dstMD5, dstOK := storage.SinglePartMD5(dstETag); dstOK {
 			if srcMD5 != dstMD5 {
-				return fmt.Errorf("burn-after-reading verify: ETag mismatch %s/%s: source=%s destination=%s, refusing to delete source",
-					job.DstBucket, job.DstKey, srcMD5, dstMD5)
+				return refuseMismatch("etag", srcMD5, dstMD5)
 			}
 			verifiedBy, verified = "etag", true
 		}
@@ -904,8 +939,7 @@ func performVerifyAndDelete(ctx context.Context, job Job, dst destinationVerifie
 			return fmt.Errorf("burn-after-reading verify: read destination %s/%s: %w", job.DstBucket, job.DstKey, err)
 		}
 		if srcChecksum != dstChecksum {
-			return fmt.Errorf("burn-after-reading verify: checksum mismatch %s/%s: source=%s destination=%s, refusing to delete source",
-				job.DstBucket, job.DstKey, srcChecksum, dstChecksum)
+			return refuseMismatch("content", srcChecksum, dstChecksum)
 		}
 	}
 
@@ -955,31 +989,66 @@ func performDelete(ctx context.Context, job Job, dst objectDeleter) error {
 	return nil
 }
 
-// performBurnAfterReading verifies destination integrity and deletes the source object.
-// Both CRC32 values come from S3's own computation (upload response and stored value).
-// Safe-by-default: if either is empty (object stored without a checksum algorithm) the
-// delete is refused so data is never silently lost.
-func performBurnAfterReading(ctx context.Context, job Job, src objectDeleter, uploadCRC32, storedCRC32 string) error {
-	checksumMatch := uploadCRC32 != "" && storedCRC32 != "" && uploadCRC32 == storedCRC32
+// performBurnAfterReading verifies destination integrity and deletes the source object
+// for one just uploaded in this run. The upload/stored CRC32 pair (from S3's own
+// computation: the upload response and the stored value from HeadObject) is the
+// cheapest check and is preferred when available, but not every S3-compatible
+// endpoint echoes flexible checksums — when either is empty, this falls back to
+// the same ETag-then-content-hash tiers performVerifyAndDelete uses, rather than
+// refusing outright. Safe-by-default: content is never assumed to match without
+// having verified it via at least one of these tiers.
+func performBurnAfterReading(ctx context.Context, job Job, src sourceReadDeleter, dst objectGetter, uploadCRC32, storedCRC32, dstETag string) error {
+	// refuseMismatch reports a verification mismatch as a structured error, or —
+	// during a dry run — logs the same fields and lets the cycle continue rather
+	// than failing it.
+	refuseMismatch := func(method, srcVal, dstVal string) error {
+		if job.DryRun {
+			log.Warn().
+				Str("bucket", job.SrcBucket).Str("key", job.Key).
+				Str("verify_method", method).Str("source_value", srcVal).Str("dest_value", dstVal).
+				Msg("burn-after-reading: DRY-RUN would refuse to delete source object (verification failed)")
+			return nil
+		}
+		return &verifyMismatchError{Bucket: job.SrcBucket, Key: job.Key, Method: method, Source: srcVal, Destination: dstVal}
+	}
+
+	verifiedBy := ""
+	switch {
+	case uploadCRC32 != "" && storedCRC32 != "":
+		if uploadCRC32 != storedCRC32 {
+			return refuseMismatch("crc32", uploadCRC32, storedCRC32)
+		}
+		verifiedBy = "crc32"
+	default:
+		if srcMD5, srcOK := storage.SinglePartMD5(job.SrcETag); srcOK {
+			if dstMD5, dstOK := storage.SinglePartMD5(dstETag); dstOK {
+				if srcMD5 != dstMD5 {
+					return refuseMismatch("etag", srcMD5, dstMD5)
+				}
+				verifiedBy = "etag"
+			}
+		}
+		if verifiedBy == "" {
+			srcChecksum, err := crc32Checksum(ctx, src, job.SrcBucket, job.Key)
+			if err != nil {
+				return fmt.Errorf("burn-after-reading: read source %s/%s: %w", job.SrcBucket, job.Key, err)
+			}
+			dstChecksum, err := crc32Checksum(ctx, dst, job.DstBucket, job.DstKey)
+			if err != nil {
+				return fmt.Errorf("burn-after-reading: read destination %s/%s: %w", job.DstBucket, job.DstKey, err)
+			}
+			if srcChecksum != dstChecksum {
+				return refuseMismatch("content", srcChecksum, dstChecksum)
+			}
+			verifiedBy = "content"
+		}
+	}
+
 	log.Info().
 		Str("bucket", job.SrcBucket).
 		Str("key", job.Key).
-		Str("upload_crc32", uploadCRC32).
-		Str("stored_crc32", storedCRC32).
-		Bool("checksum_match", checksumMatch).
-		Msg("burn-after-reading: checksum verification")
-
-	if !checksumMatch {
-		if job.DryRun {
-			log.Info().
-				Str("bucket", job.SrcBucket).
-				Str("key", job.Key).
-				Msg("burn-after-reading: DRY-RUN would refuse to delete source object (checksum mismatch)")
-			return nil
-		}
-		return fmt.Errorf("burn-after-reading: checksum mismatch for %s/%s (upload=%q stored=%q), refusing to delete source",
-			job.SrcBucket, job.Key, uploadCRC32, storedCRC32)
-	}
+		Str("verified_by", verifiedBy).
+		Msg("burn-after-reading: verified")
 	if job.DryRun {
 		log.Info().
 			Str("bucket", job.SrcBucket).
