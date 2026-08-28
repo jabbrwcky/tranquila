@@ -45,6 +45,7 @@ type SyncCmd struct {
 	RedisAddr     string `name:"redis-addr" env:"REDIS_ADDR" default:"localhost:6379" help:"Redis server address"`
 	RedisPassword string `name:"redis-password" env:"REDIS_PASSWORD" help:"Redis password"`
 	RedisDB       int    `name:"redis-db" env:"REDIS_DB" default:"0" help:"Redis database number"`
+	RedisPoolSize int    `name:"redis-pool-size" env:"REDIS_POOL_SIZE" default:"0" help:"Redis connection pool size (0 = go-redis default: 10 * GOMAXPROCS)"`
 
 	Workers             int  `name:"workers" env:"TRANQUILA_WORKERS" default:"10" help:"Number of concurrent sync workers"`
 	CheckSizes          bool `name:"check-sizes" env:"TRANQUILA_CHECK_SIZES" default:"false" help:"Re-sync objects whose destination size differs from source"`
@@ -214,6 +215,7 @@ func (cmd *SyncCmd) Run() error {
 		Addr:     cmd.RedisAddr,
 		Password: cmd.RedisPassword,
 		DB:       cmd.RedisDB,
+		PoolSize: cmd.RedisPoolSize,
 	})
 	if err != nil {
 		return fmt.Errorf("connect to redis: %w", err)

@@ -100,6 +100,7 @@ sync:
     addr: "localhost:6379"
     password: ""
     db: 0
+    pool-size: 0          # 0 = go-redis default (10 * GOMAXPROCS)
 
   workers: 10
   check-sizes: false        # re-sync if destination size differs from source
@@ -226,6 +227,7 @@ tranquila sync --prefix-mappings "bucket/src-prefix=dst-prefix"
 | `REDIS_ADDR`                      | `localhost:6379` | Redis address                                        |
 | `REDIS_PASSWORD`                  |                  | Redis password                                       |
 | `REDIS_DB`                        | `0`              | Redis database number                                |
+| `REDIS_POOL_SIZE`                 | `0`              | Redis connection pool size (0 = go-redis default)    |
 | `TRANQUILA_WORKERS`               | `10`             | Number of concurrent sync workers                    |
 | `TRANQUILA_CHECK_SIZES`           | `false`          | Re-sync objects whose destination size differs       |
 | `TRANQUILA_DRY_RUN`               | `false`          | Log planned burn-after-reading deletions, no delete  |

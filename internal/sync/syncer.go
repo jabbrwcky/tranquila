@@ -546,6 +546,19 @@ func (s *Syncer) needsSync(ctx context.Context, bucket string, obj storage.Objec
 	return false, nil
 }
 
+// logStateWriteErr logs a failed Redis bookkeeping write. These are never
+// fatal to the cycle — the transfer itself already succeeded or failed on its
+// own terms — but silently discarding them (as processResults previously did)
+// leaves no trace of a Redis outage beyond go-redis's own low-level pool logs,
+// which say nothing about whether tranquila's calls are still failing at any
+// given moment.
+func logStateWriteErr(op, bucket, key string, err error) {
+	if err == nil {
+		return
+	}
+	log.Warn().Err(err).Str("op", op).Str("bucket", bucket).Str("key", key).Msg("state write failed")
+}
+
 func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 	for r := range results {
 		attrs := []attribute.KeyValue{attribute.String("bucket", r.Job.SrcBucket)}
@@ -562,7 +575,7 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 					Msg("propagate-deletes: destination delete failed")
 				s.m.failed.Add(ctx, 1, metric.WithAttributes(attrs...))
 			} else {
-				_ = s.cfg.State.RemoveObject(ctx, r.Job.SrcBucket, r.Job.Key)
+				logStateWriteErr("remove_object", r.Job.SrcBucket, r.Job.Key, s.cfg.State.RemoveObject(ctx, r.Job.SrcBucket, r.Job.Key))
 				s.m.synced.Add(ctx, 1, metric.WithAttributes(attrs...))
 			}
 			if r.Job.OnComplete != nil {
@@ -582,7 +595,7 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 					Str("dest_value", mismatch.Destination)
 			}
 			ev.Msg("transfer failed")
-			_ = s.cfg.State.MarkFailed(ctx, r.Job.SrcBucket, r.Job.Key)
+			logStateWriteErr("mark_failed", r.Job.SrcBucket, r.Job.Key, s.cfg.State.MarkFailed(ctx, r.Job.SrcBucket, r.Job.Key))
 			s.m.failed.Add(ctx, 1, metric.WithAttributes(attrs...))
 			if s.cfg.Progress != nil {
 				s.cfg.Progress.recordFailed(r.Job.SrcBucket)
@@ -597,9 +610,9 @@ func (s *Syncer) processResults(ctx context.Context, results <-chan Result) {
 			// BAR (non-dry-run): source was deleted — remove the tracking record so
 			// BucketStats stays accurate and future runs don't encounter stale entries.
 			if r.Job.BurnAfterReading && !r.Job.DryRun {
-				_ = s.cfg.State.RemoveObject(ctx, r.Job.SrcBucket, r.Job.Key)
+				logStateWriteErr("remove_object", r.Job.SrcBucket, r.Job.Key, s.cfg.State.RemoveObject(ctx, r.Job.SrcBucket, r.Job.Key))
 			} else {
-				_ = s.cfg.State.MarkSynced(ctx, r.Job.SrcBucket, r.Job.Key)
+				logStateWriteErr("mark_synced", r.Job.SrcBucket, r.Job.Key, s.cfg.State.MarkSynced(ctx, r.Job.SrcBucket, r.Job.Key))
 			}
 			s.m.synced.Add(ctx, 1, metric.WithAttributes(attrs...))
 			s.m.bytesTransferred.Add(ctx, r.Job.Size, metric.WithAttributes(attrs...))

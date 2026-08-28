@@ -190,6 +190,40 @@ that is the operator escape hatch for drift.
 
 `propagate-deletes` reconciliation adds a `seen_at` field to `tranquila:obj:{bucket}:{key}` (written by `TouchSeen`, a plain `HSET` — no counter mutation, not a status transition) and a second per-bucket scan, `ScanStaleObjects`, that pays the same keyspace-wide `SCAN` cost as `ScanPending`/`RebuildStats`. Both `TouchSeen` and `ScanStaleObjects` only run for buckets with `PropagateDeletes` enabled, so buckets that don't opt in pay neither the extra write nor the scan.
 
+### Redis connection pool recovery
+
+A reported "pool never recovers after a Redis/Valkey outage, only a tranquila
+restart fixes it" turned out, on investigation, not to be a bug in tranquila's
+own code: only one `*redis.Client`/`*state.Store` is created for the process
+lifetime (`cmd_sync.go` `Run()`), it's never closed/recreated mid-run, Redis
+errors classify as `ClassTransient` (not fatal — `isFatalCycleErr` doesn't
+terminate the watch loop over them), and no Redis call in the sync path can
+deadlock or leak a goroutine/semaphore slot on failure.
+
+go-redis's own pool (`internal/pool/pool.go`) trips into a degraded mode once
+`dialErrorsNum` reaches `PoolSize` consecutive dial failures: further callers
+get a cached error immediately, and a single background `tryDial()` goroutine
+probes once/sec, resetting the counter on the first successful dial. This is
+confirmed **by design and self-healing** by the go-redis maintainers —
+[redis/go-redis#3062](https://github.com/redis/go-redis/issues/3062), closed
+as "application related, not client related." `MinIdleConns`'s replenishment
+(`checkMinIdleConns`) goes through the *same* `dialConn`/`dialErrorsNum` gate,
+so setting it does **not** provide an independent recovery path — deliberately
+not configured for that reason.
+
+Root cause of the original report was never conclusively identified (address
+was a stable Kubernetes Service ClusterIP, ruling out stale pod-IP caching).
+Two changes were made anyway, both independently justified regardless of root
+cause: `processResults` previously discarded every `MarkFailed`/`MarkSynced`/
+`RemoveObject` error (`_ = s.cfg.State.MarkX(...)`) — during an outage this
+left zero tranquila-level log evidence beyond go-redis's own low-level pool
+spam; `logStateWriteErr` now logs them at `Warn`. `RedisConfig.PoolSize`
+(`--redis-pool-size`, default `0` = go-redis's `10 * GOMAXPROCS`) makes the
+dial-error trip threshold explicit and predictable rather than tied to the
+container's CPU limit, and gives an operator escape hatch to size it smaller
+(reaches the steady single-prober recovery state sooner, trading redial log
+noise for a small window with no dial attempts at all) or larger.
+
 ## Failure Handling
 
 Watch mode must never exit on a transient endpoint fault — `os.Exit` also kills

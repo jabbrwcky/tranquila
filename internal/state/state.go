@@ -43,6 +43,11 @@ type RedisConfig struct {
 	Addr     string
 	Password string
 	DB       int
+	// PoolSize overrides go-redis's default (10 * GOMAXPROCS). 0 = library default.
+	// Sized explicitly rather than left to GOMAXPROCS so it doesn't silently shrink
+	// on a CPU-constrained pod, and so it can be reasoned about independent of the
+	// container's CPU limit — see the pool-recovery note on dialErrorsNum below.
+	PoolSize int
 }
 
 type Store struct {
@@ -50,10 +55,17 @@ type Store struct {
 }
 
 func NewStore(cfg RedisConfig) (*Store, error) {
+	// PoolSize also governs the pool's dial-error trip threshold: go-redis's
+	// internal pool refuses to attempt a real dial once PoolSize consecutive
+	// dial failures have accumulated, deferring to a single background prober
+	// (once/sec) until it succeeds — see redis/go-redis#3062. A smaller, explicit
+	// PoolSize reaches that (still self-healing) state sooner during an outage,
+	// trading per-call redial log noise for a single steady prober.
 	client := redis.NewClient(&redis.Options{
 		Addr:     cfg.Addr,
 		Password: cfg.Password,
 		DB:       cfg.DB,
+		PoolSize: cfg.PoolSize,
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
