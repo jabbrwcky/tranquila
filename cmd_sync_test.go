@@ -7,7 +7,7 @@ import (
 	internalsync "github.com/jabbrwcky/tranquila/internal/sync"
 )
 
-func TestResolveBucketsPropagateDeletes(t *testing.T) {
+func TestResolveBucketsPerBucketFlags(t *testing.T) {
 	tests := []struct {
 		name string
 		cmd  SyncCmd
@@ -46,6 +46,30 @@ func TestResolveBucketsPropagateDeletes(t *testing.T) {
 			},
 			want: map[string]internalsync.BucketConfig{
 				"src": {Destination: "dst", PropagateDeletes: false},
+			},
+		},
+		{
+			name: "structured_yaml_threads_sharded_discovery",
+			cmd: SyncCmd{
+				Buckets: config.BucketMappings{
+					{
+						Source:           config.BucketEndpoint{Bucket: "src"},
+						Destination:      config.BucketEndpoint{Bucket: "dst"},
+						ShardedDiscovery: true,
+					},
+				},
+			},
+			want: map[string]internalsync.BucketConfig{
+				"src": {Destination: "dst", ShardedDiscovery: true},
+			},
+		},
+		{
+			name: "legacy_bucket_mappings_never_set_sharded_discovery",
+			cmd: SyncCmd{
+				BucketMappings: []string{"src=dst"},
+			},
+			want: map[string]internalsync.BucketConfig{
+				"src": {Destination: "dst", ShardedDiscovery: false},
 			},
 		},
 	}

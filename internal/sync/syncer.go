@@ -14,6 +14,7 @@ import (
 	"github.com/jabbrwcky/tranquila/internal/state"
 	"github.com/jabbrwcky/tranquila/internal/storage"
 	"github.com/jabbrwcky/tranquila/internal/watcher"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -29,6 +30,13 @@ type BucketConfig struct {
 	DstPrefix        string // replaces SrcPrefix in the destination key; empty = keep original key
 	BurnAfterReading bool   // delete source object after verified sync
 	PropagateDeletes bool   // delete destination object when the source object is deleted
+	// ShardedDiscovery skips the flat (bucket-wide) listing entirely and always
+	// discovers via a recursive, "/"-delimited tree walk instead. Set this for a
+	// bucket already known to be too large/slow for a flat listing to complete —
+	// otherwise this triggers automatically the first time a flat listing
+	// exhausts its retries with a transient/throttle error (see
+	// isShardableListErr), at the one-time cost of that exhausted retry budget.
+	ShardedDiscovery bool
 }
 
 // destKey returns the destination object key for srcKey, applying prefix replacement when configured.
@@ -235,15 +243,37 @@ func (s *Syncer) Run(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// discoverAndSyncBucket lists the source bucket in batches of DiscoveryBatchSize
-// objects, marks each pending in Redis, and submits them to the worker pool as
-// each underlying S3 listing page arrives (not after the whole batch is
-// collected), so transfers start immediately rather than waiting on a slow or
-// large listing. It waits for the batch to finish syncing before fetching the
-// next one, which keeps memory bounded. A per-bucket semaphore caps how many
-// of this bucket's transfers may be in flight at once, so a bucket with many
-// (small) objects cannot occupy the whole shared worker pool and starve other
-// buckets. Called concurrently by Run for each bucket.
+// isShardableListErr reports whether err is a listing failure (as opposed to
+// some other discovery-pipeline error, e.g. a Redis mark-pending failure —
+// storage.ListError distinguishes these) classified transient/throttled: the
+// class of failure prefix-sharded discovery might actually help with, since
+// many narrower listing calls to the same backend could succeed where one
+// flat, bucket-wide call couldn't. A permanent error (bad credentials, no
+// such bucket) would fail identically either way, so it's not shardable.
+func isShardableListErr(err error) bool {
+	var listErr *storage.ListError
+	if !errors.As(err, &listErr) {
+		return false
+	}
+	class := storage.Classify(listErr.Err)
+	return class == storage.ClassTransient || class == storage.ClassThrottle
+}
+
+// discoverAndSyncBucket lists the source bucket, marks each object pending in
+// Redis, and submits transfer jobs to the worker pool as objects are
+// discovered. A per-bucket semaphore caps how many of this bucket's transfers
+// may be in flight at once, so a bucket with many (small) objects cannot
+// occupy the whole shared worker pool and starve other buckets. Called
+// concurrently by Run for each bucket.
+//
+// Discovery uses a flat (bucket-wide) listing by default, batched via
+// DiscoveryBatchSize (see discoverFlat). cfg.ShardedDiscovery skips straight
+// to a recursive, "/"-delimited tree walk instead (see discoverSharded) for a
+// bucket already known to be too large for a flat listing to complete. For an
+// unflagged bucket, a flat listing that exhausts its retries with a
+// transient/throttle error automatically falls back to the sharded walk for
+// the rest of this cycle — at the one-time cost of the exhausted retry
+// budget, which is why the flag exists to skip that cost on repeat cycles.
 func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg BucketConfig, collectionTime time.Time, pool *workerPool) error {
 	logger := log.With().Str("bucket", bucket).Str("prefix", cfg.SrcPrefix).Logger()
 
@@ -255,8 +285,109 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 		s.cfg.Progress.startBucket(bucket)
 	}
 
-	batchSize := s.discoveryBatchSize()
 	bucketSem := make(chan struct{}, s.maxWorkersPerBucket())
+
+	var err error
+	if cfg.ShardedDiscovery {
+		err = s.discoverSharded(ctx, bucket, cfg, collectionTime, pool, bucketSem, logger)
+	} else {
+		err = s.discoverFlat(ctx, bucket, cfg, collectionTime, pool, bucketSem, logger)
+		if err != nil && isShardableListErr(err) {
+			logger.Warn().Err(err).Msg("flat listing exhausted retries with a transient error, " +
+				"falling back to prefix-sharded discovery for this bucket " +
+				"(set sharded-discovery: true on this bucket mapping to skip the flat attempt next time)")
+			err = s.discoverSharded(ctx, bucket, cfg, collectionTime, pool, bucketSem, logger)
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	if s.cfg.State != nil {
+		if err := s.cfg.State.SetCollectionTime(ctx, bucket, collectionTime); err != nil {
+			return fmt.Errorf("set collection time: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// discoverObject evaluates one discovered object and, if it needs syncing,
+// marks it pending and submits a transfer Job — shared by discoverFlat and
+// discoverSharded so job-submission semantics never drift between the two
+// discovery strategies. Blocks on bucketSem for per-bucket backpressure;
+// on submission, wg.Add(1) is called before pool.submit and the job's
+// OnComplete calls wg.Done() and releases bucketSem, so callers can wait for
+// everything they've queued via their own wg regardless of how they batch.
+func (s *Syncer) discoverObject(ctx context.Context, bucket string, cfg BucketConfig, collectionTime time.Time, obj storage.Object, pool *workerPool, bucketSem chan struct{}, wg *sync.WaitGroup, logger zerolog.Logger) (queued bool, err error) {
+	needsFullSync, err := s.needsSync(ctx, bucket, obj, cfg)
+	if err != nil {
+		logger.Warn().Err(err).Str("key", obj.Key).Msg("state check failed, marking pending")
+		needsFullSync = true
+	}
+
+	// Record that this object is still present in source, so a later
+	// reconcileDeletes pass can tell "still present" apart from "no longer
+	// seen" for objects needsSync otherwise never touches again. Done after
+	// needsSync reads prior state, so this write doesn't change what that
+	// read observed.
+	if cfg.PropagateDeletes && s.cfg.State != nil {
+		if err := s.cfg.State.TouchSeen(ctx, bucket, obj.Key, collectionTime); err != nil {
+			logger.Warn().Err(err).Str("key", obj.Key).Msg("touch seen failed")
+		}
+	}
+
+	// For non-BAR buckets: skip objects that don't need sync.
+	// For BAR buckets: even already-synced objects need verify-and-delete
+	// (source was not deleted when the bucket was previously in normal mode).
+	if !needsFullSync && !cfg.BurnAfterReading {
+		return false, nil
+	}
+
+	verifyAndDelete := !needsFullSync // already-synced; skip re-upload, just verify+delete
+
+	if needsFullSync && s.cfg.State != nil {
+		if err := s.cfg.State.MarkPending(ctx, bucket, obj.Key, obj.ModifiedAt); err != nil {
+			return false, fmt.Errorf("mark pending %s: %w", obj.Key, err)
+		}
+	}
+
+	select {
+	case bucketSem <- struct{}{}:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+
+	wg.Add(1)
+	pool.submit(Job{
+		SrcBucket:  bucket,
+		DstBucket:  cfg.Destination,
+		Key:        obj.Key,
+		DstKey:     cfg.destKey(obj.Key),
+		Size:       obj.Size,
+		ModifiedAt: obj.ModifiedAt,
+		SrcETag:    obj.ETag,
+		OnComplete: func() {
+			wg.Done()
+			<-bucketSem
+		},
+		BurnAfterReading: cfg.BurnAfterReading,
+		DryRun:           s.cfg.DryRun,
+		VerifyAndDelete:  verifyAndDelete,
+	})
+	return true, nil
+}
+
+// discoverFlat lists bucket in batches of DiscoveryBatchSize objects, waiting
+// for each batch to finish syncing before fetching the next — this is what
+// bounds memory/pending growth for a very large bucket, at the cost of one
+// flat, bucket-wide ListObjectsV2 call per page. Returns a *storage.ListError
+// (directly or wrapped) when the listing itself fails, as opposed to an error
+// from onPage (mark-pending, ctx cancellation) — discoverAndSyncBucket uses
+// this distinction (via isShardableListErr) to decide whether falling back to
+// discoverSharded could plausibly help.
+func (s *Syncer) discoverFlat(ctx context.Context, bucket string, cfg BucketConfig, collectionTime time.Time, pool *workerPool, bucketSem chan struct{}, logger zerolog.Logger) error {
+	batchSize := s.discoveryBatchSize()
 	var token *string
 	var batchNum, totalCount, totalPending int
 
@@ -273,64 +404,15 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 			var pagePending int
 			for _, obj := range page {
 				totalCount++
-				needsFullSync, err := s.needsSync(ctx, bucket, obj, cfg)
+				queued, err := s.discoverObject(ctx, bucket, cfg, collectionTime, obj, pool, bucketSem, &batchDone, logger)
 				if err != nil {
-					logger.Warn().Err(err).Str("key", obj.Key).Msg("state check failed, marking pending")
-					needsFullSync = true
+					return err
 				}
-
-				// Record that this object is still present in source, so a later
-				// reconcileDeletes pass can tell "still present" apart from "no
-				// longer seen" for objects needsSync otherwise never touches again.
-				// Done after needsSync reads prior state, so this write doesn't
-				// change what that read observed.
-				if cfg.PropagateDeletes && s.cfg.State != nil {
-					if err := s.cfg.State.TouchSeen(ctx, bucket, obj.Key, collectionTime); err != nil {
-						logger.Warn().Err(err).Str("key", obj.Key).Msg("touch seen failed")
-					}
+				if queued {
+					totalPending++
+					batchPending++
+					pagePending++
 				}
-
-				// For non-BAR buckets: skip objects that don't need sync.
-				// For BAR buckets: even already-synced objects need verify-and-delete
-				// (source was not deleted when the bucket was previously in normal mode).
-				if !needsFullSync && !cfg.BurnAfterReading {
-					continue
-				}
-
-				verifyAndDelete := !needsFullSync // already-synced; skip re-upload, just verify+delete
-
-				if needsFullSync && s.cfg.State != nil {
-					if err := s.cfg.State.MarkPending(ctx, bucket, obj.Key, obj.ModifiedAt); err != nil {
-						return fmt.Errorf("mark pending %s: %w", obj.Key, err)
-					}
-				}
-
-				select {
-				case bucketSem <- struct{}{}:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-
-				totalPending++
-				batchPending++
-				pagePending++
-				batchDone.Add(1)
-				pool.submit(Job{
-					SrcBucket:  bucket,
-					DstBucket:  cfg.Destination,
-					Key:        obj.Key,
-					DstKey:     cfg.destKey(obj.Key),
-					Size:       obj.Size,
-					ModifiedAt: obj.ModifiedAt,
-					SrcETag:    obj.ETag,
-					OnComplete: func() {
-						batchDone.Done()
-						<-bucketSem
-					},
-					BurnAfterReading: cfg.BurnAfterReading,
-					DryRun:           s.cfg.DryRun,
-					VerifyAndDelete:  verifyAndDelete,
-				})
 			}
 			if s.cfg.Progress != nil && pagePending > 0 {
 				s.cfg.Progress.addPending(bucket, int64(pagePending))
@@ -362,16 +444,53 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 
 		token = nextToken
 		if token == nil {
-			break
+			return nil
 		}
 	}
+}
 
-	if s.cfg.State != nil {
-		if err := s.cfg.State.SetCollectionTime(ctx, bucket, collectionTime); err != nil {
-			return fmt.Errorf("set collection time: %w", err)
+// discoverSharded lists bucket via a recursive, "/"-delimited tree walk
+// (storage.Client.ListObjectsTree) instead of one flat listing. Unlike
+// discoverFlat, there is no linear continuation token to pause discovery on,
+// so DiscoveryBatchSize's pause-while-a-batch-drains behavior does not apply
+// here — jobs are submitted continuously as the tree is walked, backpressured
+// by bucketSem exactly as in flat discovery, and this function waits once for
+// all of them to complete after the whole tree walk finishes (mirroring
+// discoverFlat's final-batch wait).
+func (s *Syncer) discoverSharded(ctx context.Context, bucket string, cfg BucketConfig, collectionTime time.Time, pool *workerPool, bucketSem chan struct{}, logger zerolog.Logger) error {
+	var wg sync.WaitGroup
+	var totalCount, totalPending int
+
+	onPage := func(page []storage.Object) error {
+		var pagePending int
+		for _, obj := range page {
+			totalCount++
+			queued, err := s.discoverObject(ctx, bucket, cfg, collectionTime, obj, pool, bucketSem, &wg, logger)
+			if err != nil {
+				return err
+			}
+			if queued {
+				totalPending++
+				pagePending++
+			}
 		}
+		if s.cfg.Progress != nil && pagePending > 0 {
+			s.cfg.Progress.addPending(bucket, int64(pagePending))
+		}
+		return nil
 	}
 
+	logger.Info().Msg("prefix-sharded discovery starting")
+	err := s.cfg.Source.ListObjectsTree(ctx, bucket, cfg.SrcPrefix, onPage)
+	wg.Wait()
+	if err != nil {
+		return err
+	}
+
+	logger.Info().
+		Int("total", totalCount).
+		Int("pending", totalPending).
+		Msg("prefix-sharded discovery complete")
 	return nil
 }
 

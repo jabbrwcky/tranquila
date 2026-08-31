@@ -110,6 +110,7 @@ func (cmd *SyncCmd) resolveBuckets() (map[string]internalsync.BucketConfig, erro
 			DstPrefix:        bm.Destination.Prefix,
 			BurnAfterReading: bm.BurnAfterReading,
 			PropagateDeletes: bm.PropagateDeletes,
+			ShardedDiscovery: bm.ShardedDiscovery,
 		}
 	}
 

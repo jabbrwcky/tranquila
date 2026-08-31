@@ -191,6 +191,33 @@ sync:
 
 A one-shot run (no `--watch`) always reconciles once, since there's no repeated cycle to throttle.
 
+#### Prefix-Sharded Discovery
+
+By default tranquila lists a bucket flat — one bucket-wide `ListObjectsV2` scan. Some backends (observed against a MinIO deployment with ~295K objects) cannot answer that in one request: the call hangs with no response at all, even bypassing every proxy in front of it. Since the underlying data is fine — the same bucket browses instantly folder-by-folder in the MinIO/S3 console — the fix is to discover the same way: a recursive, `/`-delimited listing that walks the bucket's own key structure (e.g. `2026/08/26/...`) instead of asking for everything at once.
+
+This kicks in two ways:
+
+- **Automatically** — if a flat listing exhausts all its retries with a transient/gateway-timeout-class error, tranquila falls back to prefix-sharded discovery for that bucket for the rest of the cycle, and logs a warning telling you to set the flag below. This costs the full exhausted retry budget (worst case a few minutes) the first time it happens, once per bucket, until you set the flag.
+- **Explicitly** — set `sharded-discovery: true` on a bucket mapping already known to need it, to skip the doomed flat attempt entirely:
+
+```yaml
+sync:
+  buckets:
+    - source:
+        bucket: keycloak-audit-events
+      destination:
+        bucket: archive
+      sharded-discovery: true
+```
+
+Like `burn-after-reading`/`propagate-deletes`, this is only available via structured `buckets:` config, not the legacy `--bucket-mappings` flags.
+
+**Tradeoffs:**
+
+- `--discovery-batch-size`'s pause-while-a-batch-drains pacing doesn't apply to sharded discovery — there's no single continuation token for a tree walk to pause on. Backpressure instead comes from the same per-bucket worker cap (`--max-workers-per-bucket`) that already throttles flat discovery, which bounds it identically in practice.
+- A bucket with no `/`-delimited key structure gains nothing from sharding (there's nothing to shard by) but isn't harmed either — it just becomes one listing call at the root, same shape as flat.
+- Every `ListObjectsV2` attempt (flat or sharded) is now individually bounded to 60s. A healthy call finishes in well under that; a hanging one now actually fails and retries instead of blocking a discovery goroutine forever.
+
 #### Bucket mappings via CLI / file
 
 Legacy string-based mappings are also supported and additive with structured config. CLI flags win on conflict (same source bucket):

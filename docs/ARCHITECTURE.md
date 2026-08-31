@@ -72,6 +72,25 @@ Objects are skipped when Redis already records them as synced, unless
 `--check-sizes` is set, which re-queues any object whose destination size
 differs from the source.
 
+### Prefix-sharded discovery
+
+`ListObjectsPage` above is the default, flat path: one bucket-wide
+`ListObjectsV2` scan. Some backends cannot answer that for a large bucket at
+all — observed against a real MinIO deployment (~295K objects), where the call
+hung with zero response, even with every proxy removed from the path. Since
+the same bucket browses instantly folder-by-folder in the MinIO/S3 console,
+`storage.Client.ListObjectsTree` discovers the same way: a recursive,
+`/`-delimited listing (`internal/storage/s3.go`'s `listObjectsTree`, bounded
+to `shardedDiscoveryConcurrency` concurrent prefixes) instead of one flat
+scan. `discoverAndSyncBucket` picks the path: `cfg.ShardedDiscovery` (the
+`sharded-discovery` bucket flag) skips flat entirely; otherwise a flat listing
+that exhausts its retries with a transient/throttle error
+(`isShardableListErr`) falls back to the sharded walk automatically for the
+rest of that cycle. Both paths funnel through the same `discoverObject` (per-
+object `needsSync`/`MarkPending`/job-submission logic), so nothing about
+job semantics differs between them — only how objects are discovered. See the
+README's "Prefix-Sharded Discovery" section for the operator-facing view.
+
 ## Concurrency and memory
 
 Three bounds keep a multi-million-object bucket from exhausting memory:
@@ -158,7 +177,7 @@ Four layers, innermost first:
 | Layer | Mechanism |
 | --- | --- |
 | Classification | `storage.Classify` → `ClassOK` / `ClassTransient` / `ClassThrottle` / `ClassPermanent`. HTTP status first, then the smithy error code. |
-| Per-call retry | The AWS SDK retryer at `s3MaxAttempts` (5); `listPageWithRetry` at 8 attempts, 30s delay cap, jittered. |
+| Per-call retry | The AWS SDK retryer at `s3MaxAttempts` (5); `listPageWithRetry` at 8 attempts, 30s delay cap, jittered, each attempt bounded by a 60s `listAttemptTimeout` (a hung server otherwise never even reaches a second attempt — see below). |
 | Per-cycle retry | `runWatch` / `initialSync` back off with jittered exponential delay and never return on a transient error. |
 | Rate degradation | AIMD per endpoint, fed one signal per S3 call. |
 

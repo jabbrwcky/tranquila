@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -316,6 +317,45 @@ func (c *Client) ListObjects(ctx context.Context, bucket, prefix string) (<-chan
 	return objects, errc
 }
 
+// objectsFromContents converts one ListObjectsV2 page's Contents into Objects,
+// skipping any entry with a nil Key (defensive; S3 does not document this as
+// possible, but a nil dereference here would crash discovery). Shared by
+// ListObjectsPage and the delimited listing used by ListObjectsTree.
+func objectsFromContents(bucket string, contents []s3types.Object) []Object {
+	objs := make([]Object, 0, len(contents))
+	for _, item := range contents {
+		if item.Key == nil {
+			continue
+		}
+		obj := Object{
+			Bucket: bucket,
+			Key:    *item.Key,
+			Size:   aws.ToInt64(item.Size),
+		}
+		if item.LastModified != nil {
+			obj.ModifiedAt = *item.LastModified
+		}
+		if item.ETag != nil {
+			obj.ETag = *item.ETag
+		}
+		objs = append(objs, obj)
+	}
+	return objs
+}
+
+// ListError wraps a failure from the underlying ListObjectsV2 call itself, as
+// opposed to one returned by a caller's onPage callback (e.g. a state-write
+// failure). Callers that need to tell these apart — discoverAndSyncBucket
+// decides whether falling back to sharded discovery could plausibly help
+// based on this — use errors.As rather than string-matching the message.
+type ListError struct {
+	Bucket string
+	Err    error
+}
+
+func (e *ListError) Error() string { return fmt.Sprintf("list objects in %s: %v", e.Bucket, e.Err) }
+func (e *ListError) Unwrap() error { return e.Err }
+
 // ListObjectsPage fetches up to maxObjects from bucket starting after token,
 // invoking onPage after each underlying S3 API page so callers can act on
 // (e.g. transfer) objects as they are discovered instead of waiting for the
@@ -337,28 +377,11 @@ func (c *Client) ListObjectsPage(ctx context.Context, bucket, prefix string, tok
 
 		page, err := c.listPageWithRetry(ctx, input)
 		if err != nil {
-			return collected, nil, fmt.Errorf("list objects in %s: %w", bucket, err)
+			return collected, nil, &ListError{Bucket: bucket, Err: err}
 		}
 
 		pageNum++
-		objs := make([]Object, 0, len(page.Contents))
-		for _, item := range page.Contents {
-			if item.Key == nil {
-				continue
-			}
-			obj := Object{
-				Bucket: bucket,
-				Key:    *item.Key,
-				Size:   aws.ToInt64(item.Size),
-			}
-			if item.LastModified != nil {
-				obj.ModifiedAt = *item.LastModified
-			}
-			if item.ETag != nil {
-				obj.ETag = *item.ETag
-			}
-			objs = append(objs, obj)
-		}
+		objs := objectsFromContents(bucket, page.Contents)
 		collected += len(objs)
 
 		log.Debug().
@@ -395,10 +418,28 @@ const (
 	listMaxRetries = 8
 	// listMaxDelay caps the doubling so late attempts do not stall for minutes.
 	listMaxDelay = 30 * time.Second
+	// listAttemptTimeout bounds a single ListObjectsV2 attempt. Nothing else in
+	// this client imposes a per-call deadline — a hanging server (observed: 2+
+	// minutes with zero response, no timeout, no error, from a MinIO bucket
+	// backend that couldn't enumerate a large flat listing) would otherwise
+	// block the caller's very first attempt forever, so the retry loop below
+	// never even gets a chance to run.
+	listAttemptTimeout = 60 * time.Second
 )
 
+// listAttemptTimedOut reports whether a per-attempt sub-context — not the
+// caller's outer ctx — is what expired. storage.Classify deliberately treats
+// context.DeadlineExceeded as ClassOK ("cancellation is our own doing, never
+// a congestion signal"), which is correct for the caller's own ctx but wrong
+// here: a timeout listPageWithRetry imposes on itself is a transient failure
+// that must be retried, not silently treated as an "OK" outcome.
+func listAttemptTimedOut(outerCtx, attemptCtx context.Context, err error) bool {
+	return outerCtx.Err() == nil && attemptCtx.Err() != nil && errors.Is(err, context.DeadlineExceeded)
+}
+
 // listPageWithRetry fetches a single ListObjectsV2 page, retrying transient
-// errors (5xx, EOF, connection reset, broken pipe) with exponential backoff.
+// errors (5xx, EOF, connection reset, broken pipe, or a per-attempt timeout)
+// with exponential backoff.
 func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
 	bucket := aws.ToString(input.Bucket)
 	var err error
@@ -406,14 +447,16 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 		if err = c.wait(ctx); err != nil {
 			return nil, err
 		}
+		attemptCtx, cancel := context.WithTimeout(ctx, listAttemptTimeout)
 		start := time.Now()
 		var out *s3.ListObjectsV2Output
-		out, err = c.s3.ListObjectsV2(ctx, input)
+		out, err = c.s3.ListObjectsV2(attemptCtx, input)
+		cancel()
 		c.recordOp(ctx, "ListObjectsV2", bucket, start, err)
 		if err == nil {
 			return out, nil
 		}
-		if !isTransientErr(err) {
+		if !isTransientErr(err) && !listAttemptTimedOut(ctx, attemptCtx, err) {
 			return nil, err
 		}
 		delay := min(time.Duration(1<<uint(attempt))*time.Second, listMaxDelay)
@@ -427,6 +470,173 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 		}
 	}
 	return nil, err
+}
+
+// listDelimitedFn lists one page of a delimiter-scoped listing at prefix,
+// resuming from token. Abstracts the real S3 call away from listObjectsTree's
+// fan-out/fan-in orchestration, which has no S3 dependency and is unit-tested
+// against a fake of this type.
+type listDelimitedFn func(ctx context.Context, prefix string, token *string) (contents []Object, commonPrefixes []string, nextToken *string, err error)
+
+// listDelimitedPage returns a listDelimitedFn backed by a real "/"-delimited
+// ListObjectsV2 call against bucket, going through the same retry (including
+// the per-attempt timeout) as a flat listing.
+func (c *Client) listDelimitedPage(bucket string) listDelimitedFn {
+	return func(ctx context.Context, prefix string, token *string) ([]Object, []string, *string, error) {
+		input := &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			Prefix:            aws.String(prefix),
+			Delimiter:         aws.String("/"),
+			ContinuationToken: token,
+		}
+		page, err := c.listPageWithRetry(ctx, input)
+		if err != nil {
+			return nil, nil, nil, &ListError{Bucket: bucket, Err: fmt.Errorf("prefix %q: %w", prefix, err)}
+		}
+		objs := objectsFromContents(bucket, page.Contents)
+		prefixes := make([]string, 0, len(page.CommonPrefixes))
+		for _, p := range page.CommonPrefixes {
+			if p.Prefix != nil {
+				prefixes = append(prefixes, *p.Prefix)
+			}
+		}
+		var next *string
+		if aws.ToBool(page.IsTruncated) {
+			next = page.NextContinuationToken
+		}
+		return objs, prefixes, next, nil
+	}
+}
+
+// shardedDiscoveryConcurrency bounds how many prefixes are actively being
+// listed at once during a tree walk — a struggling backend must not be hit
+// with an unbounded burst of concurrent LIST calls just because the bucket
+// happens to have many subfolders.
+const shardedDiscoveryConcurrency = 4
+
+// ListObjectsTree recursively lists everything under rootPrefix using a
+// "/"-delimited listing at each level — the same shape the MinIO/S3 web
+// console uses to browse a bucket folder-by-folder — instead of one flat,
+// bucket-wide listing that a backend struggling with a very large keyspace
+// may never be able to answer (observed: a direct ListObjectsV2 call hanging
+// 2+ minutes with zero response). Sibling prefixes are listed concurrently,
+// bounded by shardedDiscoveryConcurrency.
+func (c *Client) ListObjectsTree(ctx context.Context, bucket, rootPrefix string, onPage func([]Object) error) error {
+	return listObjectsTree(ctx, rootPrefix, c.listDelimitedPage(bucket), onPage)
+}
+
+// listObjectsTree is the S3-independent orchestration core of ListObjectsTree,
+// unit-tested against a fake listDelimitedFn. onPage is invoked from a single
+// goroutine only, one page at a time — never concurrently — so its existing
+// contract (built in discoverAndSyncBucket, which mutates closed-over
+// counters and a semaphore without locking) holds even though the listing
+// calls that produce those pages run concurrently across many prefixes.
+func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedFn, onPage func([]Object) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	tasks := make(chan string, 64)
+	pages := make(chan []Object)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	setErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+	getErr := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr
+	}
+
+	// enqueue reserves the WaitGroup slot synchronously (so a concurrent
+	// wg.Wait() can never observe "done" before every discovered prefix is
+	// accounted for) but performs the actual channel send on its own
+	// goroutine, so a worker discovering many sibling prefixes never blocks
+	// on tasks' capacity — only shardedDiscoveryConcurrency workers are ever
+	// blocked doing the real (expensive) listing call.
+	enqueue := func(prefix string) {
+		wg.Add(1)
+		go func() {
+			select {
+			case tasks <- prefix:
+			case <-ctx.Done():
+				wg.Done()
+			}
+		}()
+	}
+
+	// processOne fully paginates one prefix (which may span multiple pages),
+	// enqueueing any subPrefixes it discovers along the way, and unconditionally
+	// releases this task's WaitGroup slot via defer exactly once regardless of
+	// which return path is taken — a plain `return` here, rather than `break`
+	// inside the select below (which would only break the select, not this
+	// loop, and double-release the slot on the next iteration).
+	processOne := func(prefix string) {
+		defer wg.Done()
+		var token *string
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			objs, subPrefixes, next, err := list(ctx, prefix, token)
+			if err != nil {
+				setErr(err)
+				return
+			}
+			if len(objs) > 0 {
+				select {
+				case pages <- objs:
+				case <-ctx.Done():
+					return
+				}
+			}
+			for _, sp := range subPrefixes {
+				enqueue(sp)
+			}
+			if next == nil {
+				return
+			}
+			token = next
+		}
+	}
+
+	worker := func() {
+		for prefix := range tasks {
+			processOne(prefix)
+		}
+	}
+
+	for range shardedDiscoveryConcurrency {
+		go worker()
+	}
+	enqueue(rootPrefix)
+
+	go func() {
+		wg.Wait()
+		close(tasks)
+		close(pages)
+	}()
+
+	for objs := range pages {
+		if getErr() != nil {
+			continue // already failing; drain so producers blocked on `pages <-` can exit
+		}
+		if err := onPage(objs); err != nil {
+			setErr(err)
+		}
+	}
+
+	if err := getErr(); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {

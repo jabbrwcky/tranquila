@@ -19,6 +19,7 @@ type BucketMapping struct {
 	Destination      BucketEndpoint `yaml:"destination"`
 	BurnAfterReading bool           `yaml:"burn-after-reading"`
 	PropagateDeletes bool           `yaml:"propagate-deletes"`
+	ShardedDiscovery bool           `yaml:"sharded-discovery"`
 }
 
 // BucketMappings is a slice of BucketMapping that implements kong.MapperValue
