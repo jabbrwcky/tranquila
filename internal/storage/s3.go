@@ -468,6 +468,7 @@ func listAttemptTimedOut(outerCtx, attemptCtx context.Context, err error) bool {
 // with exponential backoff.
 func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
 	bucket := aws.ToString(input.Bucket)
+	prefix := aws.ToString(input.Prefix)
 	var err error
 	for attempt := range listMaxRetries {
 		if err = c.wait(ctx); err != nil {
@@ -488,7 +489,7 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 		delay := min(time.Duration(1<<uint(attempt))*time.Second, listMaxDelay)
 		// Jitter keeps replicas sharing an endpoint from retrying in lockstep.
 		delay += rand.N(delay / 2)
-		log.Warn().Err(err).Str("bucket", bucket).Int("attempt", attempt+1).Dur("retry_in", delay).Msg("transient list error, retrying")
+		log.Warn().Err(err).Str("bucket", bucket).Str("prefix", prefix).Int("attempt", attempt+1).Dur("retry_in", delay).Msg("transient list error, retrying")
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
@@ -530,6 +531,19 @@ func (c *Client) listDelimitedPage(bucket string) listDelimitedFn {
 		if aws.ToBool(page.IsTruncated) {
 			next = page.NextContinuationToken
 		}
+		// Debug, not Info: a bucket with a deep/wide key structure can visit
+		// thousands of prefixes in one discovery cycle. This is what makes the
+		// recursive descent (this prefix, its object count, and how many
+		// subfolders it fans out into next) observable when diagnosing whether
+		// sharded discovery is actually narrowing scope level by level, or stuck
+		// re-listing the same prefix.
+		log.Debug().
+			Str("bucket", bucket).
+			Str("prefix", prefix).
+			Int("page_objects", len(objs)).
+			Int("common_prefixes", len(prefixes)).
+			Bool("truncated", next != nil).
+			Msg("sharded discovery: prefix page complete")
 		return objs, prefixes, next, nil
 	}
 }
