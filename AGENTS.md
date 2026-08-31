@@ -61,6 +61,8 @@ General operating instructions for coding agents working in this repository.
 A task is complete when:
 
 1. Requested behavior is implemented.
+2. Design documents are added to the repository as markdown files
+3. For user facing features th user documentation is updated.
 2. Relevant checks/tests were run (or a clear reason is provided).
 3. No unrelated files were changed.
 4. Final summary is provided with next steps only if useful.
