@@ -26,6 +26,11 @@ General operating instructions for coding agents working in this repository.
 
 ## 4) Safety and Git Hygiene
 
+- Never commit directly to `main`. Create a branch named `<type>/<slug>` (matching
+  the commit's conventional-commit type, e.g. `fix/...`, `feat/...`, `ci/...`,
+  `chore/...`) and open a PR (`gh pr create`) for every change, so it goes
+  through CI and is captured by automatic release-note generation. Do not merge
+  the PR yourself unless explicitly asked to.
 - Never run destructive git commands (for example force reset/checkout) unless explicitly requested.
 - Do not revert user changes that are unrelated to the task.
 - If unexpected modifications appear during work, pause and call them out.
