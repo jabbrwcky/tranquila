@@ -105,6 +105,8 @@ sync:
   workers: 10
   check-sizes: false        # re-sync if destination size differs from source
   discovery-batch-size: 100000  # objects per batch; sync drains before next batch starts
+  list-attempt-timeout: 0s              # per ListObjectsV2 attempt (0 = default 60s)
+  sharded-discovery-concurrency: 0      # concurrent prefix listings in sharded mode (0 = default 4)
 
   # Continuous watch mode
   watch: false
@@ -216,7 +218,20 @@ Like `burn-after-reading`/`propagate-deletes`, this is only available via struct
 
 - `--discovery-batch-size`'s pause-while-a-batch-drains pacing doesn't apply to sharded discovery — there's no single continuation token for a tree walk to pause on. Backpressure instead comes from the same per-bucket worker cap (`--max-workers-per-bucket`) that already throttles flat discovery, which bounds it identically in practice.
 - A bucket with no `/`-delimited key structure gains nothing from sharding (there's nothing to shard by) but isn't harmed either — it just becomes one listing call at the root, same shape as flat.
-- Every `ListObjectsV2` attempt (flat or sharded) is now individually bounded to 60s. A healthy call finishes in well under that; a hanging one now actually fails and retries instead of blocking a discovery goroutine forever.
+- Every `ListObjectsV2` attempt (flat or sharded) is individually bounded by `--list-attempt-timeout` (default 60s). A healthy call finishes in well under that; a hanging one now actually fails and retries instead of blocking a discovery goroutine forever.
+
+**Tuning for a slow backend.** Sharding narrows *what* each listing call covers, but if the backend itself is slow per-call — regardless of how narrow the prefix is — narrower scope alone may not be enough once several listings run concurrently. Two knobs:
+
+```shell
+# Fewer simultaneous prefix listings per bucket during a sharded walk (default 4).
+# Lower this first if individual LIST calls are slow even in isolation.
+tranquila sync --sharded-discovery-concurrency=1
+
+# More headroom before giving up on one ListObjectsV2 attempt (default 60s).
+tranquila sync --list-attempt-timeout=3m
+```
+
+Both apply to the source endpoint only (nothing lists the destination). If you also have `--source-rate-limit` set, make sure it's sized for what the backend can actually sustain — a limit far above real capacity does not prevent the contention that pushes individual calls past the attempt timeout.
 
 #### Bucket mappings via CLI / file
 
@@ -259,6 +274,8 @@ tranquila sync --prefix-mappings "bucket/src-prefix=dst-prefix"
 | `TRANQUILA_CHECK_SIZES`           | `false`          | Re-sync objects whose destination size differs       |
 | `TRANQUILA_DRY_RUN`               | `false`          | Log planned burn-after-reading deletions, no delete  |
 | `TRANQUILA_DISCOVERY_BATCH_SIZE`  | `100000`         | Objects per discovery batch (0 = use default)        |
+| `TRANQUILA_LIST_ATTEMPT_TIMEOUT`  | `0`              | Per-`ListObjectsV2`-attempt timeout (0 = default 60s) |
+| `TRANQUILA_SHARDED_DISCOVERY_CONCURRENCY` | `0`      | Concurrent prefix listings in sharded mode (0 = default 4) |
 | `TRANQUILA_WATCH`                 | `false`          | Enable continuous watch mode                         |
 | `TRANQUILA_WATCH_MODE`            | `poll`           | Watch backend: `poll`, `minio`, or `sqs`             |
 | `TRANQUILA_WATCH_INTERVAL`        | `60s`            | Idle time between poll cycles                        |

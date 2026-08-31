@@ -33,6 +33,15 @@ type Config struct {
 	FailThreshold int          // consecutive transient failures before the rate is halved (0 = default 5)
 	Name          string       // "source"/"destination"; labels metrics
 	Meter         metric.Meter // optional; zero value produces no-op instruments
+
+	// ListAttemptTimeout bounds a single ListObjectsV2 attempt (0 = default
+	// defaultListAttemptTimeout). Only meaningful on the source client — nothing
+	// calls ListObjectsPage/ListObjectsTree on the destination.
+	ListAttemptTimeout time.Duration
+	// ShardedDiscoveryConcurrency bounds how many prefixes are listed
+	// concurrently during a sharded discovery tree walk (0 = default
+	// defaultShardedDiscoveryConcurrency). Only meaningful on the source client.
+	ShardedDiscoveryConcurrency int
 }
 
 type Object struct {
@@ -57,6 +66,9 @@ type Client struct {
 	limiter *rate.Limiter // never nil; rate.Inf = unlimited, mutated only via aimd
 	aimd    *aimd
 	m       clientMetrics
+
+	listAttemptTimeout          time.Duration
+	shardedDiscoveryConcurrency int
 }
 
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
@@ -101,12 +113,23 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	// Burst of 1 enforces strict per-call pacing with no token accumulation.
 	lim := rate.NewLimiter(base, 1)
 
+	listAttemptTimeout := cfg.ListAttemptTimeout
+	if listAttemptTimeout <= 0 {
+		listAttemptTimeout = defaultListAttemptTimeout
+	}
+	shardedDiscoveryConcurrency := cfg.ShardedDiscoveryConcurrency
+	if shardedDiscoveryConcurrency <= 0 {
+		shardedDiscoveryConcurrency = defaultShardedDiscoveryConcurrency
+	}
+
 	c := &Client{
-		s3:      s3c,
-		tm:      transfermanager.New(s3c),
-		region:  cfg.Region,
-		limiter: lim,
-		aimd:    newAIMD(lim, base, cfg.FailThreshold),
+		s3:                          s3c,
+		tm:                          transfermanager.New(s3c),
+		region:                      cfg.Region,
+		limiter:                     lim,
+		aimd:                        newAIMD(lim, base, cfg.FailThreshold),
+		listAttemptTimeout:          listAttemptTimeout,
+		shardedDiscoveryConcurrency: shardedDiscoveryConcurrency,
 	}
 	if err := c.initMetrics(cfg); err != nil {
 		return nil, err
@@ -418,13 +441,16 @@ const (
 	listMaxRetries = 8
 	// listMaxDelay caps the doubling so late attempts do not stall for minutes.
 	listMaxDelay = 30 * time.Second
-	// listAttemptTimeout bounds a single ListObjectsV2 attempt. Nothing else in
-	// this client imposes a per-call deadline — a hanging server (observed: 2+
-	// minutes with zero response, no timeout, no error, from a MinIO bucket
-	// backend that couldn't enumerate a large flat listing) would otherwise
-	// block the caller's very first attempt forever, so the retry loop below
-	// never even gets a chance to run.
-	listAttemptTimeout = 60 * time.Second
+	// defaultListAttemptTimeout bounds a single ListObjectsV2 attempt, unless
+	// Config.ListAttemptTimeout overrides it. Nothing else in this client
+	// imposes a per-call deadline — a hanging server (observed: 2+ minutes with
+	// zero response, no timeout, no error, from a MinIO bucket backend that
+	// couldn't enumerate a large flat listing) would otherwise block the
+	// caller's very first attempt forever, so the retry loop below never even
+	// gets a chance to run. A slow-but-not-hanging backend under real
+	// concurrent load (many discovery + transfer calls at once) may need more
+	// than the default — see Config.ListAttemptTimeout.
+	defaultListAttemptTimeout = 60 * time.Second
 )
 
 // listAttemptTimedOut reports whether a per-attempt sub-context — not the
@@ -442,12 +468,13 @@ func listAttemptTimedOut(outerCtx, attemptCtx context.Context, err error) bool {
 // with exponential backoff.
 func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
 	bucket := aws.ToString(input.Bucket)
+	prefix := aws.ToString(input.Prefix)
 	var err error
 	for attempt := range listMaxRetries {
 		if err = c.wait(ctx); err != nil {
 			return nil, err
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, listAttemptTimeout)
+		attemptCtx, cancel := context.WithTimeout(ctx, c.listAttemptTimeout)
 		start := time.Now()
 		var out *s3.ListObjectsV2Output
 		out, err = c.s3.ListObjectsV2(attemptCtx, input)
@@ -462,7 +489,7 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 		delay := min(time.Duration(1<<uint(attempt))*time.Second, listMaxDelay)
 		// Jitter keeps replicas sharing an endpoint from retrying in lockstep.
 		delay += rand.N(delay / 2)
-		log.Warn().Err(err).Str("bucket", bucket).Int("attempt", attempt+1).Dur("retry_in", delay).Msg("transient list error, retrying")
+		log.Warn().Err(err).Str("bucket", bucket).Str("prefix", prefix).Int("attempt", attempt+1).Dur("retry_in", delay).Msg("transient list error, retrying")
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
@@ -504,15 +531,33 @@ func (c *Client) listDelimitedPage(bucket string) listDelimitedFn {
 		if aws.ToBool(page.IsTruncated) {
 			next = page.NextContinuationToken
 		}
+		// Debug, not Info: a bucket with a deep/wide key structure can visit
+		// thousands of prefixes in one discovery cycle. This is what makes the
+		// recursive descent (this prefix, its object count, and how many
+		// subfolders it fans out into next) observable when diagnosing whether
+		// sharded discovery is actually narrowing scope level by level, or stuck
+		// re-listing the same prefix.
+		log.Debug().
+			Str("bucket", bucket).
+			Str("prefix", prefix).
+			Int("page_objects", len(objs)).
+			Int("common_prefixes", len(prefixes)).
+			Bool("truncated", next != nil).
+			Msg("sharded discovery: prefix page complete")
 		return objs, prefixes, next, nil
 	}
 }
 
-// shardedDiscoveryConcurrency bounds how many prefixes are actively being
-// listed at once during a tree walk — a struggling backend must not be hit
-// with an unbounded burst of concurrent LIST calls just because the bucket
-// happens to have many subfolders.
-const shardedDiscoveryConcurrency = 4
+// defaultShardedDiscoveryConcurrency bounds how many prefixes are actively
+// being listed at once during a tree walk, unless
+// Config.ShardedDiscoveryConcurrency overrides it — a struggling backend must
+// not be hit with an unbounded burst of concurrent LIST calls just because
+// the bucket happens to have many subfolders. Observed: a backend whose
+// individual LIST latency is already several seconds even in isolation (e.g.
+// a leaf-level folder with tens of thousands of objects) can push well past
+// even a generous per-attempt timeout once several of these run concurrently
+// alongside the transfer worker pool — see Config.ShardedDiscoveryConcurrency.
+const defaultShardedDiscoveryConcurrency = 4
 
 // ListObjectsTree recursively lists everything under rootPrefix using a
 // "/"-delimited listing at each level — the same shape the MinIO/S3 web
@@ -520,9 +565,9 @@ const shardedDiscoveryConcurrency = 4
 // bucket-wide listing that a backend struggling with a very large keyspace
 // may never be able to answer (observed: a direct ListObjectsV2 call hanging
 // 2+ minutes with zero response). Sibling prefixes are listed concurrently,
-// bounded by shardedDiscoveryConcurrency.
+// bounded by c.shardedDiscoveryConcurrency.
 func (c *Client) ListObjectsTree(ctx context.Context, bucket, rootPrefix string, onPage func([]Object) error) error {
-	return listObjectsTree(ctx, rootPrefix, c.listDelimitedPage(bucket), onPage)
+	return listObjectsTree(ctx, rootPrefix, c.listDelimitedPage(bucket), onPage, c.shardedDiscoveryConcurrency)
 }
 
 // listObjectsTree is the S3-independent orchestration core of ListObjectsTree,
@@ -531,7 +576,7 @@ func (c *Client) ListObjectsTree(ctx context.Context, bucket, rootPrefix string,
 // contract (built in discoverAndSyncBucket, which mutates closed-over
 // counters and a semaphore without locking) holds even though the listing
 // calls that produce those pages run concurrently across many prefixes.
-func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedFn, onPage func([]Object) error) error {
+func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedFn, onPage func([]Object) error, concurrency int) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -559,8 +604,8 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 	// wg.Wait() can never observe "done" before every discovered prefix is
 	// accounted for) but performs the actual channel send on its own
 	// goroutine, so a worker discovering many sibling prefixes never blocks
-	// on tasks' capacity — only shardedDiscoveryConcurrency workers are ever
-	// blocked doing the real (expensive) listing call.
+	// on tasks' capacity — only `concurrency` workers are ever blocked doing
+	// the real (expensive) listing call.
 	enqueue := func(prefix string) {
 		wg.Add(1)
 		go func() {
@@ -613,7 +658,7 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 		}
 	}
 
-	for range shardedDiscoveryConcurrency {
+	for range concurrency {
 		go worker()
 	}
 	enqueue(rootPrefix)
