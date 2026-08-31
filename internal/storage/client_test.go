@@ -117,3 +117,48 @@ func TestClientThrottleDegradesImmediately(t *testing.T) {
 		t.Errorf("limit = %v, want 50 after a single throttle", got)
 	}
 }
+
+// TestNewClientResolvesDiscoveryTuningDefaults pins that a zero/unset
+// ListAttemptTimeout or ShardedDiscoveryConcurrency falls back to the
+// package defaults, while an explicit value overrides them — the same "0 =
+// default" convention as every other tunable in this codebase.
+func TestNewClientResolvesDiscoveryTuningDefaults(t *testing.T) {
+	tests := []struct {
+		name               string
+		cfg                Config
+		wantListTimeout    time.Duration
+		wantShardedConcurr int
+	}{
+		{
+			name:               "zero_values_use_defaults",
+			cfg:                Config{Name: "source", Region: "us-east-1"},
+			wantListTimeout:    defaultListAttemptTimeout,
+			wantShardedConcurr: defaultShardedDiscoveryConcurrency,
+		},
+		{
+			name: "explicit_values_override_defaults",
+			cfg: Config{
+				Name: "source", Region: "us-east-1",
+				ListAttemptTimeout:          10 * time.Second,
+				ShardedDiscoveryConcurrency: 1,
+			},
+			wantListTimeout:    10 * time.Second,
+			wantShardedConcurr: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := NewClient(context.Background(), tc.cfg)
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			if c.listAttemptTimeout != tc.wantListTimeout {
+				t.Errorf("listAttemptTimeout = %v, want %v", c.listAttemptTimeout, tc.wantListTimeout)
+			}
+			if c.shardedDiscoveryConcurrency != tc.wantShardedConcurr {
+				t.Errorf("shardedDiscoveryConcurrency = %d, want %d", c.shardedDiscoveryConcurrency, tc.wantShardedConcurr)
+			}
+		})
+	}
+}

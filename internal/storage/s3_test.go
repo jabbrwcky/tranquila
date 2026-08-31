@@ -126,7 +126,7 @@ func TestListObjectsTree(t *testing.T) {
 		return nil
 	}
 
-	if err := listObjectsTree(context.Background(), "", list, onPage); err != nil {
+	if err := listObjectsTree(context.Background(), "", list, onPage, defaultShardedDiscoveryConcurrency); err != nil {
 		t.Fatalf("listObjectsTree: %v", err)
 	}
 
@@ -146,6 +146,7 @@ func TestListObjectsTreeConcurrencyBounded(t *testing.T) {
 		tree[p] = treeNode{objs: []Object{{Key: p + "obj"}}}
 	}
 
+	const concurrency = 3
 	var current, maxConcurrent int32
 	list := fakeTree(t, tree, 20*time.Millisecond, &current, &maxConcurrent)
 
@@ -155,14 +156,14 @@ func TestListObjectsTreeConcurrencyBounded(t *testing.T) {
 		return nil
 	}
 
-	if err := listObjectsTree(context.Background(), "", list, onPage); err != nil {
+	if err := listObjectsTree(context.Background(), "", list, onPage, concurrency); err != nil {
 		t.Fatalf("listObjectsTree: %v", err)
 	}
 	if count != n {
 		t.Errorf("delivered %d objects, want %d", count, n)
 	}
-	if got := atomic.LoadInt32(&maxConcurrent); got > shardedDiscoveryConcurrency {
-		t.Errorf("observed %d concurrent list calls, want <= %d", got, shardedDiscoveryConcurrency)
+	if got := atomic.LoadInt32(&maxConcurrent); got > concurrency {
+		t.Errorf("observed %d concurrent list calls, want <= %d", got, concurrency)
 	}
 }
 
@@ -183,7 +184,7 @@ func TestListObjectsTreeListErrorPropagates(t *testing.T) {
 		return node.objs, node.subPrefixes, nil, nil
 	}
 
-	err := listObjectsTree(context.Background(), "", list, func([]Object) error { return nil })
+	err := listObjectsTree(context.Background(), "", list, func([]Object) error { return nil }, defaultShardedDiscoveryConcurrency)
 	if !errors.Is(err, wantErr) {
 		t.Errorf("got err %v, want %v", err, wantErr)
 	}
@@ -194,7 +195,7 @@ func TestListObjectsTreeOnPageErrorPropagates(t *testing.T) {
 	tree := map[string]treeNode{"": {objs: []Object{{Key: "root.txt"}}}}
 	list := fakeTree(t, tree, 0, nil, nil)
 
-	err := listObjectsTree(context.Background(), "", list, func([]Object) error { return wantErr })
+	err := listObjectsTree(context.Background(), "", list, func([]Object) error { return wantErr }, defaultShardedDiscoveryConcurrency)
 	if !errors.Is(err, wantErr) {
 		t.Errorf("got err %v, want %v", err, wantErr)
 	}

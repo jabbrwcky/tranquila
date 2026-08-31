@@ -53,6 +53,9 @@ type SyncCmd struct {
 	DiscoveryBatchSize  int  `name:"discovery-batch-size" env:"TRANQUILA_DISCOVERY_BATCH_SIZE" default:"100000" help:"Objects to discover per bucket before syncing; next batch starts after sync drains (0 = default 100000)"`
 	MaxWorkersPerBucket int  `name:"max-workers-per-bucket" env:"TRANQUILA_MAX_WORKERS_PER_BUCKET" default:"0" help:"Cap on concurrent transfers for a single bucket, so one large bucket cannot starve others (0 = auto: half of --workers)"`
 
+	ListAttemptTimeout          time.Duration `name:"list-attempt-timeout" env:"TRANQUILA_LIST_ATTEMPT_TIMEOUT" default:"0" help:"Per-attempt timeout for a single ListObjectsV2 call, flat or sharded (0 = default 60s)"`
+	ShardedDiscoveryConcurrency int           `name:"sharded-discovery-concurrency" env:"TRANQUILA_SHARDED_DISCOVERY_CONCURRENCY" default:"0" help:"Concurrent prefix listings during sharded discovery (0 = default 4); lower for a source backend whose LIST calls are slow even in isolation"`
+
 	Watch         bool          `name:"watch" env:"TRANQUILA_WATCH" default:"false" help:"Continuously re-run sync until interrupted"`
 	WatchMode     string        `name:"watch-mode" env:"TRANQUILA_WATCH_MODE" default:"poll" enum:"poll,minio,sqs" help:"Watch backend: poll|minio|sqs"`
 	WatchInterval time.Duration `name:"watch-interval" env:"TRANQUILA_WATCH_INTERVAL" default:"60s" help:"Idle time between poll cycles (poll mode only)"`
@@ -225,14 +228,16 @@ func (cmd *SyncCmd) Run() error {
 
 	log.Debug().Str("endpoint", cmd.Source.Endpoint).Str("region", cmd.Source.Region).Msg("creating source client")
 	src, err := storage.NewClient(ctx, storage.Config{
-		Endpoint:      cmd.Source.Endpoint,
-		Region:        cmd.Source.Region,
-		AccessKey:     cmd.Source.AccessKey,
-		SecretKey:     cmd.Source.SecretKey,
-		RateLimit:     cmd.Source.RateLimit,
-		FailThreshold: cmd.EndpointFailThreshold,
-		Name:          "source",
-		Meter:         tel.Meter,
+		Endpoint:                    cmd.Source.Endpoint,
+		Region:                      cmd.Source.Region,
+		AccessKey:                   cmd.Source.AccessKey,
+		SecretKey:                   cmd.Source.SecretKey,
+		RateLimit:                   cmd.Source.RateLimit,
+		FailThreshold:               cmd.EndpointFailThreshold,
+		Name:                        "source",
+		Meter:                       tel.Meter,
+		ListAttemptTimeout:          cmd.ListAttemptTimeout,
+		ShardedDiscoveryConcurrency: cmd.ShardedDiscoveryConcurrency,
 	})
 	if err != nil {
 		return fmt.Errorf("create source S3 client: %w", err)
