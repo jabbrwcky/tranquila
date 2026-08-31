@@ -281,35 +281,38 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 		return fmt.Errorf("ensure destination bucket %s: %w", cfg.Destination, err)
 	}
 
-	if s.cfg.Progress != nil {
-		s.cfg.Progress.startBucket(bucket)
-	}
-
-	bucketSem := make(chan struct{}, s.maxWorkersPerBucket())
-
-	var err error
-	if cfg.ShardedDiscovery {
-		err = s.discoverSharded(ctx, bucket, cfg, collectionTime, pool, bucketSem, logger)
-	} else {
-		err = s.discoverFlat(ctx, bucket, cfg, collectionTime, pool, bucketSem, logger)
-		if err != nil && isShardableListErr(err) {
-			logger.Warn().Err(err).Msg("flat listing exhausted retries with a transient error, " +
-				"falling back to prefix-sharded discovery for this bucket " +
-				"(set sharded-discovery: true on this bucket mapping to skip the flat attempt next time)")
-			err = s.discoverSharded(ctx, bucket, cfg, collectionTime, pool, bucketSem, logger)
-		}
-	}
-	if err != nil {
-		return err
-	}
-
+	// Register the bucket (tranquila:buckets index + collection timestamp) as
+	// soon as we start working on it, not only once discovery finishes
+	// end-to-end. discoverFlat/discoverSharded stream and transfer objects
+	// incrementally as they're listed (including burn-after-reading deletes),
+	// so a large bucket can make substantial, real progress and still fail on
+	// a later listing page (e.g. a transient S3 error) — that must not make it
+	// vanish from `tranquila status`/ListBuckets, since nothing else in this
+	// codebase reads this timestamp for sync decisions; it's purely a
+	// display/existence check (internal/api's getBucket 404s when it's zero).
 	if s.cfg.State != nil {
 		if err := s.cfg.State.SetCollectionTime(ctx, bucket, collectionTime); err != nil {
 			return fmt.Errorf("set collection time: %w", err)
 		}
 	}
 
-	return nil
+	if s.cfg.Progress != nil {
+		s.cfg.Progress.startBucket(bucket)
+	}
+
+	bucketSem := make(chan struct{}, s.maxWorkersPerBucket())
+
+	if cfg.ShardedDiscovery {
+		return s.discoverSharded(ctx, bucket, cfg, collectionTime, pool, bucketSem, logger)
+	}
+	err := s.discoverFlat(ctx, bucket, cfg, collectionTime, pool, bucketSem, logger)
+	if err != nil && isShardableListErr(err) {
+		logger.Warn().Err(err).Msg("flat listing exhausted retries with a transient error, " +
+			"falling back to prefix-sharded discovery for this bucket " +
+			"(set sharded-discovery: true on this bucket mapping to skip the flat attempt next time)")
+		err = s.discoverSharded(ctx, bucket, cfg, collectionTime, pool, bucketSem, logger)
+	}
+	return err
 }
 
 // discoverObject evaluates one discovered object and, if it needs syncing,
