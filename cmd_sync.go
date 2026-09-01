@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -67,6 +69,9 @@ type SyncCmd struct {
 
 	DeleteReconcileInterval time.Duration `name:"delete-reconcile-interval" env:"TRANQUILA_DELETE_RECONCILE_INTERVAL" default:"0s" help:"Cadence for detecting source deletions via a full Redis scan and propagating them to destinations with propagate-deletes enabled (0 = every cycle)"`
 
+	BurnAfterReadingMinAge            config.Duration `name:"burn-after-reading-min-age" env:"TRANQUILA_BURN_AFTER_READING_MIN_AGE" default:"0s" help:"Global default: minimum source object age before burn-after-reading deletes it; supports d/w units (e.g. 7d, 2w) in addition to Go duration syntax. Overridable per bucket. 0 = delete immediately after verified sync (unchanged behavior)"`
+	BurnAfterReadingReconcileInterval config.Duration `name:"burn-after-reading-reconcile-interval" env:"TRANQUILA_BURN_AFTER_READING_RECONCILE_INTERVAL" default:"30m" help:"Cadence for the independent background sweep that burns objects once they age past burn-after-reading-min-age; runs regardless of --watch-mode/--watch-interval, including in minio/sqs event-driven mode"`
+
 	TelemetryExporter     string `name:"telemetry-exporter" env:"TELEMETRY_EXPORTER" default:"prometheus" enum:"prometheus,otlp,none" help:"Metrics exporter"`
 	TelemetryAddr         string `name:"telemetry-addr" env:"TELEMETRY_ADDR" default:":8081" help:"Prometheus metrics listen address"`
 	TelemetryOTLPEndpoint string `name:"telemetry-otlp-endpoint" env:"TELEMETRY_OTLP_ENDPOINT" help:"OTLP gRPC endpoint"`
@@ -107,13 +112,18 @@ func (cmd *SyncCmd) resolveBuckets() (map[string]internalsync.BucketConfig, erro
 		if dst == "" {
 			dst = src
 		}
+		minAge := time.Duration(cmd.BurnAfterReadingMinAge)
+		if bm.BurnAfterReadingMinAge != nil {
+			minAge = time.Duration(*bm.BurnAfterReadingMinAge)
+		}
 		result[src] = internalsync.BucketConfig{
-			Destination:      dst,
-			SrcPrefix:        bm.Source.Prefix,
-			DstPrefix:        bm.Destination.Prefix,
-			BurnAfterReading: bm.BurnAfterReading,
-			PropagateDeletes: bm.PropagateDeletes,
-			ShardedDiscovery: bm.ShardedDiscovery,
+			Destination:            dst,
+			SrcPrefix:              bm.Source.Prefix,
+			DstPrefix:              bm.Destination.Prefix,
+			BurnAfterReading:       bm.BurnAfterReading,
+			BurnAfterReadingMinAge: minAge,
+			PropagateDeletes:       bm.PropagateDeletes,
+			ShardedDiscovery:       bm.ShardedDiscovery,
 		}
 	}
 
@@ -313,37 +323,52 @@ func (cmd *SyncCmd) Run() error {
 
 	var runErr error
 	if !cmd.Watch {
-		runErr = syncer.Run(ctx)
+		runErr = errors.Join(syncer.Run(ctx), syncer.ReconcileBurnAfterReading(ctx))
 	} else {
-		switch cmd.WatchMode {
-		case "poll":
-			runErr = syncer.RunWatch(ctx, cmd.WatchInterval)
-		case "minio":
-			w, err := watcher.NewMinIO(watcher.MinIOConfig{
-				Endpoint:  cmd.Source.Endpoint,
-				AccessKey: cmd.Source.AccessKey,
-				SecretKey: cmd.Source.SecretKey,
-				Secure:    strings.HasPrefix(cmd.Source.Endpoint, "https://"),
-			})
-			if err != nil {
-				return fmt.Errorf("create minio watcher: %w", err)
+		// The burn-after-reading min-age reconciler runs on its own schedule,
+		// independent of --watch-mode/--watch-interval — see
+		// Syncer.RunBurnAfterReadingReconciler. It must run concurrently with
+		// whichever watch backend is selected, not as an alternative to it.
+		var watchErr, reconcileErr error
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			reconcileErr = syncer.RunBurnAfterReadingReconciler(ctx, time.Duration(cmd.BurnAfterReadingReconcileInterval))
+		})
+		wg.Go(func() {
+			switch cmd.WatchMode {
+			case "poll":
+				watchErr = syncer.RunWatch(ctx, cmd.WatchInterval)
+			case "minio":
+				w, err := watcher.NewMinIO(watcher.MinIOConfig{
+					Endpoint:  cmd.Source.Endpoint,
+					AccessKey: cmd.Source.AccessKey,
+					SecretKey: cmd.Source.SecretKey,
+					Secure:    strings.HasPrefix(cmd.Source.Endpoint, "https://"),
+				})
+				if err != nil {
+					watchErr = fmt.Errorf("create minio watcher: %w", err)
+					return
+				}
+				watchErr = syncer.RunWatcher(ctx, w)
+			case "sqs":
+				w, err := watcher.NewSQS(watcher.SQSConfig{
+					QueueURL:  cmd.SQSQueueURL,
+					Region:    cmd.Source.Region,
+					AccessKey: cmd.Source.AccessKey,
+					SecretKey: cmd.Source.SecretKey,
+				})
+				if err != nil {
+					watchErr = fmt.Errorf("create sqs watcher: %w", err)
+					return
+				}
+				watchErr = syncer.RunWatcher(ctx, w)
 			}
-			runErr = syncer.RunWatcher(ctx, w)
-		case "sqs":
-			w, err := watcher.NewSQS(watcher.SQSConfig{
-				QueueURL:  cmd.SQSQueueURL,
-				Region:    cmd.Source.Region,
-				AccessKey: cmd.Source.AccessKey,
-				SecretKey: cmd.Source.SecretKey,
-			})
-			if err != nil {
-				return fmt.Errorf("create sqs watcher: %w", err)
-			}
-			runErr = syncer.RunWatcher(ctx, w)
-		}
+		})
+		wg.Wait()
+		runErr = errors.Join(watchErr, reconcileErr)
 	}
 
-	if runErr != nil && runErr != context.Canceled {
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
 		return runErr
 	}
 

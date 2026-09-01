@@ -300,6 +300,70 @@ func (s *Store) ScanStaleObjects(ctx context.Context, bucket string, before time
 	return stale, nil
 }
 
+// ScanAgedSyncedObjects returns keys for a bucket whose status is "synced" and
+// whose modified_at is at or before `before` — candidates for burn-after-
+// reading's minimum-age reconciliation. Reuses the modified_at field every
+// object record already carries (written by MarkPending/UpsertObject); unlike
+// ScanStaleObjects, no extra per-object write is needed for this to work. A
+// record with a missing or unparseable modified_at is excluded rather than
+// treated as a candidate — burn-after-reading must never delete a source
+// object whose age it cannot actually confirm.
+//
+// Like ScanStaleObjects, this scans tranquila:obj:{bucket}:* — SCAN filters
+// MATCH server-side after walking the whole keyspace, so this call costs
+// O(total keyspace) regardless of the bucket's size (see RebuildStats and
+// this project's Redis Key Design notes). Only call it for buckets with a
+// configured burn-after-reading minimum age, on the reconciler's own
+// (deliberately infrequent) schedule.
+func (s *Store) ScanAgedSyncedObjects(ctx context.Context, bucket string, before time.Time) ([]string, error) {
+	pattern := "tranquila:obj:" + bucket + ":*"
+	prefix := "tranquila:obj:" + bucket + ":"
+
+	var keys []string
+	iter := s.client.Scan(ctx, 0, pattern, scanBatchSize).Iterator()
+	for iter.Next(ctx) {
+		keys = append(keys, iter.Val())
+	}
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("scan keys for bucket %s: %w", bucket, err)
+	}
+
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	var aged []string
+	for i := 0; i < len(keys); i += scanBatchSize {
+		end := min(i+scanBatchSize, len(keys))
+		batch := keys[i:end]
+
+		pipe := s.client.Pipeline()
+		cmds := make([]*redis.SliceCmd, len(batch))
+		for j, k := range batch {
+			cmds[j] = pipe.HMGet(ctx, k, "status", "modified_at")
+		}
+		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return nil, fmt.Errorf("pipeline hmget: %w", err)
+		}
+		for j, cmd := range cmds {
+			vals := cmd.Val()
+			status, _ := vals[0].(string)
+			if status != StatusSynced {
+				continue
+			}
+			modifiedAtStr, _ := vals[1].(string)
+			modifiedAt, err := time.Parse(time.RFC3339Nano, modifiedAtStr)
+			if err != nil {
+				continue
+			}
+			if !modifiedAt.After(before) {
+				aged = append(aged, strings.TrimPrefix(batch[j], prefix))
+			}
+		}
+	}
+	return aged, nil
+}
+
 func (s *Store) SetCollectionTime(ctx context.Context, bucket string, t time.Time) error {
 	pipe := s.client.Pipeline()
 	pipe.Set(ctx, collKey(bucket), t.UTC().Format(time.RFC3339Nano), 0)

@@ -29,7 +29,13 @@ type BucketConfig struct {
 	SrcPrefix        string // list/filter prefix applied when scanning the source; empty = all objects
 	DstPrefix        string // replaces SrcPrefix in the destination key; empty = keep original key
 	BurnAfterReading bool   // delete source object after verified sync
-	PropagateDeletes bool   // delete destination object when the source object is deleted
+	// BurnAfterReadingMinAge defers a burn until the source object is at least
+	// this old (by its S3 last-modified time). 0 = delete immediately after
+	// verified sync, matching burn-after-reading's original behavior. Already
+	// resolved (global default merged with any per-bucket override) by the
+	// time it reaches this struct — see config.Duration/cmd_sync.go.
+	BurnAfterReadingMinAge time.Duration
+	PropagateDeletes       bool // delete destination object when the source object is deleted
 	// ShardedDiscovery skips the flat (bucket-wide) listing entirely and always
 	// discovers via a recursive, "/"-delimited tree walk instead. Set this for a
 	// bucket already known to be too large/slow for a flat listing to complete —
@@ -322,6 +328,24 @@ func (s *Syncer) discoverAndSyncBucket(ctx context.Context, bucket string, cfg B
 // on submission, wg.Add(1) is called before pool.submit and the job's
 // OnComplete calls wg.Done() and releases bucketSem, so callers can wait for
 // everything they've queued via their own wg regardless of how they batch.
+// burnEligible reports whether an object last modified at modifiedAt is old
+// enough to burn under minAge, evaluated against now. minAge <= 0 means no
+// gate — always eligible, matching burn-after-reading's original immediate-
+// delete behavior. An unknown modifiedAt (the zero time — can happen for
+// watch-mode events; ObjectEvent.ModifiedAt is documented best-effort)
+// refuses eligibility rather than assuming it's old enough, matching this
+// codebase's established "never delete on an inconclusive answer" posture
+// (see classifyHeadErr/reconcileDeletes).
+func burnEligible(modifiedAt time.Time, minAge time.Duration, now time.Time) bool {
+	if minAge <= 0 {
+		return true
+	}
+	if modifiedAt.IsZero() {
+		return false
+	}
+	return now.Sub(modifiedAt) >= minAge
+}
+
 func (s *Syncer) discoverObject(ctx context.Context, bucket string, cfg BucketConfig, collectionTime time.Time, obj storage.Object, pool *workerPool, bucketSem chan struct{}, wg *sync.WaitGroup, logger zerolog.Logger) (queued bool, err error) {
 	needsFullSync, err := s.needsSync(ctx, bucket, obj, cfg)
 	if err != nil {
@@ -340,10 +364,21 @@ func (s *Syncer) discoverObject(ctx context.Context, bucket string, cfg BucketCo
 		}
 	}
 
+	// burnNow reflects whether THIS job should actually attempt a burn: BAR
+	// enabled for the bucket AND (no min-age gate, or the object is already
+	// old enough). processResults decides RemoveObject vs MarkSynced purely
+	// from Job.BurnAfterReading, so this must be the final word — not
+	// cfg.BurnAfterReading alone — or a deferred-for-age object would get its
+	// tracking record wrongly removed despite its source never being deleted.
+	burnNow := cfg.BurnAfterReading && burnEligible(obj.ModifiedAt, cfg.BurnAfterReadingMinAge, collectionTime)
+
 	// For non-BAR buckets: skip objects that don't need sync.
 	// For BAR buckets: even already-synced objects need verify-and-delete
 	// (source was not deleted when the bucket was previously in normal mode).
-	if !needsFullSync && !cfg.BurnAfterReading {
+	if !needsFullSync && !burnNow {
+		if cfg.BurnAfterReading {
+			logger.Debug().Str("key", obj.Key).Msg("burn-after-reading: deferring, not yet old enough")
+		}
 		return false, nil
 	}
 
@@ -374,7 +409,7 @@ func (s *Syncer) discoverObject(ctx context.Context, bucket string, cfg BucketCo
 			wg.Done()
 			<-bucketSem
 		},
-		BurnAfterReading: cfg.BurnAfterReading,
+		BurnAfterReading: burnNow,
 		DryRun:           s.cfg.DryRun,
 		VerifyAndDelete:  verifyAndDelete,
 	})
@@ -519,6 +554,16 @@ func eventDispatch(event watcher.ObjectEvent, bc BucketConfig) eventDecision {
 	return dispatchDelete
 }
 
+// burnNowForEvent computes whether a live watch-mode upload event should
+// attempt a burn-after-reading delete once transferred — the same age-gate
+// logic discoverObject applies during flat/sharded discovery (burnEligible),
+// applied here to the event's ModifiedAt instead of a listed object's.
+// Decoupled from job submission for the same testability reason as
+// eventDispatch.
+func burnNowForEvent(event watcher.ObjectEvent, bc BucketConfig, now time.Time) bool {
+	return bc.BurnAfterReading && burnEligible(event.ModifiedAt, bc.BurnAfterReadingMinAge, now)
+}
+
 // dueForReconcile reports whether enough time has passed since last for a
 // propagate-deletes reconcile pass to run again. interval <= 0 means "every
 // call", matching this codebase's other "0 = no throttling" flags (e.g.
@@ -622,6 +667,96 @@ func (s *Syncer) reconcileDeletes(ctx context.Context, bucket string, cfg Bucket
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// ReconcileBurnAfterReading runs one burn-after-reading minimum-age reconcile
+// pass across every configured bucket. Deliberately independent of
+// propagate-deletes' reconcileDeletes (separate schedule, separate Redis
+// scan, no HeadObject still-present check — an aged object was never
+// "expected gone," it's simply now old enough) — see
+// RunBurnAfterReadingReconciler for why this needs its own trigger, decoupled
+// from --watch-mode/--watch-interval. Exported: called directly once for
+// one-shot mode, and once per tick by RunBurnAfterReadingReconciler.
+func (s *Syncer) ReconcileBurnAfterReading(ctx context.Context) error {
+	bucketMap, err := s.resolveBuckets(ctx)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	var errs []error
+	for bucket, cfg := range bucketMap {
+		if !cfg.BurnAfterReading || cfg.BurnAfterReadingMinAge <= 0 {
+			continue
+		}
+		if err := s.reconcileBurnAfterReadingBucket(ctx, bucket, cfg, now); err != nil && !errors.Is(err, context.Canceled) {
+			errs = append(errs, fmt.Errorf("reconcile burn-after-reading %s: %w", bucket, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// reconcileBurnAfterReadingBucket finds synced objects in bucket whose source
+// has aged past cfg.BurnAfterReadingMinAge and, after verifying each against
+// the destination, deletes the source. Mirrors reconcileDeletes' shape
+// (candidates → per-candidate action → remove state, errors.Join across
+// failures) but calls performVerifyAndDelete instead of performDelete: no
+// SrcETag is stored in Redis for a reconcile candidate, so it falls back to
+// performVerifyAndDelete's own content-hash tier automatically, the same as
+// any other caller missing an ETag.
+func (s *Syncer) reconcileBurnAfterReadingBucket(ctx context.Context, bucket string, cfg BucketConfig, now time.Time) error {
+	candidates, err := s.cfg.State.ScanAgedSyncedObjects(ctx, bucket, now.Add(-cfg.BurnAfterReadingMinAge))
+	if err != nil {
+		return fmt.Errorf("scan aged objects: %w", err)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	log.Info().Str("bucket", bucket).Int("candidates", len(candidates)).Msg("burn-after-reading: reconciling aged objects")
+
+	var errs []error
+	for _, key := range candidates {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		job := Job{SrcBucket: bucket, DstBucket: cfg.Destination, Key: key, DstKey: cfg.destKey(key), DryRun: s.cfg.DryRun}
+		if err := performVerifyAndDelete(ctx, job, s.cfg.Destination, s.cfg.Source); err != nil {
+			errs = append(errs, fmt.Errorf("verify and delete %s/%s: %w", bucket, key, err))
+			continue
+		}
+		if s.cfg.DryRun {
+			continue
+		}
+		if err := s.cfg.State.RemoveObject(ctx, bucket, key); err != nil {
+			errs = append(errs, fmt.Errorf("remove state %s/%s: %w", bucket, key, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// RunBurnAfterReadingReconciler loops ReconcileBurnAfterReading every interval
+// until ctx is cancelled, running the first pass immediately. Deliberately
+// independent of RunWatch/RunWatcher's own cycle — the same background loop
+// runs unconditionally for all three --watch-mode backends (poll included),
+// since burn-after-reading age-gating and the regular sync/discovery cadence
+// are orthogonal concerns with very different natural frequencies: a sync
+// cycle might run every few seconds, but checking for month-old objects to
+// burn does not need to, and in pure event-driven (minio/sqs) watch mode
+// there is no other periodic re-scan at all to piggyback on (unlike
+// propagate-deletes' reconcileDeletes, which only gets a one-time pass at
+// RunWatcher startup for those backends). A failed pass is logged, not
+// returned — a transient failure must not kill a reconciler meant to run for
+// the life of the process.
+func (s *Syncer) RunBurnAfterReadingReconciler(ctx context.Context, interval time.Duration) error {
+	for {
+		if err := s.ReconcileBurnAfterReading(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Error().Err(err).Msg("burn-after-reading: reconcile pass failed")
+		}
+		if !waitOrDone(ctx, interval) {
+			return nil
+		}
+	}
 }
 
 func (s *Syncer) resolveBuckets(ctx context.Context) (map[string]BucketConfig, error) {
@@ -901,6 +1036,7 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 				continue
 			}
 		}
+		burnNow := burnNowForEvent(event, bc, time.Now().UTC())
 		pool.submit(Job{
 			SrcBucket:        event.Bucket,
 			DstBucket:        bc.Destination,
@@ -908,7 +1044,7 @@ func (s *Syncer) runWatcher(ctx context.Context, w watcher.Watcher, srcBuckets [
 			DstKey:           bc.destKey(event.Key),
 			Size:             event.Size,
 			ModifiedAt:       event.ModifiedAt,
-			BurnAfterReading: bc.BurnAfterReading,
+			BurnAfterReading: burnNow,
 			DryRun:           s.cfg.DryRun,
 		})
 	}

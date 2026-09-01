@@ -18,8 +18,12 @@ type BucketMapping struct {
 	Source           BucketEndpoint `yaml:"source"`
 	Destination      BucketEndpoint `yaml:"destination"`
 	BurnAfterReading bool           `yaml:"burn-after-reading"`
-	PropagateDeletes bool           `yaml:"propagate-deletes"`
-	ShardedDiscovery bool           `yaml:"sharded-discovery"`
+	// BurnAfterReadingMinAge overrides the global --burn-after-reading-min-age
+	// for this bucket. nil = inherit the global default; an explicit value
+	// (including 0) overrides it in either direction.
+	BurnAfterReadingMinAge *Duration `yaml:"burn-after-reading-min-age"`
+	PropagateDeletes       bool      `yaml:"propagate-deletes"`
+	ShardedDiscovery       bool      `yaml:"sharded-discovery"`
 }
 
 // BucketMappings is a slice of BucketMapping that implements kong.MapperValue

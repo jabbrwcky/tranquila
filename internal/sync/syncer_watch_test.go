@@ -239,3 +239,53 @@ func TestEventDispatch(t *testing.T) {
 		})
 	}
 }
+
+func TestBurnNowForEvent(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name  string
+		event watcher.ObjectEvent
+		bc    BucketConfig
+		want  bool
+	}{
+		{
+			name:  "bar_disabled_never_burns",
+			event: watcher.ObjectEvent{ModifiedAt: now},
+			bc:    BucketConfig{BurnAfterReading: false},
+			want:  false,
+		},
+		{
+			name:  "bar_enabled_no_gate_burns_immediately",
+			event: watcher.ObjectEvent{ModifiedAt: now},
+			bc:    BucketConfig{BurnAfterReading: true},
+			want:  true,
+		},
+		{
+			name:  "bar_enabled_gated_and_old_enough",
+			event: watcher.ObjectEvent{ModifiedAt: now.Add(-8 * 24 * time.Hour)},
+			bc:    BucketConfig{BurnAfterReading: true, BurnAfterReadingMinAge: 7 * 24 * time.Hour},
+			want:  true,
+		},
+		{
+			name:  "bar_enabled_gated_too_young_defers",
+			event: watcher.ObjectEvent{ModifiedAt: now},
+			bc:    BucketConfig{BurnAfterReading: true, BurnAfterReadingMinAge: 7 * 24 * time.Hour},
+			want:  false,
+		},
+		{
+			name: "bar_enabled_gated_unknown_modified_at_defers",
+			// ObjectEvent.ModifiedAt is documented best-effort — may be zero.
+			event: watcher.ObjectEvent{},
+			bc:    BucketConfig{BurnAfterReading: true, BurnAfterReadingMinAge: 7 * 24 * time.Hour},
+			want:  false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := burnNowForEvent(tc.event, tc.bc, now); got != tc.want {
+				t.Errorf("burnNowForEvent() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

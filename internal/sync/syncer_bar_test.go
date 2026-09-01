@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 )
 
 // fakeDeleter records DeleteObject calls for assertion. It also implements
@@ -399,6 +400,62 @@ func TestPerformVerifyAndDelete(t *testing.T) {
 			}
 			if tc.wantDeleted && len(fd.calls) > 0 && fd.calls[0] != "src/data/file.bin" {
 				t.Errorf("deleted wrong key: got %q, want %q", fd.calls[0], "src/data/file.bin")
+			}
+		})
+	}
+}
+
+func TestBurnEligible(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name       string
+		modifiedAt time.Time
+		minAge     time.Duration
+		want       bool
+	}{
+		{
+			name:       "no_gate_always_eligible",
+			modifiedAt: now, // just modified
+			minAge:     0,
+			want:       true,
+		},
+		{
+			name:       "no_gate_even_with_unknown_modified_at",
+			modifiedAt: time.Time{},
+			minAge:     0,
+			want:       true,
+		},
+		{
+			name:       "unknown_modified_at_refuses_when_gated",
+			modifiedAt: time.Time{},
+			minAge:     7 * 24 * time.Hour,
+			want:       false,
+		},
+		{
+			name:       "too_young_refuses",
+			modifiedAt: now.Add(-6 * 24 * time.Hour),
+			minAge:     7 * 24 * time.Hour,
+			want:       false,
+		},
+		{
+			name:       "exactly_at_threshold_eligible",
+			modifiedAt: now.Add(-7 * 24 * time.Hour),
+			minAge:     7 * 24 * time.Hour,
+			want:       true,
+		},
+		{
+			name:       "older_than_threshold_eligible",
+			modifiedAt: now.Add(-30 * 24 * time.Hour),
+			minAge:     7 * 24 * time.Hour,
+			want:       true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := burnEligible(tc.modifiedAt, tc.minAge, now); got != tc.want {
+				t.Errorf("burnEligible() = %v, want %v", got, tc.want)
 			}
 		})
 	}
