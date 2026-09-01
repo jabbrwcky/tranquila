@@ -430,3 +430,51 @@ func TestScanStaleObjects(t *testing.T) {
 		}
 	})
 }
+
+// TestScanAgedSyncedObjects covers the candidate selection burn-after-reading
+// min-age reconciliation relies on: only synced objects whose modified_at is
+// at or before the cutoff are reported; pending/failed objects and objects
+// modified after the cutoff are not.
+func TestScanAgedSyncedObjects(t *testing.T) {
+	forEachEngine(t, func(t *testing.T, st *state.Store, _ *redis.Client) {
+		ctx := context.Background()
+		const bucket = "aged"
+		now := time.Now()
+		before := now.Add(-7 * 24 * time.Hour)
+
+		markSyncedAt := func(key string, modifiedAt time.Time) {
+			t.Helper()
+			if err := st.MarkPending(ctx, bucket, key, modifiedAt); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.MarkSynced(ctx, bucket, key); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		markSyncedAt("old-synced", now.Add(-30*24*time.Hour)) // well before cutoff -> candidate
+		markSyncedAt("recent-synced", now.Add(-time.Hour))    // after cutoff -> not a candidate
+		markSyncedAt("at-boundary", before)                   // exactly at cutoff -> candidate (inclusive)
+
+		if err := st.MarkPending(ctx, bucket, "old-pending", now.Add(-30*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := st.MarkPending(ctx, bucket, "old-failed", now.Add(-30*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.MarkFailed(ctx, bucket, "old-failed"); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := st.ScanAgedSyncedObjects(ctx, bucket, before)
+		if err != nil {
+			t.Fatalf("ScanAgedSyncedObjects: %v", err)
+		}
+		slices.Sort(got)
+		want := []string{"at-boundary", "old-synced"}
+		if !slices.Equal(got, want) {
+			t.Errorf("ScanAgedSyncedObjects() = %v, want %v", got, want)
+		}
+	})
+}

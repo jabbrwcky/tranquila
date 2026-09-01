@@ -123,6 +123,11 @@ sync:
   # sync only; see "Propagate Deletes"). 0 = every cycle.
   delete-reconcile-interval: 0s
 
+  # Burn-after-reading minimum age (see "Burn-After-Reading"). 0 = delete
+  # immediately, today's original behavior.
+  burn-after-reading-min-age: 0s
+  burn-after-reading-reconcile-interval: 30m
+
   telemetry:
     exporter: "prometheus"  # prometheus | otlp | none
     addr: ":8081"
@@ -162,6 +167,33 @@ tranquila sync --dry-run -c tranquila.yaml
 ```
 
 Dry-run logs include the object key, CRC32 comparison result, and the planned deletion for every object that would be removed.
+
+**Minimum age.** By default the source object is deleted immediately once verified. Set `burn-after-reading-min-age` (globally, and/or per bucket) to defer deletion until the source object is at least that old (by its S3 last-modified time). An object younger than the threshold is still synced normally — just not deleted yet — and picked up for deletion once it ages past the threshold.
+
+```yaml
+sync:
+  burn-after-reading-min-age: 7d   # global default: applies to every burn-after-reading bucket
+  burn-after-reading-reconcile-interval: 30m   # how often the background sweep checks for objects that just became old enough
+
+  buckets:
+    - source:
+        bucket: staging-uploads
+      destination:
+        bucket: archive-uploads
+      burn-after-reading: true
+      # inherits the 7d global default
+
+    - source:
+        bucket: audit-logs
+      destination:
+        bucket: audit-logs-archive
+      burn-after-reading: true
+      burn-after-reading-min-age: 30d   # overrides the global default for this bucket
+```
+
+Accepts Go duration syntax (`12h`, `90m`) plus `d`/`w` suffixes (`7d`, `2w`) for single-unit day/week values — `1d12h` is not supported; use `36h` instead. `0` (the default) means immediate deletion, today's original behavior.
+
+**How deferred objects get swept.** An independent background reconciler (`--burn-after-reading-reconcile-interval`, default `30m`) periodically scans for synced objects that have now aged past the threshold and deletes them, using the same tiered verification as above. This is deliberately **not** tied to `--watch-interval` or to the regular sync/discovery cycle: checking for month-old objects doesn't need sync-cycle cadence, and in pure event-driven watch mode (`--watch-mode=minio`/`sqs`) there's no other periodic re-scan to piggyback on — the reconciler runs on its own schedule in all three watch modes, and once at the end of a one-shot (non-`--watch`) run.
 
 #### Propagate Deletes
 
@@ -284,6 +316,8 @@ tranquila sync --prefix-mappings "bucket/src-prefix=dst-prefix"
 | `TRANQUILA_CYCLE_BACKOFF_MAX`     | `10m`            | Maximum retry delay after a failed cycle             |
 | `TRANQUILA_ENDPOINT_FAIL_THRESHOLD` | `5`            | Transient failures before an endpoint's rate is halved |
 | `TRANQUILA_DELETE_RECONCILE_INTERVAL` | `0s`         | Cadence for propagate-deletes reconciliation (0 = every cycle) |
+| `TRANQUILA_BURN_AFTER_READING_MIN_AGE` | `0s`        | Global default minimum object age before burn-after-reading deletes it (0 = immediate); supports `d`/`w` units |
+| `TRANQUILA_BURN_AFTER_READING_RECONCILE_INTERVAL` | `30m` | Cadence for the independent sweep that burns objects once old enough |
 | `TELEMETRY_EXPORTER`              | `prometheus`     | Metrics exporter: `prometheus`, `otlp`, or `none`    |
 | `TELEMETRY_ADDR`                  | `:8081`          | Prometheus metrics listen address                    |
 | `TELEMETRY_OTLP_ENDPOINT`         |                  | OTLP gRPC endpoint                                   |

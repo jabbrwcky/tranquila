@@ -2,10 +2,16 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/jabbrwcky/tranquila/config"
 	internalsync "github.com/jabbrwcky/tranquila/internal/sync"
 )
+
+func cfgDuration(d time.Duration) *config.Duration {
+	cd := config.Duration(d)
+	return &cd
+}
 
 func TestResolveBucketsPerBucketFlags(t *testing.T) {
 	tests := []struct {
@@ -70,6 +76,52 @@ func TestResolveBucketsPerBucketFlags(t *testing.T) {
 			},
 			want: map[string]internalsync.BucketConfig{
 				"src": {Destination: "dst", ShardedDiscovery: false},
+			},
+		},
+		{
+			name: "bucket_without_override_inherits_global_min_age",
+			cmd: SyncCmd{
+				BurnAfterReadingMinAge: config.Duration(7 * 24 * time.Hour),
+				Buckets: config.BucketMappings{
+					{Source: config.BucketEndpoint{Bucket: "src"}, Destination: config.BucketEndpoint{Bucket: "dst"}, BurnAfterReading: true},
+				},
+			},
+			want: map[string]internalsync.BucketConfig{
+				"src": {Destination: "dst", BurnAfterReading: true, BurnAfterReadingMinAge: 7 * 24 * time.Hour},
+			},
+		},
+		{
+			name: "bucket_override_wins_over_global_min_age",
+			cmd: SyncCmd{
+				BurnAfterReadingMinAge: config.Duration(7 * 24 * time.Hour),
+				Buckets: config.BucketMappings{
+					{
+						Source:                 config.BucketEndpoint{Bucket: "src"},
+						Destination:            config.BucketEndpoint{Bucket: "dst"},
+						BurnAfterReading:       true,
+						BurnAfterReadingMinAge: cfgDuration(30 * 24 * time.Hour),
+					},
+				},
+			},
+			want: map[string]internalsync.BucketConfig{
+				"src": {Destination: "dst", BurnAfterReading: true, BurnAfterReadingMinAge: 30 * 24 * time.Hour},
+			},
+		},
+		{
+			name: "bucket_explicit_zero_overrides_nonzero_global_min_age",
+			cmd: SyncCmd{
+				BurnAfterReadingMinAge: config.Duration(7 * 24 * time.Hour),
+				Buckets: config.BucketMappings{
+					{
+						Source:                 config.BucketEndpoint{Bucket: "src"},
+						Destination:            config.BucketEndpoint{Bucket: "dst"},
+						BurnAfterReading:       true,
+						BurnAfterReadingMinAge: cfgDuration(0),
+					},
+				},
+			},
+			want: map[string]internalsync.BucketConfig{
+				"src": {Destination: "dst", BurnAfterReading: true, BurnAfterReadingMinAge: 0},
 			},
 		},
 	}
