@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,13 +24,21 @@ func testMetrics(t *testing.T) metrics {
 	return m
 }
 
+// fastSleep replaces the real backoff sleeper: backoff durations are asserted
+// separately, so tests only need cancellation to be honoured.
+func fastSleep(ctx context.Context, _ time.Duration) bool {
+	return waitOrDone(ctx, time.Millisecond)
+}
+
 // fakeWatcher implements watcher.Watcher for testing runWatcher.
 type fakeWatcher struct {
 	events []watcher.ObjectEvent
 	err    error
+	calls  atomic.Int32
 }
 
 func (f *fakeWatcher) Watch(_ context.Context, _ []string) (<-chan watcher.ObjectEvent, error) {
+	f.calls.Add(1)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -132,10 +141,6 @@ func TestRunWatch(t *testing.T) {
 				time.AfterFunc(tc.cancelAt, cancel)
 			}
 
-			// Backoff is asserted separately; keep retries fast here.
-			fastSleep := func(ctx context.Context, _ time.Duration) bool {
-				return waitOrDone(ctx, time.Millisecond)
-			}
 			err := s.runWatch(ctx, tc.interval, wrapped, fastSleep)
 
 			if tc.wantErr && err == nil {
@@ -202,6 +207,60 @@ func TestRunWatcherDeleteEventPropagateDeletesDisabled(t *testing.T) {
 	})
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestRunWatcherWithCatchUpDoesNotBlockEventLoop is the regression test for
+// watch mode being dead in production: the catch-up sync used to run to
+// completion *before* the event loop, so one bucket whose discovery never
+// succeeded (attempt=179 and counting) meant no live events were consumed for
+// any bucket at all.
+func TestRunWatcherWithCatchUpDoesNotBlockEventLoop(t *testing.T) {
+	s := &Syncer{m: testMetrics(t)}
+	w := &fakeWatcher{} // no events; runWatcher returns and the loop reconnects
+
+	var attempts atomic.Int32
+	cycleFn := func(context.Context) error {
+		attempts.Add(1)
+		return errors.New("bucket events: list objects: context deadline exceeded")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	time.AfterFunc(150*time.Millisecond, cancel)
+
+	err := s.runWatcherWithCatchUp(ctx, w, nil, nil, cycleFn, fastSleep)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if w.calls.Load() == 0 {
+		t.Error("event loop never started while the catch-up sync kept failing")
+	}
+	if attempts.Load() == 0 {
+		t.Error("catch-up sync was never attempted")
+	}
+}
+
+// TestRunWatcherWithCatchUpFatalErrorStopsWatcher pins that a misconfiguration
+// (all-permanent cycle error) still terminates instead of leaving the event
+// loop running until SIGTERM.
+func TestRunWatcherWithCatchUpFatalErrorStopsWatcher(t *testing.T) {
+	s := &Syncer{m: testMetrics(t)}
+	w := &fakeWatcher{}
+	fatal := &smithy.GenericAPIError{Code: "AccessDenied", Message: "denied"}
+
+	// Generous safety net: if the fatal path stops cancelling the event loop,
+	// this fails on elapsed time rather than hanging the suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err := s.runWatcherWithCatchUp(ctx, w, nil, nil, func(context.Context) error { return fatal }, fastSleep)
+	if !errors.Is(err, fatal) {
+		t.Errorf("got err %v, want %v", err, fatal)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("took %v — a fatal catch-up must stop the event loop, not wait for SIGTERM", elapsed)
 	}
 }
 

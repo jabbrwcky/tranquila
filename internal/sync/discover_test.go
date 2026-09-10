@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -41,6 +42,19 @@ func TestIsShardableListErr(t *testing.T) {
 			// storage.Classify's fallback, but it's not a *storage.ListError
 			// (e.g. a Redis mark-pending failure) — sharding can't help this.
 			err:  fmt.Errorf("mark pending %s: %w", "key", errors.New("redis down")),
+			want: false,
+		},
+		{
+			// The most common real trigger: our own per-attempt timeout. Sharding
+			// is exactly the remedy, but storage.Classify calls DeadlineExceeded
+			// ClassOK, so without special-casing the fallback never fired.
+			name: "per_attempt_timeout_is_shardable",
+			err:  &storage.ListError{Bucket: "b", Err: fmt.Errorf("prefix %q: %w", "2026/9/10/", context.DeadlineExceeded)},
+			want: true,
+		},
+		{
+			name: "caller_cancellation_not_shardable",
+			err:  &storage.ListError{Bucket: "b", Err: fmt.Errorf("prefix %q: %w", "2026/9/10/", context.Canceled)},
 			want: false,
 		},
 		{

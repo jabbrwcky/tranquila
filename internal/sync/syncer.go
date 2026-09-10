@@ -261,6 +261,14 @@ func isShardableListErr(err error) bool {
 	if !errors.As(err, &listErr) {
 		return false
 	}
+	// A listing too slow to finish within its per-attempt timeout is exactly
+	// what sharding remedies, but storage.Classify deliberately calls
+	// context.DeadlineExceeded ClassOK ("cancellation is our own doing"), so
+	// this shape has to be recognised here. Only DeadlineExceeded — a plain
+	// context.Canceled is SIGTERM, not a struggling backend.
+	if errors.Is(listErr.Err, context.DeadlineExceeded) {
+		return true
+	}
 	class := storage.Classify(listErr.Err)
 	return class == storage.ClassTransient || class == storage.ClassThrottle
 }
@@ -925,17 +933,11 @@ func (s *Syncer) runWatch(ctx context.Context, interval time.Duration, cycleFn f
 	}
 }
 
-// RunWatcher performs an initial full sync cycle to catch any changes missed while
-// the program was down, then switches to event-driven mode consuming events from w.
-// In-flight transfers complete before returning on context cancellation.
+// RunWatcher consumes events from w while a full catch-up sync — for changes
+// missed while the program was down — runs alongside it, not before it (see
+// runWatcherWithCatchUp). In-flight transfers complete before returning on
+// context cancellation.
 func (s *Syncer) RunWatcher(ctx context.Context, w watcher.Watcher) error {
-	if err := s.initialSync(ctx, s.Run, waitOrDone); err != nil {
-		return err
-	}
-	if ctx.Err() != nil {
-		return nil
-	}
-
 	bucketMap, err := s.resolveBuckets(ctx)
 	if err != nil {
 		return err
@@ -952,20 +954,51 @@ func (s *Syncer) RunWatcher(ctx context.Context, w watcher.Watcher) error {
 		srcBuckets = append(srcBuckets, b)
 	}
 
-	// The event stream can close without error (a MinIO notification stream that
-	// drops is not reconnected by the watcher). Returning here would exit 0 and
-	// let K8s restart the pod, so reconnect with the same backoff instead.
-	for n := 1; ; n++ {
-		err := s.runWatcher(ctx, w, srcBuckets, bucketMap)
-		if err != nil || ctx.Err() != nil {
-			return err
+	return s.runWatcherWithCatchUp(ctx, w, srcBuckets, bucketMap, s.Run, waitOrDone)
+}
+
+// runWatcherWithCatchUp runs the catch-up sync and the event loop concurrently.
+// The catch-up used to run to completion first, which meant a single bucket
+// whose discovery never succeeds (a very large bucket whose listing keeps
+// timing out) kept live events from *every* bucket from being consumed at all,
+// indefinitely — initialSync only returns once a whole cycle succeeds.
+// cycleFn/sleep are injected so this is testable without real S3 or Redis.
+func (s *Syncer) runWatcherWithCatchUp(ctx context.Context, w watcher.Watcher, srcBuckets []string, bucketMap map[string]BucketConfig, cycleFn func(context.Context) error, sleep sleeper) error {
+	// Own cancel so a fatal (all-permanent, i.e. misconfigured) catch-up stops
+	// the event loop too instead of leaving it running until SIGTERM.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var catchUpErr, watchErr error
+
+	wg.Go(func() {
+		catchUpErr = s.initialSync(ctx, cycleFn, sleep)
+		if catchUpErr != nil {
+			cancel()
 		}
-		delay := s.cycleBackoff(n)
-		log.Warn().Int("attempt", n).Dur("retry_in", delay).Msg("watch: event stream closed, reconnecting")
-		if !waitOrDone(ctx, delay) {
-			return nil
+	})
+
+	wg.Go(func() {
+		// The event stream can close without error (a MinIO notification stream
+		// that drops is not reconnected by the watcher). Returning here would exit
+		// 0 and let K8s restart the pod, so reconnect with the same backoff instead.
+		for n := 1; ; n++ {
+			err := s.runWatcher(ctx, w, srcBuckets, bucketMap)
+			if err != nil || ctx.Err() != nil {
+				watchErr = err
+				return
+			}
+			delay := s.cycleBackoff(n)
+			log.Warn().Int("attempt", n).Dur("retry_in", delay).Msg("watch: event stream closed, reconnecting")
+			if !sleep(ctx, delay) {
+				return
+			}
 		}
-	}
+	})
+
+	wg.Wait()
+	return errors.Join(watchErr, catchUpErr)
 }
 
 // initialSync retries the catch-up cycle with backoff so a gateway that is flaky

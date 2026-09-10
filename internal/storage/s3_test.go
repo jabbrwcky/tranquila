@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -187,6 +188,82 @@ func TestListObjectsTreeListErrorPropagates(t *testing.T) {
 	err := listObjectsTree(context.Background(), "", list, func([]Object) error { return nil }, defaultShardedDiscoveryConcurrency)
 	if !errors.Is(err, wantErr) {
 		t.Errorf("got err %v, want %v", err, wantErr)
+	}
+}
+
+// TestListObjectsTreeFailedPrefixDoesNotAbortWalk is the regression test for a
+// 3.4M-object bucket that never completed discovery: one pathological prefix
+// used to cancel the whole walk, discarding every other prefix's progress on
+// every cycle.
+func TestListObjectsTreeFailedPrefixDoesNotAbortWalk(t *testing.T) {
+	wantErr := errors.New("too slow")
+	tree := map[string]treeNode{
+		"":     {subPrefixes: []string{"a/", "bad/", "c/"}},
+		"a/":   {objs: []Object{{Key: "a/1"}, {Key: "a/2"}}},
+		"c/":   {objs: []Object{{Key: "c/1"}}, subPrefixes: []string{"c/d/"}},
+		"c/d/": {objs: []Object{{Key: "c/d/1"}}},
+	}
+	list := func(ctx context.Context, prefix string, token *string) ([]Object, []string, *string, error) {
+		if prefix == "bad/" {
+			return nil, nil, nil, wantErr
+		}
+		node, ok := tree[prefix]
+		if !ok {
+			return nil, nil, nil, fmt.Errorf("unexpected prefix %q", prefix)
+		}
+		return node.objs, node.subPrefixes, nil, nil
+	}
+
+	var got []string
+	err := listObjectsTree(context.Background(), "", list, func(objs []Object) error {
+		for _, o := range objs {
+			got = append(got, o.Key)
+		}
+		return nil
+	}, defaultShardedDiscoveryConcurrency)
+
+	if !errors.Is(err, wantErr) {
+		t.Errorf("got err %v, want it to wrap %v", err, wantErr)
+	}
+	sort.Strings(got)
+	// Every healthy prefix must still be delivered, including c/d/ which is only
+	// reachable by descending past the failure.
+	want := []string{"a/1", "a/2", "c/1", "c/d/1"}
+	if !slices.Equal(got, want) {
+		t.Errorf("delivered %v, want %v", got, want)
+	}
+}
+
+// TestListObjectsTreeReportsCappedPrefixErrors pins that a bucket where every
+// prefix fails does not produce an unbounded joined error, logged in full on
+// every cycle.
+func TestListObjectsTreeReportsCappedPrefixErrors(t *testing.T) {
+	const prefixes = maxReportedPrefixErrs + 5
+	root := treeNode{}
+	for i := range prefixes {
+		root.subPrefixes = append(root.subPrefixes, fmt.Sprintf("p%d/", i))
+	}
+	list := func(ctx context.Context, prefix string, token *string) ([]Object, []string, *string, error) {
+		if prefix == "" {
+			return nil, root.subPrefixes, nil, nil
+		}
+		return nil, nil, nil, fmt.Errorf("prefix %s failed", prefix)
+	}
+
+	err := listObjectsTree(context.Background(), "", list, func([]Object) error { return nil }, 2)
+	if err == nil {
+		t.Fatal("expected an error when every prefix fails")
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		t.Fatalf("expected a joined error, got %T", err)
+	}
+	// maxReportedPrefixErrs retained failures plus one "and N more" summary.
+	if n := len(joined.Unwrap()); n != maxReportedPrefixErrs+1 {
+		t.Errorf("joined %d errors, want %d", n, maxReportedPrefixErrs+1)
+	}
+	if !strings.Contains(err.Error(), "and 5 more prefixes failed") {
+		t.Errorf("error should summarise the elided failures, got: %v", err)
 	}
 }
 
