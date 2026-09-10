@@ -570,12 +570,22 @@ func (c *Client) ListObjectsTree(ctx context.Context, bucket, rootPrefix string,
 	return listObjectsTree(ctx, rootPrefix, c.listDelimitedPage(bucket), onPage, c.shardedDiscoveryConcurrency)
 }
 
+// maxReportedPrefixErrs caps how many per-prefix failures are retained for the
+// returned error. A bucket where every prefix is too slow to list would
+// otherwise produce a joined error naming hundreds of them, logged in full on
+// every cycle.
+const maxReportedPrefixErrs = 10
+
 // listObjectsTree is the S3-independent orchestration core of ListObjectsTree,
 // unit-tested against a fake listDelimitedFn. onPage is invoked from a single
 // goroutine only, one page at a time — never concurrently — so its existing
 // contract (built in discoverAndSyncBucket, which mutates closed-over
 // counters and a semaphore without locking) holds even though the listing
 // calls that produce those pages run concurrently across many prefixes.
+//
+// A prefix whose listing fails is abandoned and reported, but does not stop
+// the walk: on a very large bucket a handful of pathological prefixes must not
+// discard every other prefix's progress (see docs/ARCHITECTURE.md).
 func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedFn, onPage func([]Object) error, concurrency int) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -585,19 +595,41 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var firstErr error
-	setErr := func(err error) {
+	var fatalErr error
+	var prefixErrs []error
+	var prefixErrCount int
+
+	// setFatal aborts the whole walk: an onPage failure is the caller's (state
+	// writes, cancellation), so continuing to list would be pointless.
+	setFatal := func(err error) {
 		mu.Lock()
 		defer mu.Unlock()
-		if firstErr == nil {
-			firstErr = err
+		if fatalErr == nil {
+			fatalErr = err
 			cancel()
 		}
 	}
-	getErr := func() error {
+	getFatal := func() error {
 		mu.Lock()
 		defer mu.Unlock()
-		return firstErr
+		return fatalErr
+	}
+	addPrefixErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		prefixErrCount++
+		if len(prefixErrs) < maxReportedPrefixErrs {
+			prefixErrs = append(prefixErrs, err)
+		}
+	}
+	joinPrefixErrs := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if prefixErrCount > len(prefixErrs) {
+			return errors.Join(append(prefixErrs,
+				fmt.Errorf("and %d more prefixes failed", prefixErrCount-len(prefixErrs)))...)
+		}
+		return errors.Join(prefixErrs...)
 	}
 
 	// enqueue reserves the WaitGroup slot synchronously (so a concurrent
@@ -632,7 +664,14 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 			}
 			objs, subPrefixes, next, err := list(ctx, prefix, token)
 			if err != nil {
-				setErr(err)
+				// Abandon this prefix only. Pages already delivered stay synced;
+				// the rest of it (and any sub-prefixes it had not yet reached) is
+				// retried on the next discovery cycle.
+				if ctx.Err() == nil {
+					log.Warn().Err(err).Str("prefix", prefix).
+						Msg("sharded discovery: prefix listing failed after retries, continuing with other prefixes")
+				}
+				addPrefixErr(err)
 				return
 			}
 			if len(objs) > 0 {
@@ -670,18 +709,21 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 	}()
 
 	for objs := range pages {
-		if getErr() != nil {
-			continue // already failing; drain so producers blocked on `pages <-` can exit
+		if getFatal() != nil {
+			continue // already aborting; drain so producers blocked on `pages <-` can exit
 		}
 		if err := onPage(objs); err != nil {
-			setErr(err)
+			setFatal(err)
 		}
 	}
 
-	if err := getErr(); err != nil {
+	if err := getFatal(); err != nil {
 		return err
 	}
-	return ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return joinPrefixErrs()
 }
 
 func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {

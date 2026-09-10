@@ -265,6 +265,10 @@ tranquila sync --list-attempt-timeout=3m
 
 Both apply to the source endpoint only (nothing lists the destination). If you also have `--source-rate-limit` set, make sure it's sized for what the backend can actually sustain — a limit far above real capacity does not prevent the contention that pushes individual calls past the attempt timeout.
 
+**A prefix that keeps failing no longer takes the bucket down with it.** Each prefix is listed independently: one that exhausts its retries is logged (`sharded discovery: prefix listing failed after retries, continuing with other prefixes`), skipped, and retried on the next cycle, while every other prefix still completes and syncs. Discovery reports those failures at the end of the cycle, so the bucket's cycle is still marked failed and retried — but the objects it *could* reach are already synced rather than discarded. On a bucket with hundreds of prefixes, only the first few failures are named in the cycle error, followed by a count of the rest.
+
+**A bucket that can never finish discovery no longer blocks live events.** In `minio`/`sqs` watch mode the initial catch-up sync runs *concurrently* with the event stream, so a bucket whose listing keeps timing out no longer stops every other bucket's live events from being consumed. The catch-up keeps retrying in the background with the usual cycle backoff; only a genuine misconfiguration (all-permanent failures) terminates the process.
+
 #### Bucket mappings via CLI / file
 
 Legacy string-based mappings are also supported and additive with structured config. CLI flags win on conflict (same source bucket):

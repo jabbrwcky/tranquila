@@ -91,6 +91,21 @@ object `needsSync`/`MarkPending`/job-submission logic), so nothing about
 job semantics differs between them — only how objects are discovered. See the
 README's "Prefix-Sharded Discovery" section for the operator-facing view.
 
+**Failure isolation.** Each prefix is listed independently. A prefix that
+exhausts its retries is logged, skipped and retried next cycle, while every
+other prefix still completes — one pathological prefix on a multi-million-object
+bucket must not discard the whole bucket's progress. `listObjectsTree` collects
+those per-prefix failures (capped, with a count of the remainder) and returns
+them joined at the end; only an `onPage` failure or context cancellation aborts
+the walk outright, since both are caller-side.
+
+**Catch-up is concurrent with the event stream.** In `minio`/`sqs` watch mode,
+`RunWatcher` runs the initial catch-up `Run()` and the event loop together
+(`runWatcherWithCatchUp`) rather than gating the latter on the former. A bucket
+whose discovery can never finish would otherwise keep live events from *every*
+bucket from being consumed, since `initialSync` only returns once a whole cycle
+succeeds. A fatal (all-permanent) catch-up error still cancels both.
+
 ## Concurrency and memory
 
 Three bounds keep a multi-million-object bucket from exhausting memory:
