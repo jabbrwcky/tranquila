@@ -540,6 +540,64 @@ go build -v
 
 Requires Go 1.25 or later, as declared in `go.mod`.
 
+## Container images
+
+CI publishes images to `ghcr.io/jabbrwcky/tranquila`:
+
+| Tag | Points at |
+| --- | --- |
+| `latest` | the newest stable release |
+| `1.2.3`, `1.2`, `1` | that release |
+| `<short-sha>` | the build of that commit, never moves |
+| `main` | the newest build of `main` |
+| `pr-<n>` | the newest build of that pull request |
+
+Images are built for `linux/amd64` and `linux/arm64`. A release rebuilds from its tag, so the
+release tags share one digest of their own and `tranquila --version` reports the version rather
+than a commit sha. Use a `<short-sha>` tag to deploy an exact CI build.
+
+A branch with no open pull request produces no image; run the CI workflow manually
+(`workflow_dispatch`) to get a `:<branch>` image for one.
+
+### Verifying a release
+
+Images are signed with cosign using the workflow's own identity — there is no public key to
+distribute:
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github.com/jabbrwcky/tranquila/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/jabbrwcky/tranquila:1.2.3
+```
+
+Release images carry an SPDX SBOM and SLSA provenance as attestations:
+
+```bash
+docker buildx imagetools inspect ghcr.io/jabbrwcky/tranquila:1.2.3 --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/jabbrwcky/tranquila:1.2.3 --format '{{ json .Provenance }}'
+```
+
+CI images (`main`, `pr-<n>`, `<short-sha>`) are signed too, but carry no SBOM or provenance —
+those two commands return nothing for them, which is expected.
+
+Release binaries come with an SPDX SBOM each and a signed `checksums.txt`, which covers the
+binaries and their SBOMs:
+
+```bash
+cosign verify-blob \
+  --bundle checksums.txt.bundle \
+  --certificate-identity-regexp '^https://github.com/jabbrwcky/tranquila/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+sha256sum -c checksums.txt
+```
+
+Binaries are published for `linux` and `darwin` on `amd64` and `arm64`.
+
+The full rationale for this pipeline is in
+[docs/adr/0001-ci-cd-pipeline.md](docs/adr/0001-ci-cd-pipeline.md).
+
 ## Tests
 
 ```bash
