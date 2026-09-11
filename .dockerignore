@@ -1,0 +1,14 @@
+# The build context is the production Go module. Everything below is either
+# untracked local state or material the root `go build .` never reads, so
+# excluding it keeps doc- and CI-only commits from invalidating the COPY layer.
+.git
+.github
+.claude
+.envrc
+docs
+e2e
+*.md
+openapi.yaml
+dist
+tranquila
+*.rdb

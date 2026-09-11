@@ -339,3 +339,19 @@ Fault injection uses two tools because they work at different layers: Toxiproxy
 is L4 and cannot emit an HTTP status at all, so an in-process
 `httputil.ReverseProxy` injects 5xx responses — including non-XML gateway pages,
 the case that forces status-first classification.
+
+## Build and release
+
+The container image is built multi-stage onto distroless and cross-compiled: the builder stage
+runs `FROM --platform=$BUILDPLATFORM` and sets `GOOS`/`GOARCH` from `TARGETOS`/`TARGETARCH`, so
+`linux/amd64` and `linux/arm64` are two native compiles rather than one native and one under
+QEMU.
+
+`main.version` — the string kong reports through `--version` — is not read from anywhere at
+runtime. It is linked in at build time from the `VERSION` build argument via
+`-ldflags "-X main.version=…"`, which CI sets to the short commit sha and the release workflow
+sets to the git tag. A build with no `VERSION` argument reports `dev`.
+
+Releases rebuild from the tag rather than retagging the CI image, are signed with cosign and
+carry an SBOM. The reasoning, including what that costs and what it rules out, is in
+[adr/0001-ci-cd-pipeline.md](adr/0001-ci-cd-pipeline.md).

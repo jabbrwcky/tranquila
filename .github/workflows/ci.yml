@@ -1,102 +1,116 @@
 name: CI
 
 on:
-  push:
-    branches: ["**"]
   pull_request:
-    branches: ["main"]
+  push:
+    branches: [main]
+  # A branch with no open PR gets no image otherwise. Dispatching runs against
+  # the base repo with a full token and OIDC, so push and signing work as usual.
+  workflow_dispatch:
+
+# A PR gets a fresh run per push and the superseded one is pointless; main
+# pushes are not cancelled because each commit must produce its own image.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  # A push to a branch with an open PR would otherwise run this workflow twice
-  # (once for the push, once for the pull_request synchronize) against the
-  # same commit. On push, skip the real jobs when an open PR already covers
-  # the branch — the pull_request-triggered run covers it instead.
-  should-run-push:
-    name: Check for open PR (push dedup)
-    if: github.event_name == 'push'
+  checks:
+    uses: ./.github/workflows/go-checks.yml
+    permissions:
+      contents: read
+
+  # needs: checks keeps the guarantee the old workflow_run arrangement gave —
+  # no image ever exists for a commit whose tests failed.
+  image:
+    name: Image
+    needs: checks
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: read
-    outputs:
-      run: ${{ steps.check.outputs.run }}
+      contents: read
+      packages: write
+      id-token: write
     steps:
-      - name: Skip if an open PR already covers this branch
-        id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Pull requests from forks get no registry credentials and no OIDC token,
+      # so they build only and are not signed.
+      - name: Decide whether the image can be pushed
+        id: push
         run: |
-          count=$(gh pr list --repo "${{ github.repository }}" --head "${{ github.ref_name }}" --state open --json number --jq 'length')
-          if [ "$count" -gt 0 ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping push-triggered run — PR already covers ${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" != "pull_request" ] \
+            || [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
-            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
-  build-and-test:
-    name: Build & Test
-    needs: [should-run-push]
-    if: always() && (github.event_name != 'push' || needs.should-run-push.outputs.run == 'true')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # On pull_request the checked-out HEAD is the merge commit, which exists
+      # in no one's clone, so the tag comes from the head commit instead.
+      - name: Resolve the commit being built
+        id: commit
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: echo "short_sha=${SHA:0:7}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Log in to GitHub Container Registry
+        if: steps.push.outputs.enabled == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
-          go-version: '>=1.25.0'
-          check-latest: true
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build
-        run: go build ./...
-
-      - name: Test
-        run: go test ./...
-
-      # The e2e module is not covered by the commands above (go does not descend
-      # into nested modules), so vet it here to catch compile breakage even when
-      # the container-backed job is skipped.
-      - name: Vet e2e module
-        working-directory: e2e
-        run: go vet ./...
-
-  e2e:
-    name: End-to-End (MinIO + Toxiproxy)
-    needs: [should-run-push]
-    if: always() && (github.event_name != 'push' || needs.should-run-push.outputs.run == 'true')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - name: Collect image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index,manifest
         with:
-          go-version: '>=1.25.0'
-          check-latest: true
+          images: ${{ env.IMAGE }}
+          # :latest belongs to releases only, see docs/adr/0001-ci-cd-pipeline.md.
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ steps.commit.outputs.short_sha }}
+            type=ref,event=branch
+            type=ref,event=pr
 
-      # Docker is preinstalled on ubuntu-latest and testcontainers finds
-      # /var/run/docker.sock unaided, so no runtime setup is needed here. The
-      # podman handling in e2e/runtime_test.go is inert on this runner.
-      - name: Run end-to-end tests
-        working-directory: e2e
-        run: go test -v -timeout 30m ./...
-
-  vuln-check:
-    name: Vulnerability Check
-    needs: [should-run-push]
-    if: always() && (github.event_name != 'push' || needs.should-run-push.outputs.run == 'true')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      # provenance: false is deliberate — build-push-action would otherwise
+      # attach mode=min provenance, an extra manifest GHCR renders as an
+      # unknown/unknown row, asserting only what the cosign signature already
+      # proves cryptographically. Releases do carry full provenance.
+      - name: Build the image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
-          go-version: '>=1.25.0'
-          check-latest: true
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.push.outputs.enabled == 'true' }}
+          build-args: |
+            VERSION=${{ steps.commit.outputs.short_sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: steps.push.outputs.enabled == 'true'
 
-      - name: Run govulncheck
-        run: govulncheck ./...
+      # Keyless: the signing identity is this workflow's OIDC token, so there
+      # is no private key to hold. Signing by digest covers every tag at once.
+      # Skipped for fork builds, which export nothing and so have no digest.
+      - name: Sign the image
+        if: steps.push.outputs.enabled == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
