@@ -198,7 +198,12 @@ func (c *Client) wait(ctx context.Context) error {
 
 // recordOp records a completed S3 API call with operation name, bucket, success flag, and duration.
 func (c *Client) recordOp(ctx context.Context, op, bucket string, start time.Time, err error) {
-	class := Classify(err)
+	c.recordOpClass(ctx, op, bucket, start, err, Classify(err))
+}
+
+// recordOpClass is recordOp with an explicit congestion class, for callers
+// whose own context deadline makes Classify's reading of the error wrong.
+func (c *Client) recordOpClass(ctx context.Context, op, bucket string, start time.Time, err error, class ErrClass) {
 	status := "ok"
 	if err != nil {
 		status = "error"
@@ -451,6 +456,16 @@ const (
 	// concurrent load (many discovery + transfer calls at once) may need more
 	// than the default — see Config.ListAttemptTimeout.
 	defaultListAttemptTimeout = 60 * time.Second
+	// listAttemptTimeoutMaxFactor caps how far a timed-out attempt escalates
+	// the next attempt's deadline, as a multiple of the base timeout. Past
+	// this, a single page is so slow that the answer is a narrower prefix (or
+	// a healthier backend), not more waiting.
+	listAttemptTimeoutMaxFactor = 4
+	// listRetryBudget bounds the whole retry loop. Escalating deadlines would
+	// otherwise let an unanswerable prefix hold a discovery slot far longer
+	// than the fixed-deadline loop this replaces; the budget keeps the
+	// all-timeouts worst case at roughly what 8 fixed 60s attempts cost.
+	listRetryBudget = 10 * time.Minute
 )
 
 // listAttemptTimedOut reports whether a per-attempt sub-context — not the
@@ -463,33 +478,76 @@ func listAttemptTimedOut(outerCtx, attemptCtx context.Context, err error) bool {
 	return outerCtx.Err() == nil && attemptCtx.Err() != nil && errors.Is(err, context.DeadlineExceeded)
 }
 
+// listErrClass classifies one list attempt for the congestion controller.
+// A deadline the retry loop imposed on itself must count as congestion:
+// Classify maps context.DeadlineExceeded to ClassOK ("cancellation is our own
+// doing"), which is right for the caller's ctx but inverts the signal here.
+// The backend failing to answer in time is exactly what AIMD exists to back
+// off from, yet ClassOK feeds aimd.onHealthy(), which raises the rate limit
+// and resets consecFail — so concurrent discovery workers timing out in a
+// loop kept the endpoint pinned at "healthy" and never reached the fail
+// threshold, speeding up against a backend that was already too slow.
+// escalateListTimeout returns the deadline for the next attempt. Retrying a
+// deadline with the same deadline cannot succeed: if the backend needs 90s to
+// answer, every 60s attempt fails identically and the loop merely burns
+// listMaxRetries × timeout before giving up — observed in production as eight
+// consecutive ~60s failures on the same prefix. Only a timeout escalates; a
+// 504 needs another try, not a longer one.
+func escalateListTimeout(cur, max time.Duration, timedOut bool) time.Duration {
+	if !timedOut {
+		return cur
+	}
+	return min(cur*2, max)
+}
+
+func listErrClass(err error, timedOut bool) ErrClass {
+	if timedOut {
+		return ClassTransient
+	}
+	return Classify(err)
+}
+
 // listPageWithRetry fetches a single ListObjectsV2 page, retrying transient
 // errors (5xx, EOF, connection reset, broken pipe, or a per-attempt timeout)
 // with exponential backoff.
 func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, error) {
 	bucket := aws.ToString(input.Bucket)
 	prefix := aws.ToString(input.Prefix)
+	timeout := c.listAttemptTimeout
+	maxTimeout := c.listAttemptTimeout * listAttemptTimeoutMaxFactor
+	began := time.Now()
 	var err error
 	for attempt := range listMaxRetries {
 		if err = c.wait(ctx); err != nil {
 			return nil, err
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, c.listAttemptTimeout)
+		// Escalating deadlines can outrun listMaxRetries, so the budget — not
+		// the attempt count — is what bounds an unanswerable prefix.
+		remaining := listRetryBudget - time.Since(began)
+		if remaining <= 0 {
+			break
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, min(timeout, remaining))
 		start := time.Now()
 		var out *s3.ListObjectsV2Output
 		out, err = c.s3.ListObjectsV2(attemptCtx, input)
 		cancel()
-		c.recordOp(ctx, "ListObjectsV2", bucket, start, err)
+		timedOut := listAttemptTimedOut(ctx, attemptCtx, err)
+		c.recordOpClass(ctx, "ListObjectsV2", bucket, start, err, listErrClass(err, timedOut))
 		if err == nil {
 			return out, nil
 		}
-		if !isTransientErr(err) && !listAttemptTimedOut(ctx, attemptCtx, err) {
+		if !isTransientErr(err) && !timedOut {
 			return nil, err
 		}
+		timeout = escalateListTimeout(timeout, maxTimeout, timedOut)
 		delay := min(time.Duration(1<<uint(attempt))*time.Second, listMaxDelay)
 		// Jitter keeps replicas sharing an endpoint from retrying in lockstep.
 		delay += rand.N(delay / 2)
-		log.Warn().Err(err).Str("bucket", bucket).Str("prefix", prefix).Int("attempt", attempt+1).Dur("retry_in", delay).Msg("transient list error, retrying")
+		log.Warn().Err(err).Str("bucket", bucket).Str("prefix", prefix).
+			Int("attempt", attempt+1).Dur("retry_in", delay).
+			Dur("next_timeout", timeout).Bool("timed_out", timedOut).
+			Msg("transient list error, retrying")
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
