@@ -105,7 +105,7 @@ sync:
   workers: 10
   check-sizes: false        # re-sync if destination size differs from source
   discovery-batch-size: 100000  # objects per batch; sync drains before next batch starts
-  list-attempt-timeout: 0s              # per ListObjectsV2 attempt (0 = default 60s)
+  list-attempt-timeout: 0s              # starting ListObjectsV2 attempt timeout (0 = default 60s)
   sharded-discovery-concurrency: 0      # concurrent prefix listings in sharded mode (0 = default 4)
 
   # Continuous watch mode
@@ -250,7 +250,9 @@ Like `burn-after-reading`/`propagate-deletes`, this is only available via struct
 
 - `--discovery-batch-size`'s pause-while-a-batch-drains pacing doesn't apply to sharded discovery — there's no single continuation token for a tree walk to pause on. Backpressure instead comes from the same per-bucket worker cap (`--max-workers-per-bucket`) that already throttles flat discovery, which bounds it identically in practice.
 - A bucket with no `/`-delimited key structure gains nothing from sharding (there's nothing to shard by) but isn't harmed either — it just becomes one listing call at the root, same shape as flat.
-- Every `ListObjectsV2` attempt (flat or sharded) is individually bounded by `--list-attempt-timeout` (default 60s). A healthy call finishes in well under that; a hanging one now actually fails and retries instead of blocking a discovery goroutine forever.
+- Every `ListObjectsV2` attempt (flat or sharded) is individually bounded by `--list-attempt-timeout` (default 60s). A healthy call finishes in well under that; a hanging one fails and retries instead of blocking a discovery goroutine forever.
+- The flag sets the timeout for the **first** attempt only. Each attempt that times out doubles the deadline for the next one, up to 4x the configured value, because retrying a deadline with the same deadline cannot succeed — a prefix that genuinely needs 90s to list would otherwise fail identically on every attempt. Failures that are not timeouts (a 504, say) do not extend the deadline. The whole retry loop is capped at 10 minutes per page regardless.
+- A timed-out attempt counts as endpoint congestion, so it feeds the rate-limit degradation described above. Listings timing out under load will therefore slow tranquila down, which is usually what relieves the pressure causing them.
 
 **Tuning for a slow backend.** Sharding narrows *what* each listing call covers, but if the backend itself is slow per-call — regardless of how narrow the prefix is — narrower scope alone may not be enough once several listings run concurrently. Two knobs:
 

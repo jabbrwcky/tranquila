@@ -55,7 +55,7 @@ type SyncCmd struct {
 	DiscoveryBatchSize  int  `name:"discovery-batch-size" env:"TRANQUILA_DISCOVERY_BATCH_SIZE" default:"100000" help:"Objects to discover per bucket before syncing; next batch starts after sync drains (0 = default 100000)"`
 	MaxWorkersPerBucket int  `name:"max-workers-per-bucket" env:"TRANQUILA_MAX_WORKERS_PER_BUCKET" default:"0" help:"Cap on concurrent transfers for a single bucket, so one large bucket cannot starve others (0 = auto: half of --workers)"`
 
-	ListAttemptTimeout          time.Duration `name:"list-attempt-timeout" env:"TRANQUILA_LIST_ATTEMPT_TIMEOUT" default:"0" help:"Per-attempt timeout for a single ListObjectsV2 call, flat or sharded (0 = default 60s)"`
+	ListAttemptTimeout          time.Duration `name:"list-attempt-timeout" env:"TRANQUILA_LIST_ATTEMPT_TIMEOUT" default:"0" help:"Starting timeout for a single ListObjectsV2 attempt, flat or sharded; doubles after each timed-out attempt up to 4x (0 = default 60s)"`
 	ShardedDiscoveryConcurrency int           `name:"sharded-discovery-concurrency" env:"TRANQUILA_SHARDED_DISCOVERY_CONCURRENCY" default:"0" help:"Concurrent prefix listings during sharded discovery (0 = default 4); lower for a source backend whose LIST calls are slow even in isolation"`
 
 	Watch         bool          `name:"watch" env:"TRANQUILA_WATCH" default:"false" help:"Continuously re-run sync until interrupted"`
