@@ -31,6 +31,16 @@ General operating instructions for coding agents working in this repository.
   `chore/...`) and open a PR (`gh pr create`) for every change, so it goes
   through CI and is captured by automatic release-note generation. Do not merge
   the PR yourself unless explicitly asked to.
+- Check a feature branch out with `git worktree`, rather than switching the branch of an existing
+  clone:
+
+  ```bash
+  git worktree add ../tranquila-<topic> -b <branch> origin/main
+  git worktree remove ../tranquila-<topic>   # once the branch is merged
+  ```
+
+  Switching in place pulls the ground out from under whatever is using that working tree — a
+  running server, a live-reload watcher, an open editor.
 - Never run destructive git commands (for example force reset/checkout) unless explicitly requested.
 - Do not revert user changes that are unrelated to the task.
 - If unexpected modifications appear during work, pause and call them out.
