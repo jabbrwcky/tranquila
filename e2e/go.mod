@@ -1,12 +1,12 @@
 // Separate module so the container/test dependency graph (testcontainers, moby)
 // never reaches the production module or its govulncheck scope.
-module github.com/jabbrwcky/tranquila/e2e
+module github.com/pflege-de-labs/tranquila/e2e
 
 go 1.26.0
 
 require (
 	github.com/Shopify/toxiproxy/v2 v2.12.0
-	github.com/jabbrwcky/tranquila v0.0.0
+	github.com/pflege-de-labs/tranquila v0.0.0
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 )
@@ -100,4 +100,4 @@ require (
 	gopkg.in/ini.v1 v1.67.3 // indirect
 )
 
-replace github.com/jabbrwcky/tranquila => ../
+replace github.com/pflege-de-labs/tranquila => ../

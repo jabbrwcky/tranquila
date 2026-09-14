@@ -1,4 +1,6 @@
-tranquila
+# The built binary, anchored to the repo root: unanchored, this also matched
+# charts/tranquila/ and silently excluded the whole chart.
+/tranquila
 .envrc
 
 # Go
@@ -9,3 +11,6 @@ tranquila
 /dist/
 /vendor/
 *.rdb
+
+# helm-ls cache
+.helm_ls_cache/

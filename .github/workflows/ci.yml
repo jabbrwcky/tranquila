@@ -26,6 +26,75 @@ jobs:
     permissions:
       contents: read
 
+  chart:
+    name: Chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # helm ships on the runner image, so there is no action to pin here. The
+      # valkey dependency is vendored under charts/tranquila/charts, so neither
+      # lint nor template needs registry access.
+      - name: Lint every values combination
+        run: |
+          for values in charts/tranquila/ci/*-values.yaml; do
+            echo "::group::lint $values"
+            helm lint charts/tranquila --values "$values"
+            echo "::endgroup::"
+          done
+
+      # Each values file is a deployment shape that reaches templates the others
+      # do not: a bad edit breaks exactly one of them and nothing else notices.
+      - name: Render every deployment shape
+        run: |
+          for values in charts/tranquila/ci/*-values.yaml; do
+            echo "::group::template $values"
+            helm template tranquila charts/tranquila --values "$values"
+            echo "::endgroup::"
+          done
+
+      # Rendering proves the chart is not broken; it says nothing about a chart
+      # that is quietly wrong. These assert what actually comes out.
+      - name: Assert what the chart renders
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          # The credentials/config a user manages out of band must suppress the
+          # chart's own objects. Both keys are documented at the top level and
+          # were previously read from under `config`, so the documented form
+          # rendered a Secret anyway and failed on its `required` calls.
+          out=$(helm template tranquila charts/tranquila \
+                  --values charts/tranquila/ci/existing-secret-values.yaml)
+          echo "$out" | grep -q "name: tranquila-s3-credentials" \
+            || fail "existingSecret is not mounted"
+          echo "$out" | grep -q "name: tranquila-sync-config" \
+            || fail "existingConfig is not mounted"
+          if echo "$out" | grep -qE "^  name: tranquila-tranquila-config$"; then
+            fail "chart rendered its own config objects despite existingSecret/existingConfig"
+          fi
+
+          # The nested form predates the documented one and must keep working.
+          helm template tranquila charts/tranquila \
+            --set config.existingSecret=legacy-secret \
+            --set config.existing=legacy-cm >/dev/null \
+            || fail "nested config.existingSecret/config.existing no longer renders"
+
+          # Disabling the subchart must actually drop it.
+          if helm template tranquila charts/tranquila \
+               --values charts/tranquila/ci/external-redis-values.yaml \
+               | grep -q "valkey"; then
+            fail "valkey rendered while valkey.enabled=false"
+          fi
+
+          # The image default must track this repository, not the old owner.
+          helm template tranquila charts/tranquila \
+            --values charts/tranquila/ci/default-values.yaml \
+            | grep -q '"ghcr.io/pflege-de-labs/tranquila:' \
+            || fail "image default does not point at ghcr.io/pflege-de-labs/tranquila"
+
+          echo "chart render assertions passed"
+
   # needs: checks keeps the guarantee the old workflow_run arrangement gave —
   # no image ever exists for a commit whose tests failed.
   image:

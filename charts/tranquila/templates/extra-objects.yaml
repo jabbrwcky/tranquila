@@ -1,0 +1,16 @@
+{{- /*
+Render arbitrary extra Kubernetes resources from .Values.extraObjects.
+
+Accepts either a MAP (keys deep-merge across multiple values files) or a LIST
+(replaced, not merged, across values files). Each entry may be a plain YAML
+object or a string; both are passed through `tpl` so embedded {{ ... }}
+expressions are rendered while resources stay readable as plain YAML.
+*/ -}}
+{{- range $key, $value := .Values.extraObjects }}
+---
+{{- if typeIs "string" $value }}
+{{ tpl $value $ }}
+{{- else }}
+{{ tpl (toYaml $value) $ }}
+{{- end }}
+{{- end }}

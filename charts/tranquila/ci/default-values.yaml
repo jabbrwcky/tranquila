@@ -1,0 +1,13 @@
+# The out-of-the-box path: bundled valkey, no ingress, no autoscaling.
+config:
+  source:
+    accesskey: ci-source-key
+    secretkey: ci-source-secret
+  destination:
+    accesskey: ci-dest-key
+    secretkey: ci-dest-secret
+  buckets:
+    - source:
+        bucket: source-bucket
+      destination:
+        bucket: destination-bucket

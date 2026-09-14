@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/jabbrwcky/tranquila/internal/state"
-	"github.com/jabbrwcky/tranquila/internal/storage"
-	"github.com/jabbrwcky/tranquila/internal/watcher"
+	"github.com/pflege-de-labs/tranquila/internal/state"
+	"github.com/pflege-de-labs/tranquila/internal/storage"
+	"github.com/pflege-de-labs/tranquila/internal/watcher"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"go.opentelemetry.io/otel/attribute"

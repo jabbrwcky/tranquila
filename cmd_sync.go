@@ -13,13 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jabbrwcky/tranquila/config"
-	"github.com/jabbrwcky/tranquila/internal/api"
-	"github.com/jabbrwcky/tranquila/internal/state"
-	"github.com/jabbrwcky/tranquila/internal/storage"
-	internalsync "github.com/jabbrwcky/tranquila/internal/sync"
-	"github.com/jabbrwcky/tranquila/internal/telemetry"
-	"github.com/jabbrwcky/tranquila/internal/watcher"
+	"github.com/pflege-de-labs/tranquila/config"
+	"github.com/pflege-de-labs/tranquila/internal/api"
+	"github.com/pflege-de-labs/tranquila/internal/state"
+	"github.com/pflege-de-labs/tranquila/internal/storage"
+	internalsync "github.com/pflege-de-labs/tranquila/internal/sync"
+	"github.com/pflege-de-labs/tranquila/internal/telemetry"
+	"github.com/pflege-de-labs/tranquila/internal/watcher"
 	"github.com/rs/zerolog/log"
 )
 

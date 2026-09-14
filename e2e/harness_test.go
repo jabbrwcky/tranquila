@@ -13,8 +13,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/jabbrwcky/tranquila/internal/state"
-	"github.com/jabbrwcky/tranquila/internal/storage"
+	"github.com/pflege-de-labs/tranquila/internal/state"
+	"github.com/pflege-de-labs/tranquila/internal/storage"
 )
 
 const (

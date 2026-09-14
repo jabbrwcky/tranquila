@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/jabbrwcky/tranquila/internal/state"
-	internalsync "github.com/jabbrwcky/tranquila/internal/sync"
+	"github.com/pflege-de-labs/tranquila/internal/state"
+	internalsync "github.com/pflege-de-labs/tranquila/internal/sync"
 	"github.com/rs/zerolog/log"
 )
 

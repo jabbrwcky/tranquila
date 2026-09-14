@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jabbrwcky/tranquila/config"
-	internalsync "github.com/jabbrwcky/tranquila/internal/sync"
+	"github.com/pflege-de-labs/tranquila/config"
+	internalsync "github.com/pflege-de-labs/tranquila/internal/sync"
 )
 
 func cfgDuration(d time.Duration) *config.Duration {

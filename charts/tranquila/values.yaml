@@ -1,0 +1,318 @@
+# Default values for tranquila.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# This will set the replicaset count more information can be found here: https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/
+replicaCount: 1
+
+# This sets the container image more information can be found here: https://kubernetes.io/docs/concepts/containers/images/
+image:
+  repository: ghcr.io/pflege-de-labs/tranquila
+  # This sets the pull policy for images.
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+# This is for the secrets for pulling an image from a private repository more information can be found here: https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+imagePullSecrets: []
+# This is to override the chart name.
+nameOverride: ""
+fullnameOverride: ""
+
+# This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
+serviceAccount:
+  # Specifies whether a service account should be created.
+  create: true
+  # Automatically mount a ServiceAccount's API credentials?
+  automount: true
+  # Annotations to add to the service account.
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template.
+  name: ""
+
+# This is for setting Kubernetes Annotations to a Pod.
+# For more information checkout: https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/
+podAnnotations: {}
+# This is for setting Kubernetes Labels to a Pod.
+# For more information checkout: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/
+podLabels: {}
+
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+# Management API exposed by tranquila (--mgmt-addr / $MGMT_ADDR).
+# This is the port targeted by the Service, Ingress and HTTPRoute below.
+managementApi:
+  # Container port the management API listens on.
+  name: mgmt
+  port: 8080
+
+# This is for setting up a service that fronts the management API.
+# more information can be found here: https://kubernetes.io/docs/concepts/services-networking/service/
+service:
+  # This sets the service type more information can be found here: https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types
+  type: ClusterIP
+  # Port the service publishes; it forwards to the management API container port.
+  port: 8080
+
+# Prometheus / OpenTelemetry metrics exposed by tranquila
+# (--telemetry-exporter / --telemetry-addr).
+metrics:
+  enabled: false
+  type: prometheus # otlp, none
+  prometheus:
+    # Container port the telemetry endpoint listens on (--telemetry-addr ":9090").
+    name: metrics
+    port: 9090
+  otlp:
+    endpoint: localhost:4317
+  # Expose the metrics port on the Service.
+  service:
+    enabled: true
+  # Requires the Prometheus Operator CRDs and metrics.service.enabled.
+  serviceMonitor:
+    enabled: false
+    interval: ""
+    scrapeTimeout: ""
+    honorLabels: false
+    extraLabels: {}
+    annotations: {}
+    relabelings: []
+    metricRelabelings: []
+  # Requires the Prometheus Operator CRDs.
+  podMonitor:
+    enabled: false
+    interval: ""
+    scrapeTimeout: ""
+    honorLabels: false
+    extraLabels: {}
+    annotations: {}
+    relabelings: []
+    metricRelabelings: []
+
+# This block is for setting up the ingress for the management API.
+# more information can be found here: https://kubernetes.io/docs/concepts/services-networking/ingress/
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: tranquila.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+    # - secretName: tranquila-tls
+    #   hosts:
+    #     - tranquila.local
+
+# -- Expose the management API via gateway-api HTTPRoute
+# Requires Gateway API resources and suitable controller installed within the cluster
+# (see: https://gateway-api.sigs.k8s.io/guides/)
+httpRoute:
+  # HTTPRoute enabled.
+  enabled: false
+  # HTTPRoute annotations.
+  annotations: {}
+  # Which Gateways this Route is attached to.
+  parentRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: gateway
+    sectionName: http
+    # namespace: default
+  # Hostnames matching HTTP header.
+  hostnames:
+  - tranquila.local
+  # List of rules and filters applied.
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+  #   filters:
+  #   - type: RequestHeaderModifier
+  #     requestHeaderModifier:
+  #       set:
+  #       - name: My-Overwrite-Header
+  #         value: this-is-the-only-value
+  #       remove:
+  #       - User-Agent
+
+resources: {}
+  # We usually recommend not to specify default resources and to leave this as a conscious
+  # choice for the user. This also increases chances charts run on environments with little
+  # resources, such as Minikube. If you do want to specify resources, uncomment the following
+  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
+  # limits:
+  #   cpu: 100m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+# Liveness and readiness probes target the management API port.
+# Disabled by default; enable and set an endpoint your build exposes.
+# https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: mgmt
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: mgmt
+
+# This section is for setting up autoscaling more information can be found here: https://kubernetes.io/docs/concepts/workloads/autoscaling/
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+# Additional volumes on the output Deployment definition.
+volumes: []
+  # - name: foo
+  #   secret:
+  #     secretName: mysecret
+  #     optional: false
+
+# Additional volumeMounts on the output Deployment definition.
+volumeMounts: []
+  # - name: foo
+  #   mountPath: "/etc/foo"
+  #   readOnly: true
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# ---------------------------------------------------------------------------
+# Valkey (Redis-compatible) subchart used as tranquila's state/queue backend.
+# When enabled, this chart renders a Secret with the connection data tranquila
+# needs (REDIS_ADDR/REDIS_PASSWORD/REDIS_DB) — see the `redis` block below.
+# ---------------------------------------------------------------------------
+valkey:
+  enabled: true
+  dataStorage:
+    enabled: true
+    requestedSize: 5Gi
+  # auth:
+  #   enabled: true
+  #   aclUsers:
+  #     default:
+  #       password: "change-me"   # mirror into redis.password below
+
+# Redis/Valkey connection used by tranquila.
+#
+# - valkey.enabled=true  -> this chart CREATES the access secret. The address is
+#   derived from the subchart service ({release}-valkey:6379). Set `password`
+#   here to match valkey.auth if you enable authentication.
+# - valkey.enabled=false -> point `existingSecret` at a secret you manage, OR
+#   leave it empty and fill in `addr`/`password`/`db` to have this chart create
+#   the secret from these values.
+#
+# The secret must expose keys: REDIS_ADDR, REDIS_PASSWORD, REDIS_DB.
+redis:
+  # Name of a pre-existing secret holding REDIS_ADDR/REDIS_PASSWORD/REDIS_DB.
+  # When set, this chart does NOT create a redis secret.
+  existingSecret: ""
+  # Connection address "host:port". Leave empty to auto-derive from the valkey
+  # subchart when valkey.enabled=true.
+  addr: ""
+  # Password (matches valkey.auth when the subchart auth is enabled).
+  password: ""
+  # Logical database number.
+  db: 0
+
+existingConfig: ""
+
+# S3 source/destination credentials. Rendered into a Secret (see secret.yaml)
+# and injected as SOURCE_*/DEST_* env vars. Point `existingSecret` at your own
+# secret to manage these out of band instead.
+existingSecret: ""
+
+# Tranquila sync configuration.
+config:
+  workers: 10
+  # set false to delete source objects after transferring
+  dryRun: true
+  # Log settings ($TRANQUILA_LOG_LEVEL / $TRANQUILA_LOG_JSON).
+  logLevel: info
+  logJson: false
+
+  source:
+    endpoint: ""
+    region: us-east-1
+    rateLimit: 0
+    accesskey: ""
+    secretkey: ""
+
+  destination:
+    endpoint: ""
+    region: us-east-1
+    rateLimit: 0
+    accesskey: ""
+    secretkey: ""
+    # Prefix prepended to auto-discovered destination bucket names.
+    bucketPrefix: ""
+
+  watch:
+    enabled: true
+    mode: poll
+    # configure sqs URL if mode is set to SQS
+    sqsQueueUrl: ""
+
+  buckets: []
+    # - source:
+    #     bucket: foo
+    #   destination:
+    #     bucket: bar
+    #   # burn-after-reading: true
+    #   # sharded-discovery: true
+    #   # propagate-deletes: true
+
+  # Free-form extra environment variables for the tranquila container.
+extraEnv: {}
+  # TRANQUILA_WORKERS: "20"
+  # TRANQUILA_WATCH: "true"
+
+# ---------------------------------------------------------------------------
+# extraObjects: deploy arbitrary additional Kubernetes resources alongside the
+# chart.
+#
+# Two accepted forms:
+#   * MAP (recommended) — keyed by an arbitrary name. Maps deep-merge across
+#     multiple `-f values.yaml` files, so entries from different files combine
+#     instead of replacing each other.
+#   * LIST — a plain YAML list. Simpler, but Helm REPLACES lists across values
+#     files (the last `-f` wins), so cross-file merging is NOT possible.
+#
+# Each entry may be a plain YAML object OR a (multi-line) string. Both are run
+# through `tpl`, so you can embed `{{ ... }}` template expressions while still
+# writing plain YAML.
+extraObjects: {}
+  # configmap-extra:                       # <- merge key (map form)
+  #   apiVersion: v1
+  #   kind: ConfigMap
+  #   metadata:
+  #     name: "{{ include \"tranquila.fullname\" . }}-extra"
+  #     labels:
+  #       {{- include "tranquila.labels" . | nindent 6 }}
+  #   data:
+  #     release: "{{ .Release.Name }}"

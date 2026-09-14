@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tranquila.fullname" . }}
+  labels:
+    {{- include "tranquila.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "tranquila.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- /* roll pods when the rendered config/secrets change */}}
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+        checksum/secret-config: {{ include (print $.Template.BasePath "/secret-config.yaml") . | sha256sum }}
+        checksum/secret-redis: {{ include (print $.Template.BasePath "/secret-redis.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "tranquila.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "tranquila.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- if and .Values.metrics.enabled (eq .Values.metrics.type "prometheus") }}
+            - "--telemetry-addr=:{{ .Values.metrics.prometheus.port }}"
+            {{- end }}
+            - "--configFile=/etc/tranquila/tranquila.yaml"
+          {{- with .Values.config.args }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name:  {{ .Values.managementApi.name }}
+              containerPort: {{ .Values.managementApi.port }}
+              protocol: TCP
+            {{- if and .Values.metrics.enabled (eq .Values.metrics.type "prometheus") }}
+            - name: {{  .Values.metrics.prometheus.name }}
+              containerPort: {{ .Values.metrics.prometheus.port }}
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- range $k, $v := .Values.config.extraEnv }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          envFrom:
+            - secretRef:
+                name: {{ include "tranquila.redisSecretName" . }}
+            - secretRef:
+                name: {{ include "tranquila.configSecretName" . }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - mountPath: /etc/tranquila
+              name: config
+              readOnly: true
+          {{- with .Values.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - configMap:
+            name: {{ include "tranquila.configMapName" . }}
+          name: config
+      {{- with .Values.volumes }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -117,6 +117,8 @@ Two traps worth not rediscovering:
 
 Rationale in [docs/adr/0003-dependency-update-policy.md](docs/adr/0003-dependency-update-policy.md).
 
+- **The Helm chart lives in this repo at `charts/tranquila`, and its two "bring your own" values were dead on arrival** — the chart moved out of `pflege-de/helm-charts` during the org migration. `values.yaml` documents top-level `existingSecret` and `existingConfig`, but the templates read `config.existingSecret` and `config.existing` (the latter a key that exists nowhere in `values.yaml`), so the documented spelling was unreachable — and `existingSecret` did not merely no-op, the render *failed* on the `required` calls guarding the credential keys. The helpers `tranquila.existingSecret`/`tranquila.existingConfig` now prefer the top-level key and fall back to the nested one, because reading only the documented key would break every values file that had worked around the bug using the spelling the chart's own notes recommended. The chart is versioned independently of the application (`appVersion` tracks the app), so a push to `main` raising `version` in `Chart.yaml` publishes it and nothing else does. CI's `chart` job lints and renders every combination under `charts/tranquila/ci/` and then asserts what came out — rendering proves a chart is not broken, it says nothing about a chart that is quietly wrong, which is exactly what this bug was. See [docs/adr/0005-repository-and-chart-consolidation.md](docs/adr/0005-repository-and-chart-consolidation.md).
+
 ## Configuration Reference (YAML)
 
 All of the below nests under a top-level `sync:` key — `Source`/`Destination`/`Buckets`/etc.
@@ -180,7 +182,7 @@ sync:
 | Scope | Command | Notes |
 | --- | --- | --- |
 | Unit | `go test ./...` | Stdlib `testing`, table-driven. No containers, no sleeps. |
-| End-to-end | `cd e2e && go test ./...` | Separate module (`github.com/jabbrwcky/tranquila/e2e`) with a `replace` to `../`. Root `go test ./...` does not descend into it. |
+| End-to-end | `cd e2e && go test ./...` | Separate module (`github.com/pflege-de-labs/tranquila/e2e`) with a `replace` to `../`. Root `go test ./...` does not descend into it. |
 
 The e2e module is separate on purpose: testcontainers pulls ~89 transitive
 dependencies (moby, containerd) that must not enter the production module graph

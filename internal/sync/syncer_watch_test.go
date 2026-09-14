@@ -9,7 +9,7 @@ import (
 	"time"
 
 	smithy "github.com/aws/smithy-go"
-	"github.com/jabbrwcky/tranquila/internal/watcher"
+	"github.com/pflege-de-labs/tranquila/internal/watcher"
 	"go.opentelemetry.io/otel/metric/noop"
 )
 
