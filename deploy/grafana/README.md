@@ -29,6 +29,53 @@ providers:
 A provisioned dashboard resolves `${DS_PROMETHEUS}` against the data source selected in the
 variable picker, so the datasource variable is kept rather than hard-coded.
 
+## Install with grafana-operator
+
+For a cluster running [grafana-operator](https://github.com/grafana/grafana-operator) v5, the
+dashboard ships as a `GrafanaDashboard` custom resource:
+
+```shell
+kubectl apply -k deploy/grafana
+```
+
+That generates a ConfigMap holding the dashboard model and a `GrafanaDashboard` referencing it.
+The model is **not** inlined in the CR — it is read from `tranquila-dashboard.json`, the same file
+the UI import path uses, so the two cannot drift apart.
+
+Without kustomize, the same two objects by hand:
+
+```shell
+kubectl create configmap tranquila-dashboard --from-file=tranquila-dashboard.json
+kubectl apply -f deploy/grafana/grafanadashboard.yaml
+```
+
+Two things usually need editing in [`grafanadashboard.yaml`](grafanadashboard.yaml):
+
+* **`spec.instanceSelector`** must match the labels on your `Grafana` CR. It ships as
+  `dashboards: grafana`, the operator's own example label. If it does not match, nothing is
+  imported and the CR's status reports `NoMatchingInstances` — the apply itself still succeeds,
+  so check the status rather than the exit code.
+* **`spec.allowCrossNamespaceImport`** must be set if the `Grafana` CR is in another namespace.
+  It defaults to false, and turning it back off later requires recreating the resource.
+
+The datasource needs no configuration: it is a template variable, and Grafana resolves it to the
+default Prometheus datasource with no input. This was verified by loading the model with no
+datasource selected and no URL parameters — the picker resolved itself and every panel returned
+data. If you run more than one Prometheus, or want the choice declarative rather than defaulted,
+pin it with `spec.variables` (commented out in the manifest):
+
+```yaml
+  variables:
+    - name: DS_PROMETHEUS
+      value: prometheus       # datasource UID or name
+```
+
+Editing the ConfigMap is enough to roll out a dashboard change — the operator re-reads the model
+every `spec.resyncPeriod` (10m as shipped), and nothing needs restarting. The generated ConfigMap
+deliberately has **no name hash**: kustomize rewrites ConfigMap references in built-in types but
+not in a custom resource's `spec.configMapRef`, so a hashed name would leave the CR pointing at a
+name that does not exist.
+
 ## Scrape configuration
 
 Run tranquila with the Prometheus exporter (the default; `--telemetry-addr` defaults to `:8081`):

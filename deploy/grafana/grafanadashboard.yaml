@@ -1,0 +1,42 @@
+# Dashboard for grafana-operator v5 (grafana.integreatly.org/v1beta1).
+#
+# The dashboard model is not inlined here: it is read from a ConfigMap generated
+# from tranquila-dashboard.json, so the JSON has exactly one copy in this
+# repository and the import path and the operator path can never drift apart.
+# `kubectl apply -k deploy/grafana` generates that ConfigMap; see README.md for
+# applying this without kustomize.
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: tranquila
+spec:
+  # Required. Must match the labels on the Grafana CR this should be imported
+  # into — `dashboards: grafana` is the operator's own example label, so change
+  # it if your Grafana instance is labelled differently, or nothing imports and
+  # the CR reports NoMatchingInstances.
+  instanceSelector:
+    matchLabels:
+      dashboards: "grafana"
+
+  folder: Tranquila
+
+  # The operator re-reads the model on this interval, so editing the ConfigMap
+  # is enough to roll out a dashboard change; there is nothing to restart.
+  resyncPeriod: 10m
+
+  configMapRef:
+    name: tranquila-dashboard
+    key: tranquila-dashboard.json
+
+  # Set this if the Grafana CR lives in a different namespace than this
+  # resource. It defaults to false, and disabling it again needs a recreate.
+  # allowCrossNamespaceImport: true
+
+  # The dashboard's datasource is a template variable, and Grafana resolves it
+  # to the default Prometheus datasource with no input — verified by loading
+  # this model with no datasource selected. Pin it only if you have more than
+  # one Prometheus, or want the choice to be declarative rather than defaulted.
+  # The value is a datasource UID or name.
+  # variables:
+  #   - name: DS_PROMETHEUS
+  #     value: prometheus

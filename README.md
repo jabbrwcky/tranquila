@@ -515,8 +515,9 @@ rate(tranquila_sync_cycle_failures_total[15m]) > 0
 
 [`deploy/grafana/tranquila-dashboard.json`](deploy/grafana/tranquila-dashboard.json) is a
 ready-to-import dashboard covering sync progress, failures, endpoint health and per-bucket
-detail. Import it through Dashboards → New → Import, or provision it from a file; see
-[deploy/grafana/README.md](deploy/grafana/README.md) for both, and for the blind spots the
+detail. Import it through Dashboards → New → Import, provision it from a file, or apply it as a
+grafana-operator `GrafanaDashboard` with `kubectl apply -k deploy/grafana`; see
+[deploy/grafana/README.md](deploy/grafana/README.md) for all three, and for the blind spots the
 dashboard cannot cover — most importantly that `tranquila.s3.operation.duration` uses the
 OpenTelemetry default bucket boundaries, whose largest finite bucket is 10 s, so no panel shows
 a latency quantile above that.
