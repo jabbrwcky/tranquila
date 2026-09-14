@@ -80,6 +80,7 @@ type Client struct {
 	shardedDiscoveryConcurrency int
 	checkpoints                 DiscoveryCheckpointer // nil = checkpointing disabled
 	discoveryPrefixBudget       time.Duration
+	listRetryBudget             time.Duration
 }
 
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
@@ -149,6 +150,7 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 		shardedDiscoveryConcurrency: shardedDiscoveryConcurrency,
 		checkpoints:                 cfg.DiscoveryCheckpoints,
 		discoveryPrefixBudget:       discoveryPrefixBudget,
+		listRetryBudget:             defaultListRetryBudget,
 	}
 	if err := c.initMetrics(cfg); err != nil {
 		return nil, err
@@ -426,6 +428,9 @@ func (c *Client) ListObjectsPage(ctx context.Context, bucket, prefix string, tok
 		if err != nil {
 			return collected, nil, &ListError{Bucket: bucket, Err: err}
 		}
+		if page == nil {
+			return collected, nil, &ListError{Bucket: bucket, Err: errNilListPage}
+		}
 
 		pageNum++
 		objs := objectsFromContents(bucket, page.Contents)
@@ -480,11 +485,12 @@ const (
 	// this, a single page is so slow that the answer is a narrower prefix (or
 	// a healthier backend), not more waiting.
 	listAttemptTimeoutMaxFactor = 4
-	// listRetryBudget bounds the whole retry loop. Escalating deadlines would
-	// otherwise let an unanswerable prefix hold a discovery slot far longer
-	// than the fixed-deadline loop this replaces; the budget keeps the
+	// defaultListRetryBudget bounds the whole retry loop. Escalating deadlines
+	// would otherwise let an unanswerable prefix hold a discovery slot far
+	// longer than the fixed-deadline loop this replaces; the budget keeps the
 	// all-timeouts worst case at roughly what 8 fixed 60s attempts cost.
-	listRetryBudget = 10 * time.Minute
+	// Overridable per Client only as a test seam; no Config field or flag.
+	defaultListRetryBudget = 10 * time.Minute
 )
 
 // listAttemptTimedOut reports whether a per-attempt sub-context — not the
@@ -526,6 +532,13 @@ func listErrClass(err error, timedOut bool) ErrClass {
 	return Classify(err)
 }
 
+// errNilListPage guards the two call sites against a nil page: an empty result
+// with no error crashed a pod in production (a limiter wait clobbered the retry
+// loop's err). listPageWithRetry now enforces the invariant itself, so this is
+// belt-and-braces — a panic here kills discovery, the transfer pool and the
+// mgmt server's probes with it.
+var errNilListPage = errors.New("list returned no page and no error")
+
 // listPageWithRetry fetches a single ListObjectsV2 page, retrying transient
 // errors (5xx, EOF, connection reset, broken pipe, or a per-attempt timeout)
 // with exponential backoff.
@@ -537,12 +550,14 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 	began := time.Now()
 	var err error
 	for attempt := range listMaxRetries {
-		if err = c.wait(ctx); err != nil {
-			return nil, err
+		// Scoped, not assigned to err: a successful wait would otherwise erase
+		// the failure the loop is about to report (see the budget break below).
+		if werr := c.wait(ctx); werr != nil {
+			return nil, werr
 		}
 		// Escalating deadlines can outrun listMaxRetries, so the budget — not
 		// the attempt count — is what bounds an unanswerable prefix.
-		remaining := listRetryBudget - time.Since(began)
+		remaining := c.listRetryBudget - time.Since(began)
 		if remaining <= 0 {
 			break
 		}
@@ -563,6 +578,8 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 		delay := min(time.Duration(1<<uint(attempt))*time.Second, listMaxDelay)
 		// Jitter keeps replicas sharing an endpoint from retrying in lockstep.
 		delay += rand.N(delay / 2)
+		// Never sleep past the budget: the next iteration would only break.
+		delay = min(delay, remaining)
 		log.Warn().Err(err).Str("bucket", bucket).Str("prefix", prefix).
 			Int("attempt", attempt+1).Dur("retry_in", delay).
 			Dur("next_timeout", timeout).Bool("timed_out", timedOut).
@@ -573,7 +590,14 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 			return nil, ctx.Err()
 		}
 	}
-	return nil, err
+	// Invariant: a nil page is never returned with a nil error. Both exits
+	// (retry count and budget) leave err holding the last attempt's failure;
+	// synthesize one only if the loop somehow ran no attempt at all.
+	if err == nil {
+		err = fmt.Errorf("no attempt completed")
+	}
+	return nil, fmt.Errorf("list retries exhausted after %s: %w",
+		time.Since(began).Round(time.Second), err)
 }
 
 // listDelimitedFn lists one page of a delimiter-scoped listing at prefix,
@@ -683,6 +707,9 @@ func (c *Client) listDelimitedPage(bucket string) listDelimitedFn {
 		page, err := c.listPageWithRetry(ctx, input)
 		if err != nil {
 			return nil, nil, nil, &ListError{Bucket: bucket, Err: fmt.Errorf("prefix %q: %w", prefix, err)}
+		}
+		if page == nil {
+			return nil, nil, nil, &ListError{Bucket: bucket, Err: fmt.Errorf("prefix %q: %w", prefix, errNilListPage)}
 		}
 		objs := objectsFromContents(bucket, page.Contents)
 		prefixes := make([]string, 0, len(page.CommonPrefixes))
