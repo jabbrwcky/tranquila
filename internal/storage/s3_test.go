@@ -127,7 +127,7 @@ func TestListObjectsTree(t *testing.T) {
 		return nil
 	}
 
-	if err := listObjectsTree(context.Background(), "", list, onPage, defaultShardedDiscoveryConcurrency, 0, nil); err != nil {
+	if err := listObjectsTree(context.Background(), "b", "", list, onPage, defaultShardedDiscoveryConcurrency, 0, nil); err != nil {
 		t.Fatalf("listObjectsTree: %v", err)
 	}
 
@@ -157,7 +157,7 @@ func TestListObjectsTreeConcurrencyBounded(t *testing.T) {
 		return nil
 	}
 
-	if err := listObjectsTree(context.Background(), "", list, onPage, concurrency, 0, nil); err != nil {
+	if err := listObjectsTree(context.Background(), "b", "", list, onPage, concurrency, 0, nil); err != nil {
 		t.Fatalf("listObjectsTree: %v", err)
 	}
 	if count != n {
@@ -185,7 +185,7 @@ func TestListObjectsTreeListErrorPropagates(t *testing.T) {
 		return node.objs, node.subPrefixes, nil, nil
 	}
 
-	err := listObjectsTree(context.Background(), "", list, func([]Object) error { return nil }, defaultShardedDiscoveryConcurrency, 0, nil)
+	err := listObjectsTree(context.Background(), "b", "", list, func([]Object) error { return nil }, defaultShardedDiscoveryConcurrency, 0, nil)
 	if !errors.Is(err, wantErr) {
 		t.Errorf("got err %v, want %v", err, wantErr)
 	}
@@ -215,7 +215,7 @@ func TestListObjectsTreeFailedPrefixDoesNotAbortWalk(t *testing.T) {
 	}
 
 	var got []string
-	err := listObjectsTree(context.Background(), "", list, func(objs []Object) error {
+	err := listObjectsTree(context.Background(), "b", "", list, func(objs []Object) error {
 		for _, o := range objs {
 			got = append(got, o.Key)
 		}
@@ -250,7 +250,7 @@ func TestListObjectsTreeReportsCappedPrefixErrors(t *testing.T) {
 		return nil, nil, nil, fmt.Errorf("prefix %s failed", prefix)
 	}
 
-	err := listObjectsTree(context.Background(), "", list, func([]Object) error { return nil }, 2, 0, nil)
+	err := listObjectsTree(context.Background(), "b", "", list, func([]Object) error { return nil }, 2, 0, nil)
 	if err == nil {
 		t.Fatal("expected an error when every prefix fails")
 	}
@@ -272,7 +272,7 @@ func TestListObjectsTreeOnPageErrorPropagates(t *testing.T) {
 	tree := map[string]treeNode{"": {objs: []Object{{Key: "root.txt"}}}}
 	list := fakeTree(t, tree, 0, nil, nil)
 
-	err := listObjectsTree(context.Background(), "", list, func([]Object) error { return wantErr }, defaultShardedDiscoveryConcurrency, 0, nil)
+	err := listObjectsTree(context.Background(), "b", "", list, func([]Object) error { return wantErr }, defaultShardedDiscoveryConcurrency, 0, nil)
 	if !errors.Is(err, wantErr) {
 		t.Errorf("got err %v, want %v", err, wantErr)
 	}
