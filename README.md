@@ -1,3 +1,4 @@
+<p align="center"><img src="tranquila.png" width="300px"></p>
 # tranquila
 
 A distributed S3 bucket synchronization tool. Tranquila copies objects from source S3 buckets to a destination S3-compatible endpoint, tracking state in Redis so syncs are resumable across runs.
