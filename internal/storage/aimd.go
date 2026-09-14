@@ -32,9 +32,18 @@ type aimd struct {
 	base  rate.Limit // configured ceiling; rate.Inf = unlimited, never degraded
 	failN int
 
-	mu         sync.Mutex
-	current    rate.Limit
-	consecFail int
+	mu      sync.Mutex
+	current rate.Limit
+	// failScore is a leaky bucket, not a consecutive-failure count: a failure
+	// adds one, a healthy call removes one, and the rate halves when it reaches
+	// failN. It used to be zeroed by any healthy call, which made the threshold
+	// nearly unreachable on a client that multiplexes concurrent work — one
+	// endpoint serves discovery listings and the transfer pool at once, so a
+	// single successful GetObject erased an arbitrarily long run of ListObjectsV2
+	// timeouts and the endpoint stayed pinned at "healthy" while it was visibly
+	// failing. "Consecutive" is not a meaningful property of interleaved
+	// concurrent calls; outnumbering is.
+	failScore  int
 	healthyOps int
 	since      time.Time
 }
@@ -47,18 +56,19 @@ func newAIMD(lim *rate.Limiter, base rate.Limit, failN int) *aimd {
 }
 
 // onCongestion records a transient or throttle failure, halving the rate once
-// failN consecutive failures have accrued. A throttle is unambiguous
+// the failure score reaches failN — that is, once failures have outnumbered
+// healthy calls by failN (see failScore). A throttle is unambiguous
 // back-pressure and acts on the first signal. Reports whether the rate changed.
 func (a *aimd) onCongestion(throttle bool) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	a.healthyOps = 0
-	a.consecFail++
-	if !throttle && a.consecFail < a.failN {
+	a.failScore++
+	if !throttle && a.failScore < a.failN {
 		return false
 	}
-	a.consecFail = 0
+	a.failScore = 0
 
 	// An endpoint the operator declined to cap has no ceiling to halve, and
 	// inventing one would throttle a healthy endpoint.
@@ -84,7 +94,13 @@ func (a *aimd) onHealthy() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.consecFail = 0
+	// Decay by one rather than zeroing: see failScore. The asymmetry with
+	// healthyOps below — which a single failure does still reset — is the
+	// deliberate congestion-control posture of backing off readily and ramping
+	// up only from a genuinely quiet endpoint.
+	if a.failScore > 0 {
+		a.failScore--
+	}
 	if a.current == a.base {
 		return false
 	}

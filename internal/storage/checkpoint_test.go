@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // treePages is a multi-page fake prefix. Page i is addressed by continuation
@@ -151,7 +152,7 @@ func collectKeys(t *testing.T, list listDelimitedFn, ckpt prefixCheckpoint, ops 
 			}
 		}
 		return nil
-	}, 1, ckpt)
+	}, 1, 0, ckpt)
 	return got, err
 }
 
@@ -264,7 +265,7 @@ func TestListObjectsTreeCheckpointSavedAfterOnPage(t *testing.T) {
 			ops = append(ops, "page:"+o.Key)
 		}
 		return nil
-	}, defaultShardedDiscoveryConcurrency, ckpt)
+	}, defaultShardedDiscoveryConcurrency, 0, ckpt)
 	if err != nil {
 		t.Fatalf("listObjectsTree: %v", err)
 	}
@@ -291,7 +292,7 @@ func TestListObjectsTreeOnPageErrorDoesNotSaveCheckpoint(t *testing.T) {
 	wantErr := errors.New("mark pending failed")
 
 	err := listObjectsTree(context.Background(), "", list,
-		func([]Object) error { return wantErr }, 1, ckpt)
+		func([]Object) error { return wantErr }, 1, 0, ckpt)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("got err %v, want it to wrap %v", err, wantErr)
 	}
@@ -398,5 +399,77 @@ func TestListObjectsTreeCheckpointErrorsAreNonFatal(t *testing.T) {
 				t.Errorf("delivered %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+// A prefix must yield its worker slot once its budget is spent, so a handful of
+// pathological prefixes cannot monopolise every slot and leave the rest of the
+// bucket unlisted — and with checkpointing on, the pages it did manage are
+// banked rather than thrown away.
+func TestListObjectsTreePrefixBudgetYieldsAndBanksProgress(t *testing.T) {
+	const pageDelay = 40 * time.Millisecond
+	// Enough budget for a page or two, nowhere near enough for all six.
+	const budget = 110 * time.Millisecond
+
+	// An endlessly paginating prefix: without a budget this never returns. The
+	// delay honours ctx, as the real SDK call does — a fake that slept through
+	// cancellation would make the budget look ineffective.
+	slow := func(ctx context.Context, _ string, token *string) ([]Object, []string, *string, error) {
+		select {
+		case <-time.After(pageDelay):
+		case <-ctx.Done():
+			return nil, nil, nil, ctx.Err()
+		}
+		idx := 0
+		if token != nil {
+			n, err := strconv.Atoi(*token)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			idx = n
+		}
+		next := strconv.Itoa(idx + 1)
+		return []Object{obj("k" + strconv.Itoa(idx))}, nil, &next, nil
+	}
+
+	ckpt := newFakeCheckpoint(nil)
+	var got []string
+	err := listObjectsTree(context.Background(), "", slow, func(objs []Object) error {
+		for _, o := range objs {
+			got = append(got, o.Key)
+		}
+		return nil
+	}, 1, budget, ckpt)
+
+	if err == nil {
+		t.Fatal("expected the prefix to report stopping early")
+	}
+	if len(got) == 0 {
+		t.Fatal("budget expired before a single page was delivered; the test budget is too tight")
+	}
+	// The prefix paginates forever, so finishing at all means the budget did
+	// its job; the count just has to be in the ballpark the budget allows.
+	if maxPages := 6; len(got) > maxPages {
+		t.Errorf("delivered %d pages on a %v budget at %v per page, want the cutoff to bite sooner",
+			len(got), budget, pageDelay)
+	}
+	// The whole point: progress survives the cutoff.
+	if tok := ckpt.snapshot()[""]; tok == "" {
+		t.Error("no checkpoint written, so the pages listed before the cutoff would be re-listed next cycle")
+	}
+}
+
+// A budget of zero means unbounded, so an existing slow-but-completing walk is
+// not silently truncated by the plumbing.
+func TestListObjectsTreeZeroPrefixBudgetIsUnbounded(t *testing.T) {
+	list := fakePagedTree(t, map[string]treePages{
+		"": pagedLeaf([]string{"a"}, []string{"b"}, []string{"c"}),
+	})
+	got, err := collectKeys(t, list, nil, nil)
+	if err != nil {
+		t.Fatalf("listObjectsTree: %v", err)
+	}
+	if want := []string{"a", "b", "c"}; !slices.Equal(got, want) {
+		t.Errorf("delivered %v, want %v", got, want)
 	}
 }
