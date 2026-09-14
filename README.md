@@ -107,6 +107,7 @@ sync:
   discovery-batch-size: 100000  # objects per batch; sync drains before next batch starts
   list-attempt-timeout: 0s              # starting ListObjectsV2 attempt timeout (0 = default 60s)
   sharded-discovery-concurrency: 0      # concurrent prefix listings in sharded mode (0 = default 4)
+  discovery-prefix-budget: 0s           # per-prefix listing budget per cycle (0 = default 10m, negative = unbounded)
   discovery-checkpoints: true           # resume a failed prefix where it stopped, not from page 1
   discovery-checkpoint-ttl: 24h         # how long an unrefreshed resume point survives
 
@@ -295,6 +296,11 @@ Details worth knowing:
 - This does not make listings faster. It stops the work being thrown away. If nearly every page
   times out you will still want `--sharded-discovery-concurrency` lowered; checkpointing is what
   makes lowering it safe, since a slower walk that also restarts every cycle is worse.
+- Each prefix gets a bounded turn (`--discovery-prefix-budget`, default 10m) before it yields its
+  worker slot. Without that bound a handful of pathological prefixes could hold every slot for
+  hours and the rest of the bucket was never listed at all in that cycle. Being cut off is cheap
+  because the checkpoint is already banked — the prefix resumes next cycle from the page it
+  stopped on. Set it negative to restore the old unbounded behaviour.
 - Watch for `sharded discovery: resuming prefix from stored checkpoint` at info level. An `Error`
   line naming a prefix that resumed and listed **zero** pages before failing means that prefix is
   pinned on a page the backend cannot answer at all; it will stay there until the TTL expires.

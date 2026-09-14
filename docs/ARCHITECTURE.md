@@ -129,6 +129,12 @@ Three properties are load-bearing:
   locking. Writing it from the producer would let a token be persisted before — or without — the
   objects it skips ever reaching `onPage`.
 
+Each prefix also gets a bounded turn (`--discovery-prefix-budget`, default 10m). `listRetryBudget`
+only bounds one *page*'s retry loop, so before this a prefix with many slow pages could hold a
+worker slot for hours while every other prefix waited — on a bucket with hundreds of prefixes a
+handful of pathological ones monopolised every slot and the rest went unlisted for the whole cycle.
+Yielding is cheap precisely because checkpoints exist: the prefix resumes from where it stopped.
+
 Checkpoint errors are never fatal; they degrade a prefix to the un-checkpointed behaviour. An
 abandoned resume point expires via TTL, which bounds the one new failure mode: a page the backend
 can never answer parks its prefix until the checkpoint expires. Full rationale in

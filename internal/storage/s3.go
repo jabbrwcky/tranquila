@@ -46,6 +46,11 @@ type Config struct {
 	// discovery walk (nil = disabled, every prefix lists from its first page on
 	// every cycle). Only meaningful on the source client.
 	DiscoveryCheckpoints DiscoveryCheckpointer
+	// DiscoveryPrefixBudget bounds how long one prefix may be listed in a single
+	// sharded walk before it yields its worker slot (0 = default
+	// defaultDiscoveryPrefixBudget, negative = unbounded). Only meaningful on
+	// the source client.
+	DiscoveryPrefixBudget time.Duration
 }
 
 type Object struct {
@@ -74,6 +79,7 @@ type Client struct {
 	listAttemptTimeout          time.Duration
 	shardedDiscoveryConcurrency int
 	checkpoints                 DiscoveryCheckpointer // nil = checkpointing disabled
+	discoveryPrefixBudget       time.Duration
 }
 
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
@@ -126,6 +132,12 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	if shardedDiscoveryConcurrency <= 0 {
 		shardedDiscoveryConcurrency = defaultShardedDiscoveryConcurrency
 	}
+	// Negative means "no budget"; zero means "use the default", matching the
+	// 0-is-the-default convention of the flags around it.
+	discoveryPrefixBudget := cfg.DiscoveryPrefixBudget
+	if discoveryPrefixBudget == 0 {
+		discoveryPrefixBudget = defaultDiscoveryPrefixBudget
+	}
 
 	c := &Client{
 		s3:                          s3c,
@@ -136,6 +148,7 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 		listAttemptTimeout:          listAttemptTimeout,
 		shardedDiscoveryConcurrency: shardedDiscoveryConcurrency,
 		checkpoints:                 cfg.DiscoveryCheckpoints,
+		discoveryPrefixBudget:       discoveryPrefixBudget,
 	}
 	if err := c.initMetrics(cfg); err != nil {
 		return nil, err
@@ -710,6 +723,17 @@ func (c *Client) listDelimitedPage(bucket string) listDelimitedFn {
 // alongside the transfer worker pool — see Config.ShardedDiscoveryConcurrency.
 const defaultShardedDiscoveryConcurrency = 4
 
+// defaultDiscoveryPrefixBudget bounds how long a single prefix may be listed in
+// one sharded walk, unless Config.DiscoveryPrefixBudget overrides it.
+// listRetryBudget bounds one *page*'s retry loop, so before this a prefix with
+// many slow pages could hold a worker slot for hours: on a bucket with hundreds
+// of prefixes, a handful of pathological ones monopolised every slot and the
+// rest were never listed at all in that cycle. Yielding is cheap now that
+// discovery checkpoints exist — the prefix resumes from the page it stopped on
+// rather than restarting — so a bounded turn per prefix trades a slower finish
+// for the walk actually reaching every prefix.
+const defaultDiscoveryPrefixBudget = 10 * time.Minute
+
 // ListObjectsTree recursively lists everything under rootPrefix using a
 // "/"-delimited listing at each level — the same shape the MinIO/S3 web
 // console uses to browse a bucket folder-by-folder — instead of one flat,
@@ -719,7 +743,7 @@ const defaultShardedDiscoveryConcurrency = 4
 // bounded by c.shardedDiscoveryConcurrency.
 func (c *Client) ListObjectsTree(ctx context.Context, bucket, rootPrefix string, onPage func([]Object) error) error {
 	return listObjectsTree(ctx, rootPrefix, c.listDelimitedPage(bucket), onPage,
-		c.shardedDiscoveryConcurrency, c.checkpointFor(bucket))
+		c.shardedDiscoveryConcurrency, c.discoveryPrefixBudget, c.checkpointFor(bucket))
 }
 
 // maxReportedPrefixErrs caps how many per-prefix failures are retained for the
@@ -738,7 +762,7 @@ const maxReportedPrefixErrs = 10
 // A prefix whose listing fails is abandoned and reported, but does not stop
 // the walk: on a very large bucket a handful of pathological prefixes must not
 // discard every other prefix's progress (see docs/ARCHITECTURE.md).
-func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedFn, onPage func([]Object) error, concurrency int, ckpt prefixCheckpoint) error {
+func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedFn, onPage func([]Object) error, concurrency int, prefixBudget time.Duration, ckpt prefixCheckpoint) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -843,20 +867,40 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 			}
 		}
 
+		// Bound the whole prefix, not each page. listRetryBudget only bounds one
+		// page's retry loop, so a prefix with many slow pages could hold a
+		// worker slot for hours while every other prefix waited. Cutting it off
+		// is cheap once checkpointing is on: it resumes from the page it stopped
+		// on next cycle rather than restarting. Derived from ctx, so cancelling
+		// the walk still cancels the prefix.
+		prefixCtx := ctx
+		if prefixBudget > 0 {
+			var cancelPrefix context.CancelFunc
+			prefixCtx, cancelPrefix = context.WithTimeout(ctx, prefixBudget)
+			defer cancelPrefix()
+		}
+
 		var pagesThisCycle int
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			objs, subPrefixes, next, err := list(ctx, prefix, token)
+			objs, subPrefixes, next, err := list(prefixCtx, prefix, token)
 			if err != nil {
 				// Abandon this prefix only, and leave its checkpoint intact —
 				// that is the point: the next cycle restarts at the page that
 				// failed rather than at the first one. Pages already delivered
 				// stay synced; sub-prefixes not yet reached are found next cycle.
 				if ctx.Err() == nil {
+					// Running out of budget is a scheduling decision, not a
+					// backend fault: the prefix yields its slot with its progress
+					// banked, and the distinction matters when reading logs.
+					budgetExhausted := prefixCtx.Err() != nil
 					ev := log.Warn()
-					if resumed && pagesThisCycle == 0 {
+					switch {
+					case budgetExhausted && pagesThisCycle > 0:
+						ev = log.Info()
+					case resumed && pagesThisCycle == 0:
 						// The page this prefix is pinned to is still unanswerable,
 						// so this cycle bought zero progress and the next one
 						// starts here again. Loud, because a permanently
@@ -865,8 +909,9 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 						ev = log.Error()
 					}
 					ev.Err(err).Str("prefix", prefix).
-						Bool("resumed", resumed).Int("pages_this_cycle", pagesThisCycle).
-						Msg("sharded discovery: prefix listing failed after retries, continuing with other prefixes")
+						Bool("resumed", resumed).Bool("budget_exhausted", budgetExhausted).
+						Int("pages_this_cycle", pagesThisCycle).
+						Msg("sharded discovery: prefix listing stopped early, continuing with other prefixes")
 				}
 				addPrefixErr(err)
 				return
