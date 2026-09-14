@@ -1,0 +1,26 @@
+# Applies the dashboard as a grafana-operator custom resource:
+#
+#     kubectl apply -k deploy/grafana
+#
+# The kustomization root is this directory rather than a nested one so that
+# tranquila-dashboard.json sits at or below the root. Kustomize refuses to read
+# files above its root unless load restrictions are disabled, and needing a
+# flag to apply a manifest is a worse trade than one flat directory.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - grafanadashboard.yaml
+
+configMapGenerator:
+  - name: tranquila-dashboard
+    files:
+      - tranquila-dashboard.json
+
+generatorOptions:
+  # Kustomize's name-reference rewriting knows about ConfigMap references in
+  # built-in types, but not about a custom resource's spec.configMapRef, so a
+  # generated name hash would leave GrafanaDashboard pointing at a name that
+  # does not exist. A stable name keeps the reference valid; the operator picks
+  # up content changes on resyncPeriod, so the hash buys nothing here anyway.
+  disableNameSuffixHash: true

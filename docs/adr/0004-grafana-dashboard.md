@@ -76,6 +76,16 @@ second y-axis; the dashboard has no dual-axis panel.
   normalises bucket bounds to `10000.0` while Prometheus 2 keeps `10000`; an exact match returns
   no data on one of them, and a panel that silently reads empty would be indistinguishable from
   "no slow calls". This was caught by running the query, not by reading it.
-* The dashboard is provisioning-ready but not provisioned by this repository, which ships no
-  deployment manifests. Import or a file provider are both documented in
+* The dashboard ships in three forms from **one** model file: UI import, a Grafana file
+  provider, and a `GrafanaDashboard` custom resource for grafana-operator v5. The custom resource
+  references the model through a generated ConfigMap rather than inlining it, because an inlined
+  copy is a second source of truth that drifts the first time someone edits one and not the other.
+  The kustomization root is `deploy/grafana/` rather than a nested directory so the JSON sits at
+  or below the root — kustomize refuses to read files above its root without
+  `--load-restrictor LoadRestrictionsNone`, and needing a flag to apply a manifest is a worse
+  trade than one flat directory. All three are documented in
   [deploy/grafana/README.md](../../deploy/grafana/README.md).
+* The operator path needs no datasource configuration, which was verified rather than assumed:
+  loading the model with no datasource selected and no URL parameters resolves the `DS_PROMETHEUS`
+  template variable to the default Prometheus datasource, and every panel returns data.
+  `spec.variables` is documented for pinning it where that default is not wanted.
