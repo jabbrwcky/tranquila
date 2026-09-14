@@ -742,7 +742,7 @@ const defaultDiscoveryPrefixBudget = 10 * time.Minute
 // 2+ minutes with zero response). Sibling prefixes are listed concurrently,
 // bounded by c.shardedDiscoveryConcurrency.
 func (c *Client) ListObjectsTree(ctx context.Context, bucket, rootPrefix string, onPage func([]Object) error) error {
-	return listObjectsTree(ctx, rootPrefix, c.listDelimitedPage(bucket), onPage,
+	return listObjectsTree(ctx, bucket, rootPrefix, c.listDelimitedPage(bucket), onPage,
 		c.shardedDiscoveryConcurrency, c.discoveryPrefixBudget, c.checkpointFor(bucket))
 }
 
@@ -762,7 +762,11 @@ const maxReportedPrefixErrs = 10
 // A prefix whose listing fails is abandoned and reported, but does not stop
 // the walk: on a very large bucket a handful of pathological prefixes must not
 // discard every other prefix's progress (see docs/ARCHITECTURE.md).
-func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedFn, onPage func([]Object) error, concurrency int, prefixBudget time.Duration, ckpt prefixCheckpoint) error {
+//
+// bucket is used for logging only — the listing itself gets it from the closure
+// in list — but without it a per-prefix line is unattributable: several buckets
+// are walked concurrently, so "prefix=20260206/" alone does not say whose.
+func listObjectsTree(ctx context.Context, bucket, rootPrefix string, list listDelimitedFn, onPage func([]Object) error, concurrency int, prefixBudget time.Duration, ckpt prefixCheckpoint) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -858,11 +862,11 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 				// Never fail the prefix over this: the worst case is exactly the
 				// pre-checkpointing behaviour, a full re-list.
 				dirty = true
-				log.Warn().Err(err).Str("prefix", prefix).
+				log.Warn().Err(err).Str("bucket", bucket).Str("prefix", prefix).
 					Msg("sharded discovery: checkpoint load failed, listing prefix from the start")
 			case tok != nil:
 				token, dirty, resumed = tok, true, true
-				log.Info().Str("prefix", prefix).
+				log.Info().Str("bucket", bucket).Str("prefix", prefix).
 					Msg("sharded discovery: resuming prefix from stored checkpoint")
 			}
 		}
@@ -908,7 +912,7 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 						// (bounded only by the checkpoint's TTL).
 						ev = log.Error()
 					}
-					ev.Err(err).Str("prefix", prefix).
+					ev.Err(err).Str("bucket", bucket).Str("prefix", prefix).
 						Bool("resumed", resumed).Bool("budget_exhausted", budgetExhausted).
 						Int("pages_this_cycle", pagesThisCycle).
 						Msg("sharded discovery: prefix listing stopped early, continuing with other prefixes")
@@ -1004,12 +1008,12 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 		switch p.action {
 		case ckptSave:
 			if err := ckpt.save(ctx, p.prefix, p.token); err != nil {
-				log.Warn().Err(err).Str("prefix", p.prefix).
+				log.Warn().Err(err).Str("bucket", bucket).Str("prefix", p.prefix).
 					Msg("sharded discovery: checkpoint save failed, prefix restarts from the beginning next cycle")
 			}
 		case ckptClear:
 			if err := ckpt.clear(ctx, p.prefix); err != nil {
-				log.Warn().Err(err).Str("prefix", p.prefix).
+				log.Warn().Err(err).Str("bucket", bucket).Str("prefix", p.prefix).
 					Msg("sharded discovery: checkpoint clear failed, prefix may resume mid-way next cycle")
 			}
 		}

@@ -144,7 +144,7 @@ func pagedLeaf(pages ...[]string) treePages {
 func collectKeys(t *testing.T, list listDelimitedFn, ckpt prefixCheckpoint, ops *[]string) ([]string, error) {
 	t.Helper()
 	var got []string
-	err := listObjectsTree(context.Background(), "", list, func(objs []Object) error {
+	err := listObjectsTree(context.Background(), "b", "", list, func(objs []Object) error {
 		for _, o := range objs {
 			got = append(got, o.Key)
 			if ops != nil {
@@ -256,7 +256,7 @@ func TestListObjectsTreeCheckpointSavedAfterOnPage(t *testing.T) {
 	ckpt := newFakeCheckpoint(&ops)
 
 	var inOnPage atomic.Bool
-	err := listObjectsTree(context.Background(), "", list, func(objs []Object) error {
+	err := listObjectsTree(context.Background(), "b", "", list, func(objs []Object) error {
 		if !inOnPage.CompareAndSwap(false, true) {
 			t.Error("onPage invoked concurrently — must be called from a single goroutine")
 		}
@@ -291,7 +291,7 @@ func TestListObjectsTreeOnPageErrorDoesNotSaveCheckpoint(t *testing.T) {
 	ckpt := newFakeCheckpoint(nil)
 	wantErr := errors.New("mark pending failed")
 
-	err := listObjectsTree(context.Background(), "", list,
+	err := listObjectsTree(context.Background(), "b", "", list,
 		func([]Object) error { return wantErr }, 1, 0, ckpt)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("got err %v, want it to wrap %v", err, wantErr)
@@ -434,7 +434,7 @@ func TestListObjectsTreePrefixBudgetYieldsAndBanksProgress(t *testing.T) {
 
 	ckpt := newFakeCheckpoint(nil)
 	var got []string
-	err := listObjectsTree(context.Background(), "", slow, func(objs []Object) error {
+	err := listObjectsTree(context.Background(), "b", "", slow, func(objs []Object) error {
 		for _, o := range objs {
 			got = append(got, o.Key)
 		}
