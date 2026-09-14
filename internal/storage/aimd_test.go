@@ -31,6 +31,17 @@ func repeat(n int, c ErrClass) []ErrClass {
 	return out
 }
 
+// repeatPattern repeats a signal sequence n times, for the interleaved-traffic
+// cases: a single client serves discovery listings and the transfer pool at
+// once, so failures and successes arrive mixed rather than in runs.
+func repeatPattern(n int, pattern ...ErrClass) []ErrClass {
+	out := make([]ErrClass, 0, n*len(pattern))
+	for range n {
+		out = append(out, pattern...)
+	}
+	return out
+}
+
 func newTestAIMD(base float64, failN int) *aimd {
 	limit := rate.Inf
 	if base > 0 {
@@ -70,15 +81,42 @@ func TestAIMD(t *testing.T) {
 			signals: repeat(40, ClassTransient), wantLimit: aimdFloor, wantDegraded: true,
 		},
 		{
-			name: "success_resets_consecutive_failures", base: 100, failN: 5,
-			signals: append(append(repeat(4, ClassTransient), ClassOK), repeat(4, ClassTransient)...),
-			// Never reached the threshold, so the base rate is untouched.
+			// A success decays the score by one; it does not erase the run. Four
+			// failures, a success, four more: the score reaches 5 on the second
+			// of those and the rate halves. The old reset-to-zero behaviour left
+			// this at the base rate, which is what made the threshold
+			// unreachable on a client serving listings and transfers at once.
+			name: "success_decays_but_does_not_erase_failures", base: 100, failN: 5,
+			signals:   append(append(repeat(4, ClassTransient), ClassOK), repeat(4, ClassTransient)...),
+			wantLimit: 50, wantDegraded: true,
+		},
+		{
+			// The endpoint answered, so a permanent error is not congestion — it
+			// decays the score exactly like a success.
+			name: "permanent_counts_as_healthy", base: 100, failN: 5,
+			signals:   append(append(repeat(4, ClassTransient), ClassPermanent), repeat(4, ClassTransient)...),
+			wantLimit: 50, wantDegraded: true,
+		},
+		{
+			// Failures and successes in equal measure are not congestion: the
+			// bucket drains as fast as it fills, so the score never climbs.
+			name: "alternating_failure_and_success_never_degrades", base: 100, failN: 5,
+			signals:   repeatPattern(20, ClassTransient, ClassOK),
 			wantLimit: 100,
 		},
 		{
-			// The endpoint answered, so it is not congested.
-			name: "permanent_counts_as_healthy", base: 100, failN: 5,
-			signals:   append(append(repeat(4, ClassTransient), ClassPermanent), repeat(4, ClassTransient)...),
+			// Failures outnumbering successes 2:1 accumulate at +1 per cycle, so
+			// four cycles reach failN exactly once and the rate halves once.
+			// Under the old reset-on-success behaviour this never degraded at
+			// all, however long it ran.
+			name: "failures_outnumbering_successes_degrade", base: 100, failN: 5,
+			signals:   repeatPattern(4, ClassTransient, ClassTransient, ClassOK),
+			wantLimit: 50, wantDegraded: true,
+		},
+		{
+			// A healthy endpoint with the occasional blip must not be throttled.
+			name: "occasional_failure_in_healthy_traffic_never_degrades", base: 100, failN: 5,
+			signals:   repeatPattern(10, ClassTransient, ClassOK, ClassOK, ClassOK),
 			wantLimit: 100,
 		},
 		{

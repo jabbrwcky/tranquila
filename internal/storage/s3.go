@@ -490,9 +490,9 @@ func listAttemptTimedOut(outerCtx, attemptCtx context.Context, err error) bool {
 // doing"), which is right for the caller's ctx but inverts the signal here.
 // The backend failing to answer in time is exactly what AIMD exists to back
 // off from, yet ClassOK feeds aimd.onHealthy(), which raises the rate limit
-// and resets consecFail — so concurrent discovery workers timing out in a
-// loop kept the endpoint pinned at "healthy" and never reached the fail
-// threshold, speeding up against a backend that was already too slow.
+// and decays the failure score — so concurrent discovery workers timing out in
+// a loop kept the endpoint pinned at "healthy", speeding up against a backend
+// that was already too slow.
 // escalateListTimeout returns the deadline for the next attempt. Retrying a
 // deadline with the same deadline cannot succeed: if the backend needs 90s to
 // answer, every 60s attempt fails identically and the loop merely burns

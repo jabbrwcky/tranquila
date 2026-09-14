@@ -71,9 +71,8 @@ func TestListErrClass(t *testing.T) {
 }
 
 // A timed-out attempt must feed the congestion controller, or concurrent
-// discovery workers looping on timeouts keep the endpoint pinned at "healthy":
-// onHealthy resets consecFail, so the fail threshold is never reached and the
-// rate limit drifts back up against a backend that is already too slow.
+// discovery workers looping on timeouts keep the endpoint pinned at "healthy"
+// and the rate limit drifts back up against a backend that is already too slow.
 func TestListTimeoutDegradesRateLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
