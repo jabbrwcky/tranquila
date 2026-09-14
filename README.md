@@ -597,9 +597,27 @@ go build -v
 
 Requires Go 1.25 or later, as declared in `go.mod`.
 
+## Helm chart
+
+The chart lives in this repository at [`charts/tranquila`](charts/tranquila) and is published
+as an OCI artifact:
+
+```shell
+helm install tranquila oci://ghcr.io/pflege-de-labs/charts/tranquila \
+  --version 0.4.1 \
+  --values my-values.yaml
+```
+
+It optionally bundles Valkey for the state store, or points at an external Redis/Valkey. See
+[charts/tranquila/README.md](charts/tranquila/README.md) for values and the supported shapes.
+
+The chart is versioned independently of the application: a push to `main` that raises `version`
+in `charts/tranquila/Chart.yaml` publishes it, anything else is a no-op. It previously lived in
+`pflege-de/helm-charts`.
+
 ## Container images
 
-CI publishes images to `ghcr.io/jabbrwcky/tranquila`:
+CI publishes images to `ghcr.io/pflege-de-labs/tranquila`:
 
 | Tag | Points at |
 | --- | --- |
@@ -623,16 +641,16 @@ distribute:
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp '^https://github.com/jabbrwcky/tranquila/' \
+  --certificate-identity-regexp '^https://github.com/pflege-de-labs/tranquila/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/jabbrwcky/tranquila:1.2.3
+  ghcr.io/pflege-de-labs/tranquila:1.2.3
 ```
 
 Release images carry an SPDX SBOM and SLSA provenance as attestations:
 
 ```bash
-docker buildx imagetools inspect ghcr.io/jabbrwcky/tranquila:1.2.3 --format '{{ json .SBOM }}'
-docker buildx imagetools inspect ghcr.io/jabbrwcky/tranquila:1.2.3 --format '{{ json .Provenance }}'
+docker buildx imagetools inspect ghcr.io/pflege-de-labs/tranquila:1.2.3 --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/pflege-de-labs/tranquila:1.2.3 --format '{{ json .Provenance }}'
 ```
 
 CI images (`main`, `pr-<n>`, `<short-sha>`) are signed too, but carry no SBOM or provenance —
@@ -644,7 +662,7 @@ binaries and their SBOMs:
 ```bash
 cosign verify-blob \
   --bundle checksums.txt.bundle \
-  --certificate-identity-regexp '^https://github.com/jabbrwcky/tranquila/' \
+  --certificate-identity-regexp '^https://github.com/pflege-de-labs/tranquila/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   checksums.txt
 sha256sum -c checksums.txt
