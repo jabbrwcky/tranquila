@@ -13,7 +13,7 @@ The chart is published as an OCI artifact:
 
 ```shell
 helm install tranquila oci://ghcr.io/pflege-de-labs/charts/tranquila \
-  --version 0.4.1 \
+  --version 0.5.1 \
   --values my-values.yaml
 ```
 

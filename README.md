@@ -604,7 +604,7 @@ as an OCI artifact:
 
 ```shell
 helm install tranquila oci://ghcr.io/pflege-de-labs/charts/tranquila \
-  --version 0.4.1 \
+  --version 0.5.1 \
   --values my-values.yaml
 ```
 
@@ -645,6 +645,11 @@ cosign verify \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/pflege-de-labs/tranquila:1.2.3
 ```
+
+> Signing and attestations start with the first release built by this pipeline. Images for
+> `0.4.3` and earlier were built before it existed and carry **no** signature — `cosign verify`
+> against them returns `no signatures found`, whichever identity you pass. Those versions were
+> also published as `linux/amd64` only; multi-arch starts with the same release.
 
 Release images carry an SPDX SBOM and SLSA provenance as attestations:
 
