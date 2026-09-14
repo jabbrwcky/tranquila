@@ -1,0 +1,63 @@
+{{- if not (include "tranquila.existingConfig" .) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tranquila.configMapName" . }}
+  labels:
+    {{- include "tranquila.labels" . | nindent 4 }}
+data:
+  tranquila.yaml: |
+    {{- with .Values.config }}
+    sync:
+      source:
+        {{- if .source.endpoint }}
+        endpoint: {{ .source.endpoint | quote }}
+        {{- end }}
+        {{- if .source.region }}
+        region:  {{ .source.region | quote }}
+        {{- end }}
+        {{- if .source.rateLimit }}
+        rate-limit: {{ .source.rateLimit }}
+        {{- end }}
+      destination:
+        {{- if .destination.endpoint }}
+        endpoint: {{ .destination.endpoint | quote }}
+        {{- end }}
+        {{- if .destination.region }}
+        region:  {{ .destination.region | quote }}
+        {{- end }}
+        {{- if .destination.rateLimit }}
+        rate-limit: {{ .destination.rateLimit }}
+        {{- end }}
+        {{- if .destination.bucketPrefix }}
+        bucket-prefix: {{ .destination.bucketPrefix | quote }}
+        {{- end }}
+
+      buckets:
+        {{- with .buckets }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+
+      {{- if and $.Values.metrics.enabled (ne $.Values.metrics.type "none") }}
+      telemetry:
+        {{- if eq $.Values.metrics.type "prometheus" }}
+        exporter: prometheus
+        addr: :{{ $.Values.metrics.prometheus.port }}
+        {{- else if eq $.Values.metrics.type "otlp" }}
+        exporter: otlp
+        otlp-endpoint: {{ $.Values.metrics.otlp.endpoint | quote }}
+        {{- end }}
+      {{- end }}
+
+      {{- if .watch.enabled }}
+      watch: {{ .watch.enabled }}
+      watch-mode: {{ .watch.mode }}
+        {{- if eq .watch.mode "sqs" }}
+      sqs-queue-url: {{ .watch.sqsQueueUrl | quote }}
+        {{- end }}
+      {{- end }}
+
+      workers: {{ .workers }}
+      dry-run: {{ .dryRun }}
+      {{- end }}
+{{- end }}

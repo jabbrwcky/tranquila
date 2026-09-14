@@ -1,0 +1,22 @@
+apiVersion: v2
+name: tranquila
+description: Deploys Tranquila, an S3 object migration tool
+type: application
+home: https://github.com/pflege-de-labs/tranquila
+sources:
+  - https://github.com/pflege-de-labs/tranquila
+keywords:
+  - s3
+  - sync
+  - migration
+  - object-storage
+# The chart is versioned independently of the application; appVersion tracks the
+# tranquila release whose image the defaults point at.
+version: 0.4.1
+appVersion: "0.4.1"
+
+dependencies:
+  - name: valkey
+    repository: oci://ghcr.io/valkey-io/valkey-helm
+    version: 0.11.0
+    condition: valkey.enabled

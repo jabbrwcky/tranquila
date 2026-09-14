@@ -1,0 +1,24 @@
+# Prometheus Operator objects plus an HPA: the templates most likely to break on
+# a chart or API change, and the ones a default render never touches.
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+  podMonitor:
+    enabled: true
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 3
+config:
+  source:
+    accesskey: ci-source-key
+    secretkey: ci-source-secret
+  destination:
+    accesskey: ci-dest-key
+    secretkey: ci-dest-secret
+  buckets:
+    - source:
+        bucket: source-bucket
+      destination:
+        bucket: destination-bucket

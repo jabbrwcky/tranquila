@@ -1,0 +1,18 @@
+# External Redis/Valkey instead of the bundled subchart, which is how this runs
+# in a cluster that already has one.
+valkey:
+  enabled: false
+redis:
+  addr: redis.data.svc.cluster.local:6379
+config:
+  source:
+    accesskey: ci-source-key
+    secretkey: ci-source-secret
+  destination:
+    accesskey: ci-dest-key
+    secretkey: ci-dest-secret
+  buckets:
+    - source:
+        bucket: source-bucket
+      destination:
+        bucket: destination-bucket

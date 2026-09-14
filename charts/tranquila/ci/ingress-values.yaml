@@ -1,0 +1,22 @@
+# Ingress and HTTPRoute for the management API.
+managementApi:
+  enabled: true
+ingress:
+  enabled: true
+  hosts:
+    - host: tranquila.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+config:
+  source:
+    accesskey: ci-source-key
+    secretkey: ci-source-secret
+  destination:
+    accesskey: ci-dest-key
+    secretkey: ci-dest-secret
+  buckets:
+    - source:
+        bucket: source-bucket
+      destination:
+        bucket: destination-bucket
