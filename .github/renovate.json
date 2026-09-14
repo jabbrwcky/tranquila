@@ -7,7 +7,7 @@
     ":dependencyDashboard"
   ],
   "pinDigests": true,
-  "separateMajorMinor": false,
+  "separateMajorMinor": true,
   "separateMinorPatch": false,
   "pruneStaleBranches": true,
   "baseBranchPatterns": [
@@ -23,23 +23,80 @@
   ],
   "automergeStrategy": "auto",
   "automergeType": "pr",
-  "ignoreTests": true,
   "timezone": "Europe/Berlin",
   "assignAutomerge": true,
-  "ignoreDeps": ["github.com/jabbrwcky/tranquila"],
+  "ignoreDeps": [
+    "github.com/jabbrwcky/tranquila"
+  ],
   "packageRules": [
     {
-      "matchManagers": ["gomod"],
-      "groupName": "go dependencies",
-      "matchUpdateTypes": [
-        "major",
-        "minor",
-        "patch"
+      "description": "Go modules settle before they are proposed, and every update tidies the module it touched.",
+      "matchManagers": [
+        "gomod"
       ],
       "minimumReleaseAge": "5 days",
-      "postUpdateOptions": ["gomodTidy"]
+      "postUpdateOptions": [
+        "gomodTidy"
+      ]
     },
     {
+      "description": "e2e is a separate module with a `replace` to ../, so every direct dependency of the root module is an indirect one of e2e's. Renovate does not manage indirect Go dependencies by default, so without this e2e/go.mod silently keeps the old versions every time the root module is bumped and `go vet ./...` in e2e/ fails with \"updates to go.mod needed\" - see PR #50. Enabling them lets Renovate bump and tidy e2e in the same PR as the root change.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchFileNames": [
+        "e2e/go.mod"
+      ],
+      "matchDepTypes": [
+        "indirect"
+      ],
+      "enabled": true
+    },
+    {
+      "description": "The AWS SDK ships ~20 modules that share internal versions; a partial bump does not compile, so they move together or not at all.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/aws/**"
+      ],
+      "groupName": "aws sdk"
+    },
+    {
+      "description": "otel, its metric/sdk packages and the exporters are one release train.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "go.opentelemetry.io/**"
+      ],
+      "groupName": "opentelemetry"
+    },
+    {
+      "description": "Container-backed test harness only. These cannot reach the production binary and drag ~89 transitive modules of their own, so they are grouped away from everything that can.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/testcontainers/**",
+        "github.com/Shopify/toxiproxy/**"
+      ],
+      "groupName": "e2e test dependencies"
+    },
+    {
+      "description": "The Go toolchain changes codegen and runtime behaviour for everything it builds. It is never a routine bump and must not ride along with a library update - PR #50 bundled go 1.25 -> 1.26 with the whole AWS SDK.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepTypes": [
+        "golang",
+        "toolchain"
+      ],
+      "groupName": "go toolchain",
+      "automerge": false
+    },
+    {
+      "description": "Base images are pinned by digest; a rebuild changes what ships, but CI now has to pass first.",
       "matchDatasources": [
         "docker"
       ],
@@ -51,18 +108,24 @@
       "minimumReleaseAge": "0"
     },
     {
+      "description": "Actions are pinned to a commit sha. Since the CI rework these push images to GHCR and sign with this repository's OIDC identity, so automerge waits on CI (see the removal of ignoreTests).",
       "matchManagers": [
         "github-actions"
       ],
+      "groupName": "github actions",
+      "groupSlug": "all-github-action",
       "automerge": true,
       "pinDigests": true
     },
     {
-      "groupName": "all github action dependencies",
-      "groupSlug": "all-github-action",
-      "matchFileNames": [
-        ".github/**"
-      ]
+      "description": "A major action bump can rename inputs, so it waits for a person.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false
     }
   ]
 }

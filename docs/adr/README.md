@@ -17,3 +17,4 @@ Architectural decisions are recorded here, one file per decision, in
 | --- | --- | --- |
 | [0001](0001-ci-cd-pipeline.md) | Images are tagged by metadata-action, releases rebuild and are signed | Accepted |
 | [0002](0002-discovery-checkpointing.md) | Sharded discovery persists a per-prefix resume point | Accepted |
+| [0003](0003-dependency-update-policy.md) | Dependency updates are grouped by what must move together | Accepted |

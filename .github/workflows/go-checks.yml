@@ -39,6 +39,22 @@ jobs:
         working-directory: e2e
         run: go vet ./...
 
+      # e2e has a `replace` to ../, so every direct dependency of the root module
+      # is an indirect one of e2e's. A root bump that does not re-tidy e2e leaves
+      # that module broken, and the failure surfaces as an opaque "updates to
+      # go.mod needed" from whichever command happens to load it first. Checking
+      # it by name makes the cause obvious and catches drift from any source, not
+      # just Renovate.
+      - name: Check both modules are tidy
+        run: |
+          go mod tidy
+          (cd e2e && go mod tidy)
+          if ! git diff --quiet -- go.mod go.sum e2e/go.mod e2e/go.sum; then
+            echo "::error::go.mod/go.sum are not tidy - run 'go mod tidy' in the repo root and in e2e/"
+            git --no-pager diff -- go.mod go.sum e2e/go.mod e2e/go.sum
+            exit 1
+          fi
+
   e2e:
     name: End-to-End (MinIO + Toxiproxy)
     if: inputs.run-e2e

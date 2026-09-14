@@ -90,6 +90,28 @@ Processed in `cmd_sync.go:resolveBuckets()`. Structured config loaded first; CLI
 - **This does not make listings faster, and the deployment tuning is part of the fix.** The bucket that motivated it was running at *defaults*: `--sharded-discovery-concurrency=4` under a `--workers=10` discovery semaphore (so up to 40 concurrent LISTs) plus the transfer pool, against a backend measured at ~9s for a single leaf page *in isolation*. Note `--source-rate-limit` defaults to `0` = unlimited, which makes AIMD entirely inert (`onCongestion` returns early on `base == rate.Inf`) — so PR #49's "list timeouts count as congestion" change is a no-op unless a finite limit is configured. Even with one set it would rarely fire: `onHealthy` resets `consecFail` unconditionally and the counter is shared across every op on the client, so the steady stream of healthy burn-after-reading `GetObject`/`DeleteObject` calls keeps clearing the streak before 4 list workers can accumulate 5 *consecutive* failures. Both are real defects, both deliberately left out of the checkpointing change.
 - **Superseded limitation (kept for the arithmetic): the tree walk used to have no cross-cycle memory.** Every failed cycle re-lists from scratch. Measured in isolation, a day-prefix page in the problem bucket costs ~8–9s *even at `MaxKeys=1`* (already the S3 API maximum, so there is no page-size lever), ~18 pages/day × ~190 day prefixes — a full walk is hours. Per-prefix checkpointing in Redis was considered and deliberately deferred until we can see how much of the bucket now completes; it needs careful invalidation (the current day's partition keeps growing, and burn-after-reading deletes keys underneath an already-"completed" prefix).
 
+## Dependency Updates
+
+Renovate groups Go dependencies by **what must move together**, not by manager: `aws sdk` (~20
+modules sharing internal version constraints — a partial bump does not compile), `opentelemetry`
+(one release train), `e2e test dependencies`, and the `go` toolchain directive alone (never
+automerged). Everything else gets its own PR, and `separateMajorMinor` is on.
+
+Two traps worth not rediscovering:
+
+- **`e2e/go.mod`'s entries are all `// indirect`**, because the module has a `replace` to `../` —
+  so every *direct* dependency of the root module is an *indirect* one of e2e's. Renovate does not
+  manage indirect Go dependencies by default, so a root bump used to leave `e2e/go.mod` pinned to
+  the old versions; the module graph then disagreed with itself and every command that loaded it
+  failed with an opaque `go: updates to go.mod needed` (PR #50). A packageRule enables them
+  explicitly, and `go-checks.yml` checks both modules are tidy by name so the next occurrence says
+  so directly.
+- **`ignoreTests: true` used to be set globally** while docker and github-actions automerged, so
+  those merged without CI passing — including the actions that push to GHCR and sign with this
+  repo's OIDC identity. Removed; automerge now waits for CI.
+
+Rationale in [docs/adr/0003-dependency-update-policy.md](docs/adr/0003-dependency-update-policy.md).
+
 ## Configuration Reference (YAML)
 
 All of the below nests under a top-level `sync:` key — `Source`/`Destination`/`Buckets`/etc.
