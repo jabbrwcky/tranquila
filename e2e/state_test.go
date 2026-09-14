@@ -478,3 +478,87 @@ func TestScanAgedSyncedObjects(t *testing.T) {
 		}
 	})
 }
+
+// TestDiscoveryCheckpointRoundTrip covers the sharded-discovery resume point
+// against every supported engine. The raw client is what makes the TTL — and
+// the claim that the new namespace leaves the counter keys alone — assertable.
+func TestDiscoveryCheckpointRoundTrip(t *testing.T) {
+	forEachEngine(t, func(t *testing.T, st *state.Store, rdb *redis.Client) {
+		ctx := context.Background()
+		const bucket, prefix = "events", "2026/3/14/"
+
+		load := func() string {
+			t.Helper()
+			tok, err := st.LoadCheckpoint(ctx, bucket, prefix)
+			if err != nil {
+				t.Fatalf("LoadCheckpoint: %v", err)
+			}
+			return tok
+		}
+
+		if got := load(); got != "" {
+			t.Errorf("absent checkpoint returned %q, want empty", got)
+		}
+
+		if err := st.SaveCheckpoint(ctx, bucket, prefix, "tok-1"); err != nil {
+			t.Fatalf("SaveCheckpoint: %v", err)
+		}
+		if got := load(); got != "tok-1" {
+			t.Errorf("after save got %q, want tok-1", got)
+		}
+
+		if err := st.SaveCheckpoint(ctx, bucket, prefix, "tok-2"); err != nil {
+			t.Fatalf("SaveCheckpoint overwrite: %v", err)
+		}
+		if got := load(); got != "tok-2" {
+			t.Errorf("after overwrite got %q, want tok-2", got)
+		}
+
+		// An abandoned prefix must expire on its own rather than pin discovery
+		// to a stale continuation token forever.
+		ttl, err := rdb.TTL(ctx, "tranquila:ckpt:"+bucket+":"+prefix).Result()
+		if err != nil {
+			t.Fatalf("TTL: %v", err)
+		}
+		if ttl <= 0 {
+			t.Errorf("checkpoint TTL is %v, want a positive expiry", ttl)
+		}
+
+		// Saving an empty token means "no resume point", not "resume from the
+		// start of the keyspace".
+		if err := st.SaveCheckpoint(ctx, bucket, prefix, ""); err != nil {
+			t.Fatalf("SaveCheckpoint empty: %v", err)
+		}
+		if got := load(); got != "" {
+			t.Errorf("after saving an empty token got %q, want empty", got)
+		}
+
+		if err := st.SaveCheckpoint(ctx, bucket, prefix, "tok-3"); err != nil {
+			t.Fatalf("SaveCheckpoint: %v", err)
+		}
+		if err := st.ClearCheckpoint(ctx, bucket, prefix); err != nil {
+			t.Fatalf("ClearCheckpoint: %v", err)
+		}
+		if got := load(); got != "" {
+			t.Errorf("after clear got %q, want empty", got)
+		}
+		// Clearing an absent checkpoint is what a completed, never-checkpointed
+		// prefix does on every cycle; it must not error.
+		if err := st.ClearCheckpoint(ctx, bucket, prefix); err != nil {
+			t.Errorf("ClearCheckpoint on an absent key: %v", err)
+		}
+
+		// The tranquila:ckpt: namespace must not disturb the counters, which are
+		// maintained by Lua scripts keyed off the object records.
+		if err := st.SaveCheckpoint(ctx, bucket, prefix, "tok-4"); err != nil {
+			t.Fatalf("SaveCheckpoint: %v", err)
+		}
+		stats, err := st.BucketStats(ctx, bucket)
+		if err != nil {
+			t.Fatalf("BucketStats: %v", err)
+		}
+		if stats != (state.BucketStats{}) {
+			t.Errorf("checkpoint writes disturbed the counters: %+v", stats)
+		}
+	})
+}

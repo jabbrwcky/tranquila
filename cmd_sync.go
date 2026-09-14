@@ -57,6 +57,8 @@ type SyncCmd struct {
 
 	ListAttemptTimeout          time.Duration `name:"list-attempt-timeout" env:"TRANQUILA_LIST_ATTEMPT_TIMEOUT" default:"0" help:"Starting timeout for a single ListObjectsV2 attempt, flat or sharded; doubles after each timed-out attempt up to 4x (0 = default 60s)"`
 	ShardedDiscoveryConcurrency int           `name:"sharded-discovery-concurrency" env:"TRANQUILA_SHARDED_DISCOVERY_CONCURRENCY" default:"0" help:"Concurrent prefix listings during sharded discovery (0 = default 4); lower for a source backend whose LIST calls are slow even in isolation"`
+	DiscoveryCheckpoints        bool          `name:"discovery-checkpoints" env:"TRANQUILA_DISCOVERY_CHECKPOINTS" default:"true" help:"Persist a per-prefix resume point during sharded discovery, so a prefix whose listing fails continues where it stopped on the next cycle instead of re-listing from its first page"`
+	DiscoveryCheckpointTTL      time.Duration `name:"discovery-checkpoint-ttl" env:"TRANQUILA_DISCOVERY_CHECKPOINT_TTL" default:"24h" help:"How long a sharded-discovery resume point stays valid without being refreshed; after this the prefix is listed from the start again"`
 
 	Watch         bool          `name:"watch" env:"TRANQUILA_WATCH" default:"false" help:"Continuously re-run sync until interrupted"`
 	WatchMode     string        `name:"watch-mode" env:"TRANQUILA_WATCH_MODE" default:"poll" enum:"poll,minio,sqs" help:"Watch backend: poll|minio|sqs"`
@@ -226,15 +228,24 @@ func (cmd *SyncCmd) Run() error {
 	defer tel.Shutdown(context.Background())
 
 	store, err := state.NewStore(state.RedisConfig{
-		Addr:     cmd.RedisAddr,
-		Password: cmd.RedisPassword,
-		DB:       cmd.RedisDB,
-		PoolSize: cmd.RedisPoolSize,
+		Addr:          cmd.RedisAddr,
+		Password:      cmd.RedisPassword,
+		DB:            cmd.RedisDB,
+		PoolSize:      cmd.RedisPoolSize,
+		CheckpointTTL: cmd.DiscoveryCheckpointTTL,
 	})
 	if err != nil {
 		return fmt.Errorf("connect to redis: %w", err)
 	}
 	defer store.Close()
+
+	// Left as a nil INTERFACE when disabled: assigning store unconditionally and
+	// nil-checking the concrete type inside the client would instead produce a
+	// non-nil interface holding a nil pointer, which it cannot detect.
+	var checkpoints storage.DiscoveryCheckpointer
+	if cmd.DiscoveryCheckpoints {
+		checkpoints = store
+	}
 
 	log.Debug().Str("endpoint", cmd.Source.Endpoint).Str("region", cmd.Source.Region).Msg("creating source client")
 	src, err := storage.NewClient(ctx, storage.Config{
@@ -248,6 +259,7 @@ func (cmd *SyncCmd) Run() error {
 		Meter:                       tel.Meter,
 		ListAttemptTimeout:          cmd.ListAttemptTimeout,
 		ShardedDiscoveryConcurrency: cmd.ShardedDiscoveryConcurrency,
+		DiscoveryCheckpoints:        checkpoints,
 	})
 	if err != nil {
 		return fmt.Errorf("create source S3 client: %w", err)

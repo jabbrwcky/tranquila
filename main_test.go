@@ -387,3 +387,30 @@ sync:
 		t.Errorf("Source.Region = %q, want %q", sync.Source.Region, "us-east-1")
 	}
 }
+
+// A bool flag defaulting to true is the awkward case: kong has to see the YAML
+// value to override it, and a silently-ignored key would look identical to the
+// default. The TTL alongside it pins that the duration resolves too.
+func TestConfigFileDiscoveryCheckpoints(t *testing.T) {
+	sync := configFromYAML(t, `
+sync:
+  discovery-checkpoints: false
+  discovery-checkpoint-ttl: 6h
+`)
+	if sync.DiscoveryCheckpoints {
+		t.Error("DiscoveryCheckpoints = true, want false from the config file")
+	}
+	if want := 6 * time.Hour; sync.DiscoveryCheckpointTTL != want {
+		t.Errorf("DiscoveryCheckpointTTL = %v, want %v", sync.DiscoveryCheckpointTTL, want)
+	}
+}
+
+func TestDiscoveryCheckpointDefaults(t *testing.T) {
+	sync := configFromYAML(t, "sync: {}\n")
+	if !sync.DiscoveryCheckpoints {
+		t.Error("DiscoveryCheckpoints defaulted to false, want true")
+	}
+	if want := 24 * time.Hour; sync.DiscoveryCheckpointTTL != want {
+		t.Errorf("DiscoveryCheckpointTTL = %v, want %v", sync.DiscoveryCheckpointTTL, want)
+	}
+}

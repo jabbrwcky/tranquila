@@ -107,6 +107,8 @@ sync:
   discovery-batch-size: 100000  # objects per batch; sync drains before next batch starts
   list-attempt-timeout: 0s              # starting ListObjectsV2 attempt timeout (0 = default 60s)
   sharded-discovery-concurrency: 0      # concurrent prefix listings in sharded mode (0 = default 4)
+  discovery-checkpoints: true           # resume a failed prefix where it stopped, not from page 1
+  discovery-checkpoint-ttl: 24h         # how long an unrefreshed resume point survives
 
   # Continuous watch mode
   watch: false
@@ -266,6 +268,36 @@ tranquila sync --list-attempt-timeout=3m
 ```
 
 Both apply to the source endpoint only (nothing lists the destination). If you also have `--source-rate-limit` set, make sure it's sized for what the backend can actually sustain — a limit far above real capacity does not prevent the contention that pushes individual calls past the attempt timeout.
+
+**Progress survives a failed cycle.** A prefix that dies partway through its pages used to be
+re-listed from its *first* page on the next cycle, so on a bucket whose pages are already at the
+limit of what the backend can answer, the walk could repeat forever with zero net progress.
+Discovery now records a resume point per prefix in Redis (`tranquila:ckpt:{bucket}:{prefix}`) and
+continues from there:
+
+```shell
+tranquila sync --discovery-checkpoints=false      # opt out (default: enabled)
+tranquila sync --discovery-checkpoint-ttl=6h      # expire an abandoned resume point sooner (default 24h)
+```
+
+Details worth knowing:
+
+- A checkpoint exists only while a prefix is **incomplete**. Completing one clears it, so the next
+  cycle lists that prefix in full — which is what gives an object whose *transfer* failed a chance
+  to be rediscovered.
+- Only leaf prefixes are checkpointed. A prefix that contains subfolders is never resumed, because
+  a delimited listing interleaves objects and subfolders in one paginated stream and resuming past
+  a page would skip the subfolders it carried.
+- An abandoned resume point expires after the TTL and the prefix is listed from the start again.
+  That is also the uninstall path: disable the flag and the keys self-delete within one TTL, with
+  no cleanup step.
+- Checkpoint store errors are never fatal — they degrade that prefix to the previous behaviour.
+- This does not make listings faster. It stops the work being thrown away. If nearly every page
+  times out you will still want `--sharded-discovery-concurrency` lowered; checkpointing is what
+  makes lowering it safe, since a slower walk that also restarts every cycle is worse.
+- Watch for `sharded discovery: resuming prefix from stored checkpoint` at info level. An `Error`
+  line naming a prefix that resumed and listed **zero** pages before failing means that prefix is
+  pinned on a page the backend cannot answer at all; it will stay there until the TTL expires.
 
 **A prefix that keeps failing no longer takes the bucket down with it.** Each prefix is listed independently: one that exhausts its retries is logged (`sharded discovery: prefix listing failed after retries, continuing with other prefixes`), skipped, and retried on the next cycle, while every other prefix still completes and syncs. Discovery reports those failures at the end of the cycle, so the bucket's cycle is still marked failed and retried — but the objects it *could* reach are already synced rather than discarded. On a bucket with hundreds of prefixes, only the first few failures are named in the cycle error, followed by a count of the rest.
 
