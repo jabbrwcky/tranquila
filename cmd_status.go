@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/jabbrwcky/tranquila/internal/api"
+	"github.com/pflege-de-labs/tranquila/internal/api"
 )
 
 type StatusCmd struct {

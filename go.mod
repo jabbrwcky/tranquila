@@ -1,4 +1,4 @@
-module github.com/jabbrwcky/tranquila
+module github.com/pflege-de-labs/tranquila
 
 go 1.26.0
 

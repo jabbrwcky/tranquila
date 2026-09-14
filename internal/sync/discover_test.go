@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	smithy "github.com/aws/smithy-go"
-	"github.com/jabbrwcky/tranquila/internal/storage"
+	"github.com/pflege-de-labs/tranquila/internal/storage"
 )
 
 func TestIsShardableListErr(t *testing.T) {

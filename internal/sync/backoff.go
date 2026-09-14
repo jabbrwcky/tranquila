@@ -6,7 +6,7 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/jabbrwcky/tranquila/internal/storage"
+	"github.com/pflege-de-labs/tranquila/internal/storage"
 )
 
 const (

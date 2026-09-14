@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jabbrwcky/tranquila/internal/state"
-	"github.com/jabbrwcky/tranquila/internal/storage"
-	tsync "github.com/jabbrwcky/tranquila/internal/sync"
+	"github.com/pflege-de-labs/tranquila/internal/state"
+	"github.com/pflege-de-labs/tranquila/internal/storage"
+	tsync "github.com/pflege-de-labs/tranquila/internal/sync"
 )
 
 // syncerFor builds a Syncer wired to the given clients with test-scale backoff.

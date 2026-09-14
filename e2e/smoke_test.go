@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/jabbrwcky/tranquila/internal/storage"
+	"github.com/pflege-de-labs/tranquila/internal/storage"
 )
 
 // TestHarnessSmoke proves the fixture itself works before any behaviour is

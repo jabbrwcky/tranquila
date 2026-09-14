@@ -26,7 +26,7 @@
   "timezone": "Europe/Berlin",
   "assignAutomerge": true,
   "ignoreDeps": [
-    "github.com/jabbrwcky/tranquila"
+    "github.com/pflege-de-labs/tranquila"
   ],
   "packageRules": [
     {

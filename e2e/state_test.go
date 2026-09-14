@@ -9,7 +9,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/jabbrwcky/tranquila/internal/state"
+	"github.com/pflege-de-labs/tranquila/internal/state"
 )
 
 // The state layer maintains its counters with Lua scripts (EVALSHA), so every
