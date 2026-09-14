@@ -135,6 +135,11 @@ worker slot for hours while every other prefix waited — on a bucket with hundr
 handful of pathological ones monopolised every slot and the rest went unlisted for the whole cycle.
 Yielding is cheap precisely because checkpoints exist: the prefix resumes from where it stopped.
 
+For how the two budgets and the escalating per-attempt deadline compose — what each attempt is
+granted, and where the ten minutes actually go — open
+[retry-mechanics.html](retry-mechanics.html) (an interactive chart; values derived from the
+constants in `internal/storage/s3.go`, with a table view for the same numbers).
+
 Checkpoint errors are never fatal; they degrade a prefix to the un-checkpointed behaviour. An
 abandoned resume point expires via TTL, which bounds the one new failure mode: a page the backend
 can never answer parks its prefix until the checkpoint expires. Full rationale in
