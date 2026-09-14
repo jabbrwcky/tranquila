@@ -24,6 +24,15 @@ const (
 
 	// bucketsKey indexes the buckets that have completed a discovery run.
 	bucketsKey = "tranquila:buckets"
+
+	// defaultCheckpointTTL bounds how long a sharded-discovery resume point
+	// stays valid. A prefix whose walk was interrupted and never resumed — the
+	// process down for a week, the bucket dropped from the mapping, the token
+	// invalidated by a backend upgrade — must not pin discovery to a stale
+	// continuation token forever. Once it expires the prefix is listed from the
+	// start again, which is always correct, merely slower. Refreshed on every
+	// save, so an actively advancing prefix never expires mid-walk.
+	defaultCheckpointTTL = 24 * time.Hour
 )
 
 type ObjectState struct {
@@ -48,10 +57,14 @@ type RedisConfig struct {
 	// on a CPU-constrained pod, and so it can be reasoned about independent of the
 	// container's CPU limit — see the pool-recovery note on dialErrorsNum below.
 	PoolSize int
+	// CheckpointTTL overrides how long a sharded-discovery resume point survives
+	// without being refreshed. 0 = defaultCheckpointTTL.
+	CheckpointTTL time.Duration
 }
 
 type Store struct {
-	client *redis.Client
+	client        *redis.Client
+	checkpointTTL time.Duration
 }
 
 func NewStore(cfg RedisConfig) (*Store, error) {
@@ -72,7 +85,11 @@ func NewStore(cfg RedisConfig) (*Store, error) {
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("ping redis at %s: %w", cfg.Addr, err)
 	}
-	return &Store{client: client}, nil
+	checkpointTTL := cfg.CheckpointTTL
+	if checkpointTTL <= 0 {
+		checkpointTTL = defaultCheckpointTTL
+	}
+	return &Store{client: client, checkpointTTL: checkpointTTL}, nil
 }
 
 func (s *Store) Close() error {
@@ -90,6 +107,22 @@ func objKey(bucket, key string) string {
 
 func collKey(bucket string) string {
 	return "tranquila:collection:" + bucket
+}
+
+// ckptKey holds the resume point for one in-flight sharded-discovery prefix.
+//
+// Its own tranquila:ckpt: namespace, disjoint from every pattern this package
+// SCANs: tranquila:obj:{bucket}:* (ScanPending, ScanStaleObjects,
+// ScanAgedSyncedObjects, RebuildStats), tranquila:collection:*
+// (listBucketsByScan) and tranquila:stats:* (staleStatsKeys). The counter Lua
+// scripts only ever touch keys handed to them explicitly in KEYS, so they are
+// unaffected too.
+//
+// Bucket names cannot contain ":" but prefixes can, which makes this key
+// ambiguous to parse. That is deliberate and harmless: every access is by exact
+// key and nothing enumerates checkpoints.
+func ckptKey(bucket, prefix string) string {
+	return "tranquila:ckpt:" + bucket + ":" + prefix
 }
 
 func statsKey(bucket string) string {
@@ -601,4 +634,45 @@ func (s *Store) staleStatsKeys(ctx context.Context, counts map[string]*BucketSta
 		return nil, fmt.Errorf("scan stats keys: %w", err)
 	}
 	return stale, nil
+}
+
+// LoadCheckpoint returns the stored continuation token for (bucket, prefix), or
+// "" when there is none — never checkpointed, already completed, or expired.
+// Implements storage.DiscoveryCheckpointer.
+func (s *Store) LoadCheckpoint(ctx context.Context, bucket, prefix string) (string, error) {
+	tok, err := s.client.HGet(ctx, ckptKey(bucket, prefix), "token").Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("load discovery checkpoint %s/%s: %w", bucket, prefix, err)
+	}
+	return tok, nil
+}
+
+// SaveCheckpoint records token as the resume point for (bucket, prefix) and
+// refreshes its TTL, so a prefix that is actively advancing stays checkpointed
+// while an abandoned one expires on its own.
+func (s *Store) SaveCheckpoint(ctx context.Context, bucket, prefix, token string) error {
+	if token == "" {
+		return s.ClearCheckpoint(ctx, bucket, prefix)
+	}
+	key := ckptKey(bucket, prefix)
+	pipe := s.client.Pipeline()
+	pipe.HSet(ctx, key, "token", token, "updated_at", time.Now().UTC().Format(time.RFC3339Nano))
+	pipe.Expire(ctx, key, s.checkpointTTL)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("save discovery checkpoint %s/%s: %w", bucket, prefix, err)
+	}
+	return nil
+}
+
+// ClearCheckpoint drops a prefix's resume point so the next cycle lists it in
+// full. Called when a prefix completes — that full re-list is what gives an
+// object whose transfer failed a chance to be rediscovered.
+func (s *Store) ClearCheckpoint(ctx context.Context, bucket, prefix string) error {
+	if err := s.client.Del(ctx, ckptKey(bucket, prefix)).Err(); err != nil {
+		return fmt.Errorf("clear discovery checkpoint %s/%s: %w", bucket, prefix, err)
+	}
+	return nil
 }

@@ -42,6 +42,10 @@ type Config struct {
 	// concurrently during a sharded discovery tree walk (0 = default
 	// defaultShardedDiscoveryConcurrency). Only meaningful on the source client.
 	ShardedDiscoveryConcurrency int
+	// DiscoveryCheckpoints persists a per-prefix resume point during a sharded
+	// discovery walk (nil = disabled, every prefix lists from its first page on
+	// every cycle). Only meaningful on the source client.
+	DiscoveryCheckpoints DiscoveryCheckpointer
 }
 
 type Object struct {
@@ -69,6 +73,7 @@ type Client struct {
 
 	listAttemptTimeout          time.Duration
 	shardedDiscoveryConcurrency int
+	checkpoints                 DiscoveryCheckpointer // nil = checkpointing disabled
 }
 
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
@@ -130,6 +135,7 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 		aimd:                        newAIMD(lim, base, cfg.FailThreshold),
 		listAttemptTimeout:          listAttemptTimeout,
 		shardedDiscoveryConcurrency: shardedDiscoveryConcurrency,
+		checkpoints:                 cfg.DiscoveryCheckpoints,
 	}
 	if err := c.initMetrics(cfg); err != nil {
 		return nil, err
@@ -563,6 +569,93 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 // against a fake of this type.
 type listDelimitedFn func(ctx context.Context, prefix string, token *string) (contents []Object, commonPrefixes []string, nextToken *string, err error)
 
+// DiscoveryCheckpointer persists sharded discovery's resume point for one
+// (bucket, prefix): the ListObjectsV2 continuation token of the page to fetch
+// next. It exists because a prefix whose listing died partway through used to
+// be re-listed from its first page on the next cycle — on a bucket whose
+// individual pages are already at the limit of what the backend can answer,
+// that restart is what makes the walk never terminate, however many cycles run.
+//
+// A checkpoint exists only while a prefix is INCOMPLETE. Completing a prefix
+// clears it, so the next cycle lists that prefix in full again. That is
+// deliberate: it is what gives an object whose *transfer* failed a chance to be
+// rediscovered, and it costs little on a burn-after-reading bucket, which
+// drains itself — a completed prefix is empty by the time it is re-listed.
+//
+// Declared here rather than in internal/state so internal/storage keeps no
+// Redis dependency; *state.Store satisfies it structurally and is wired in
+// cmd_sync.go (the same pattern as watcher.minioNotifier).
+type DiscoveryCheckpointer interface {
+	// LoadCheckpoint returns the stored token, or "" when there is none.
+	LoadCheckpoint(ctx context.Context, bucket, prefix string) (token string, err error)
+	SaveCheckpoint(ctx context.Context, bucket, prefix, token string) error
+	ClearCheckpoint(ctx context.Context, bucket, prefix string) error
+}
+
+// prefixCheckpoint is listObjectsTree's bucket-bound view of a
+// DiscoveryCheckpointer. It mirrors listDelimitedFn: the bucket is closed over,
+// so the orchestration core stays bucket-agnostic and is faked in tests with an
+// in-memory map rather than a Redis double. Unexported methods also keep the
+// public seam at exactly DiscoveryCheckpointer.
+type prefixCheckpoint interface {
+	load(ctx context.Context, prefix string) (*string, error)
+	save(ctx context.Context, prefix string, token *string) error
+	clear(ctx context.Context, prefix string) error
+}
+
+type bucketCheckpoint struct {
+	cp     DiscoveryCheckpointer
+	bucket string
+}
+
+func (b bucketCheckpoint) load(ctx context.Context, prefix string) (*string, error) {
+	tok, err := b.cp.LoadCheckpoint(ctx, b.bucket, prefix)
+	if err != nil || tok == "" {
+		return nil, err
+	}
+	return &tok, nil
+}
+
+func (b bucketCheckpoint) save(ctx context.Context, prefix string, token *string) error {
+	return b.cp.SaveCheckpoint(ctx, b.bucket, prefix, aws.ToString(token))
+}
+
+func (b bucketCheckpoint) clear(ctx context.Context, prefix string) error {
+	return b.cp.ClearCheckpoint(ctx, b.bucket, prefix)
+}
+
+// checkpointFor returns a bucket-bound checkpoint view, or a nil interface when
+// checkpointing is disabled. Returning the typed zero value instead would yield
+// a non-nil interface holding a nil implementation.
+func (c *Client) checkpointFor(bucket string) prefixCheckpoint {
+	if c.checkpoints == nil {
+		return nil
+	}
+	return bucketCheckpoint{cp: c.checkpoints, bucket: bucket}
+}
+
+// ckptAction is what the single consumer goroutine must do about a page's
+// checkpoint. The producer decides it (only it knows the prefix's pagination
+// state); the consumer executes it (only it knows onPage accepted the page).
+type ckptAction int
+
+const (
+	ckptNone  ckptAction = iota // checkpointing off, or this prefix opted out
+	ckptSave                    // record token as this prefix's resume point
+	ckptClear                   // prefix finished, or opted out: drop any resume point
+)
+
+// treePage is one unit of work for listObjectsTree's single consumer. The
+// checkpoint bookkeeping travels with the objects so that both happen on that
+// one goroutine, in page order — see the consumer loop for why the token must
+// not be persisted by the producer.
+type treePage struct {
+	prefix string
+	objs   []Object
+	action ckptAction
+	token  *string // resume point; set only when action == ckptSave
+}
+
 // listDelimitedPage returns a listDelimitedFn backed by a real "/"-delimited
 // ListObjectsV2 call against bucket, going through the same retry (including
 // the per-attempt timeout) as a flat listing.
@@ -625,7 +718,8 @@ const defaultShardedDiscoveryConcurrency = 4
 // 2+ minutes with zero response). Sibling prefixes are listed concurrently,
 // bounded by c.shardedDiscoveryConcurrency.
 func (c *Client) ListObjectsTree(ctx context.Context, bucket, rootPrefix string, onPage func([]Object) error) error {
-	return listObjectsTree(ctx, rootPrefix, c.listDelimitedPage(bucket), onPage, c.shardedDiscoveryConcurrency)
+	return listObjectsTree(ctx, rootPrefix, c.listDelimitedPage(bucket), onPage,
+		c.shardedDiscoveryConcurrency, c.checkpointFor(bucket))
 }
 
 // maxReportedPrefixErrs caps how many per-prefix failures are retained for the
@@ -644,12 +738,12 @@ const maxReportedPrefixErrs = 10
 // A prefix whose listing fails is abandoned and reported, but does not stop
 // the walk: on a very large bucket a handful of pathological prefixes must not
 // discard every other prefix's progress (see docs/ARCHITECTURE.md).
-func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedFn, onPage func([]Object) error, concurrency int) error {
+func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedFn, onPage func([]Object) error, concurrency int, ckpt prefixCheckpoint) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	tasks := make(chan string, 64)
-	pages := make(chan []Object)
+	pages := make(chan treePage)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -715,26 +809,96 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 	// loop, and double-release the slot on the next iteration).
 	processOne := func(prefix string) {
 		defer wg.Done()
+
 		var token *string
+		// dirty: this prefix may have a stored checkpoint, so a terminal event
+		// must issue a clear. Set by a successful load, by every save, and also
+		// by a FAILED load — a checkpoint we could not read may still be there,
+		// and leaving it would strand sub-prefixes if this prefix turns out to
+		// branch.
+		var dirty, resumed bool
+		// resumable: whether this prefix may be checkpointed at all. A delimited
+		// listing returns objects and CommonPrefixes interleaved in one
+		// paginated lexicographic stream, so resuming past page k would also
+		// skip the sub-prefixes page k carried — stranding whole subtrees
+		// silently. Checkpoint only while a prefix has produced no sub-prefixes:
+		// that covers exactly the expensive case (a leaf folder spanning many
+		// pages) and degrades to the un-checkpointed behaviour for the shallow
+		// index levels that fan out.
+		resumable := ckpt != nil
+
+		if resumable {
+			tok, err := ckpt.load(ctx, prefix)
+			switch {
+			case err != nil:
+				// Never fail the prefix over this: the worst case is exactly the
+				// pre-checkpointing behaviour, a full re-list.
+				dirty = true
+				log.Warn().Err(err).Str("prefix", prefix).
+					Msg("sharded discovery: checkpoint load failed, listing prefix from the start")
+			case tok != nil:
+				token, dirty, resumed = tok, true, true
+				log.Info().Str("prefix", prefix).
+					Msg("sharded discovery: resuming prefix from stored checkpoint")
+			}
+		}
+
+		var pagesThisCycle int
 		for {
 			if ctx.Err() != nil {
 				return
 			}
 			objs, subPrefixes, next, err := list(ctx, prefix, token)
 			if err != nil {
-				// Abandon this prefix only. Pages already delivered stay synced;
-				// the rest of it (and any sub-prefixes it had not yet reached) is
-				// retried on the next discovery cycle.
+				// Abandon this prefix only, and leave its checkpoint intact —
+				// that is the point: the next cycle restarts at the page that
+				// failed rather than at the first one. Pages already delivered
+				// stay synced; sub-prefixes not yet reached are found next cycle.
 				if ctx.Err() == nil {
-					log.Warn().Err(err).Str("prefix", prefix).
+					ev := log.Warn()
+					if resumed && pagesThisCycle == 0 {
+						// The page this prefix is pinned to is still unanswerable,
+						// so this cycle bought zero progress and the next one
+						// starts here again. Loud, because a permanently
+						// unanswerable page is the one way checkpointing can stall
+						// (bounded only by the checkpoint's TTL).
+						ev = log.Error()
+					}
+					ev.Err(err).Str("prefix", prefix).
+						Bool("resumed", resumed).Int("pages_this_cycle", pagesThisCycle).
 						Msg("sharded discovery: prefix listing failed after retries, continuing with other prefixes")
 				}
 				addPrefixErr(err)
 				return
 			}
-			if len(objs) > 0 {
+			pagesThisCycle++
+
+			action, tok := ckptNone, (*string)(nil)
+			switch {
+			case !resumable:
+				// Already opted out; nothing to record.
+			case len(subPrefixes) > 0:
+				// Sub-prefixes make every later page unskippable. Opt out, and
+				// clear anything an earlier cycle stored before it reached here.
+				resumable = false
+				if dirty {
+					action, dirty = ckptClear, false
+				}
+			case next != nil:
+				action, tok, dirty = ckptSave, next, true
+			case dirty:
+				// Prefix complete: drop the resume point so the NEXT cycle lists
+				// it in full, which is what rediscovers objects whose transfer
+				// failed.
+				action, dirty = ckptClear, false
+			}
+
+			// A page carrying only CommonPrefixes has no objects but may still
+			// carry a ckptClear, so it has to reach the consumer too. With
+			// checkpointing off this collapses to the original len(objs) > 0.
+			if len(objs) > 0 || action != ckptNone {
 				select {
-				case pages <- objs:
+				case pages <- treePage{prefix: prefix, objs: objs, action: action, token: tok}:
 				case <-ctx.Done():
 					return
 				}
@@ -766,12 +930,43 @@ func listObjectsTree(ctx context.Context, rootPrefix string, list listDelimitedF
 		close(pages)
 	}()
 
-	for objs := range pages {
+	// Single consumer. Beyond serializing onPage for its caller's benefit, this
+	// is now load-bearing for checkpoint correctness: because `pages` is
+	// unbuffered, a prefix's page k+1 cannot be sent until this loop has
+	// finished page k's onPage AND page k's checkpoint write, making the
+	// per-prefix ordering total with no extra synchronization.
+	for p := range pages {
 		if getFatal() != nil {
 			continue // already aborting; drain so producers blocked on `pages <-` can exit
 		}
-		if err := onPage(objs); err != nil {
-			setFatal(err)
+		if len(p.objs) > 0 {
+			if err := onPage(p.objs); err != nil {
+				setFatal(err)
+				// Deliberately skips the checkpoint write below: a rejected page
+				// must never advance the resume point past objects nobody
+				// accepted.
+				continue
+			}
+		}
+		// Only now, with this page's objects accepted, is it safe to record that
+		// the walk may resume PAST them. Persisting from processOne instead
+		// would race the handoff — the token could reach the store before, or
+		// entirely without, the objects it skips ever reaching onPage.
+		//
+		// Checkpoint failures are never fatal: a store blip must not abort a
+		// walk that is otherwise making progress. The cost is one lost resume
+		// point, i.e. the pre-checkpointing behaviour for that prefix.
+		switch p.action {
+		case ckptSave:
+			if err := ckpt.save(ctx, p.prefix, p.token); err != nil {
+				log.Warn().Err(err).Str("prefix", p.prefix).
+					Msg("sharded discovery: checkpoint save failed, prefix restarts from the beginning next cycle")
+			}
+		case ckptClear:
+			if err := ckpt.clear(ctx, p.prefix); err != nil {
+				log.Warn().Err(err).Str("prefix", p.prefix).
+					Msg("sharded discovery: checkpoint clear failed, prefix may resume mid-way next cycle")
+			}
 		}
 	}
 

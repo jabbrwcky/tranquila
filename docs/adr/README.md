@@ -16,3 +16,4 @@ Architectural decisions are recorded here, one file per decision, in
 | ADR | Title | Status |
 | --- | --- | --- |
 | [0001](0001-ci-cd-pipeline.md) | Images are tagged by metadata-action, releases rebuild and are signed | Accepted |
+| [0002](0002-discovery-checkpointing.md) | Sharded discovery persists a per-prefix resume point | Accepted |

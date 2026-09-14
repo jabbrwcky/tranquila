@@ -106,6 +106,34 @@ whose discovery can never finish would otherwise keep live events from *every*
 bucket from being consumed, since `initialSync` only returns once a whole cycle
 succeeds. A fatal (all-permanent) catch-up error still cancels both.
 
+### Discovery checkpoints
+
+A sharded walk records, per leaf prefix, the continuation token of the page to fetch next
+(`tranquila:ckpt:{bucket}:{prefix}`). A prefix whose listing fails keeps that token and resumes
+there on the next cycle instead of re-listing from its first page — on a bucket whose individual
+pages are already at the edge of what the backend can answer, that restart is what made the walk
+never terminate.
+
+Three properties are load-bearing:
+
+- **A checkpoint exists only while a prefix is incomplete.** Completion clears it, so the prefix is
+  listed in full next cycle. That full re-list is what rediscovers objects whose *transfer* failed;
+  resuming permanently past them would strand them.
+- **Only leaf prefixes are checkpointed.** A delimited listing returns objects and `CommonPrefixes`
+  interleaved in one paginated lexicographic stream, so resuming past a page would also skip the
+  sub-prefixes that page carried — losing whole subtrees silently. A prefix that produces a
+  sub-prefix drops its checkpoint and is not checkpointed again for that walk.
+- **The token is written by the single consumer goroutine, after `onPage` accepts its page.** The
+  `pages` channel is unbuffered, so page *k+1* cannot be sent until page *k*'s `onPage` and
+  checkpoint write have both finished; per-prefix ordering is therefore total without extra
+  locking. Writing it from the producer would let a token be persisted before — or without — the
+  objects it skips ever reaching `onPage`.
+
+Checkpoint errors are never fatal; they degrade a prefix to the un-checkpointed behaviour. An
+abandoned resume point expires via TTL, which bounds the one new failure mode: a page the backend
+can never answer parks its prefix until the checkpoint expires. Full rationale in
+[adr/0002-discovery-checkpointing.md](adr/0002-discovery-checkpointing.md).
+
 ## Concurrency and memory
 
 Three bounds keep a multi-million-object bucket from exhausting memory:
@@ -139,6 +167,7 @@ records — ~1.1M in production — anything on a request path must avoid scanni
 | `tranquila:stats:{bucket}` | hash | Maintained counters: `total`, `synced`, `pending`, `failed`. |
 | `tranquila:buckets` | set | Index of discovered buckets. |
 | `tranquila:statsbuilt` | string | Marker that counters have been seeded. |
+| `tranquila:ckpt:{bucket}:{prefix}` | hash | Sharded discovery's resume point: `token`, `updated_at`. TTL'd; present only while a prefix is incomplete. |
 
 Bucket names cannot contain `:` but object keys can, so parsing a bucket out of
 an object key splits on the **first** `:` after the prefix.
