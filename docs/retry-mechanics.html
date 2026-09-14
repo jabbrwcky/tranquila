@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ListObjectsV2 retry and timeout mechanics — tranquila</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;
+    --page:           #f9f9f7;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --axis:           #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-1:       #2a78d6;
+    --series-2:       #eb6834;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1:      #1a1a19;
+      --page:           #0d0d0d;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --axis:           #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-1:       #3987e5;
+      --series-2:       #d95926;
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --grid:           #2c2c2a;
+    --axis:           #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-1:       #3987e5;
+    --series-2:       #d95926;
+  }
+
+  html, body { margin: 0; padding: 0; }
+  body { background: var(--page, #f9f9f7); }
+  .viz-root {
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 32px 24px 56px;
+    max-width: 860px;
+    margin: 0 auto;
+    line-height: 1.5;
+  }
+  .viz-root h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .viz-root .sub { color: var(--text-secondary); font-size: 14px; margin: 0 0 4px; }
+  .viz-root .note { color: var(--text-muted); font-size: 12.5px; margin: 0; }
+  .head-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+
+  .toggle {
+    font: inherit; font-size: 13px; color: var(--text-secondary);
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 12px; cursor: pointer; white-space: nowrap;
+  }
+  .toggle:hover { color: var(--text-primary); }
+
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin: 24px 0 8px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px 16px; }
+  .tile .label { font-size: 12.5px; color: var(--text-secondary); margin-bottom: 8px; }
+  .tile .value { font-size: 26px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.02em; }
+  .tile .value .was { font-size: 15px; font-weight: 400; color: var(--text-muted); text-decoration: line-through; margin-right: 8px; }
+  .tile .delta { font-size: 12.5px; color: var(--text-secondary); margin-top: 6px; }
+
+  figure { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; margin: 20px 0 0; padding: 16px 16px 8px; }
+  figcaption { font-size: 15px; font-weight: 600; margin-bottom: 2px; }
+  .figsub { font-size: 13px; color: var(--text-secondary); margin-bottom: 12px; }
+  svg { display: block; width: 100%; height: auto; overflow: visible; }
+
+  .legend { display: flex; gap: 18px; align-items: center; margin: 10px 2px 6px; flex-wrap: wrap; }
+  .legend .item { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-secondary); }
+  .legend .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  .legend .key { width: 16px; height: 2px; border-radius: 1px; flex: none; }
+
+  .tip {
+    position: fixed; pointer-events: none; opacity: 0; transition: opacity .08s;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 12.5px; color: var(--text-secondary);
+    box-shadow: 0 4px 16px rgba(0,0,0,.14); z-index: 10; min-width: 132px;
+  }
+  .tip .tip-head { color: var(--text-primary); font-weight: 600; margin-bottom: 5px; font-size: 12.5px; }
+  .tip .row { display: flex; align-items: baseline; gap: 8px; margin-top: 3px; }
+  .tip .row .k { width: 16px; height: 2px; border-radius: 1px; flex: none; transform: translateY(-3px); }
+  .tip .row .v { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tip .row .n { color: var(--text-secondary); }
+
+  details { margin-top: 22px; }
+  summary { cursor: pointer; font-size: 13.5px; color: var(--text-secondary); }
+  summary:hover { color: var(--text-primary); }
+  table { border-collapse: collapse; margin-top: 12px; font-size: 13px; width: 100%; }
+  caption { text-align: left; font-size: 13px; color: var(--text-secondary); padding: 10px 0 6px; }
+  th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; font-variant-numeric: normal; }
+  thead th { color: var(--text-secondary); font-weight: 600; border-bottom: 1px solid var(--axis); }
+
+  @media (forced-colors: active) {
+    .tile, figure, .tip { border: 1px solid CanvasText; }
+  }
+</style>
+</head>
+<body data-palette="#2a78d6,#eb6834">
+<div class="viz-root">
+
+  <div class="head-row">
+    <div>
+      <h1>ListObjectsV2 retry and timeout mechanics</h1>
+      <p class="sub">How long one listing call, and one prefix, may consume before discovery gives up.</p>
+      <p class="note">Modelled from the constants in <code>internal/storage/s3.go</code>, for a page the backend never answers. Backoff shown un-jittered; the real delay adds up to 50&nbsp;%.</p>
+    </div>
+    <button class="toggle" id="themeBtn" type="button">Dark</button>
+  </div>
+
+  <section class="kpis" aria-label="Headline figures">
+    <div class="tile">
+      <div class="label">Longest single-attempt deadline</div>
+      <div class="value"><span class="was">60s</span>240s</div>
+      <div class="delta">Escalates 60 → 120 → 240, capped at 4× the configured start</div>
+    </div>
+    <div class="tile">
+      <div class="label">Attempts before giving up</div>
+      <div class="value"><span class="was">8</span>4</div>
+      <div class="delta">Fewer, longer tries inside the same ten minutes</div>
+    </div>
+    <div class="tile">
+      <div class="label">Worst case one prefix holds a worker</div>
+      <div class="value"><span class="was">180 min</span>10 min</div>
+      <div class="delta">18-page day prefix; the budget became per prefix, not per page</div>
+    </div>
+  </section>
+
+  <figure>
+    <figcaption>Deadline granted to each attempt</figcaption>
+    <div class="figsub">A fixed deadline can never succeed where the backend needs longer than it. Escalating means attempt&nbsp;3 can answer a page that takes four minutes.</div>
+    <div class="legend" id="lg1"></div>
+    <svg id="chart1" viewBox="0 0 760 300" role="img" aria-label="Grouped column chart comparing the per-attempt deadline before and after the escalation change, across eight attempts."></svg>
+  </figure>
+
+  <figure>
+    <figcaption>Cumulative time spent on one unanswerable page</figcaption>
+    <div class="figsub">Both configurations spend about ten minutes. The difference is what they buy with it.</div>
+    <div class="legend" id="lg2"></div>
+    <svg id="chart2" viewBox="0 0 760 300" role="img" aria-label="Line chart of cumulative elapsed time across retry attempts, before and after the change, against the ten-minute page budget."></svg>
+  </figure>
+
+  <details>
+    <summary>Table view — every value in both charts</summary>
+    <table>
+      <caption>Per-attempt deadline and cumulative elapsed time, in seconds.</caption>
+      <thead>
+        <tr>
+          <th scope="col">Attempt</th>
+          <th scope="col">Deadline, fixed</th>
+          <th scope="col">Deadline, escalating</th>
+          <th scope="col">Cumulative, fixed</th>
+          <th scope="col">Cumulative, escalating</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </details>
+
+  <div class="tip" id="tip" role="status" aria-live="polite"></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // Derived from internal/storage/s3.go: listMaxRetries 8, listMaxDelay 30s,
+  // defaultListAttemptTimeout 60s, listAttemptTimeoutMaxFactor 4,
+  // listRetryBudget 10m. Values for a page the backend never answers, so every
+  // attempt consumes its whole deadline.
+  var ATTEMPTS = [1, 2, 3, 4, 5, 6, 7, 8];
+  var FIXED    = [60, 60, 60, 60, 60, 60, 60, 60];
+  var ESCAL    = [60, 120, 240, 173];
+  var CUM_FIX  = [60, 121, 183, 247, 315, 391, 481, 571];
+  var CUM_ESC  = [60, 181, 423, 600];
+  var BUDGET   = 600;
+
+  var S1 = "var(--series-1)", S2 = "var(--series-2)";
+  var NS = "http://www.w3.org/2000/svg";
+
+  function el(tag, attrs) {
+    var n = document.createElementNS(NS, tag);
+    for (var k in attrs) if (attrs[k] !== undefined && attrs[k] !== null) n.setAttribute(k, attrs[k]);
+    return n;
+  }
+  function txt(tag, attrs, s) { var n = el(tag, attrs); n.textContent = s; return n; }
+
+  // ---- legends (always present: two series) -----------------------------
+  function legend(host, kind) {
+    var items = [
+      { name: "Fixed 60s deadline (before)", color: S1 },
+      { name: "Escalating deadline (after)", color: S2 }
+    ];
+    items.forEach(function (it) {
+      var wrap = document.createElement("span");
+      wrap.className = "item";
+      var mark = document.createElement("span");
+      mark.className = kind === "line" ? "key" : "swatch";
+      mark.style.background = it.color;
+      var label = document.createElement("span");
+      label.textContent = it.name;   // untrusted-data habit: never innerHTML
+      wrap.appendChild(mark); wrap.appendChild(label);
+      host.appendChild(wrap);
+    });
+  }
+  legend(document.getElementById("lg1"), "bar");
+  legend(document.getElementById("lg2"), "line");
+
+  // ---- tooltip ----------------------------------------------------------
+  var tip = document.getElementById("tip");
+  function showTip(x, y, head, rows) {
+    tip.textContent = "";
+    var h = document.createElement("div");
+    h.className = "tip-head"; h.textContent = head;
+    tip.appendChild(h);
+    rows.forEach(function (r) {
+      var row = document.createElement("div"); row.className = "row";
+      var k = document.createElement("span"); k.className = "k"; k.style.background = r.color;
+      var v = document.createElement("span"); v.className = "v"; v.textContent = r.value;
+      var n = document.createElement("span"); n.className = "n"; n.textContent = r.name;
+      row.appendChild(k); row.appendChild(v); row.appendChild(n);
+      tip.appendChild(row);
+    });
+    tip.style.opacity = "1";
+    var w = tip.offsetWidth, hgt = tip.offsetHeight;
+    var left = x + 14; if (left + w > window.innerWidth - 8) left = x - w - 14;
+    var top = y - hgt - 12; if (top < 8) top = y + 18;
+    tip.style.left = left + "px"; tip.style.top = top + "px";
+  }
+  function hideTip() { tip.style.opacity = "0"; }
+
+  // ---- chart 1: grouped columns ----------------------------------------
+  (function () {
+    var svg = document.getElementById("chart1");
+    var W = 760, H = 300, M = { t: 18, r: 18, b: 52, l: 52 };
+    var iw = W - M.l - M.r, ih = H - M.t - M.b;
+    var yMax = 240;
+    var y = function (v) { return M.t + ih - (v / yMax) * ih; };
+    var band = iw / ATTEMPTS.length;
+    var BAR = Math.min(24, (band - 10) / 2 - 1);   // <=24px, leaves air in the band
+    var GAP = 2;                                    // surface gap between adjacent bars
+
+    [0, 60, 120, 180, 240].forEach(function (v) {
+      svg.appendChild(el("line", { x1: M.l, x2: M.l + iw, y1: y(v), y2: y(v),
+        stroke: v === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }));
+      svg.appendChild(txt("text", { x: M.l - 10, y: y(v) + 4, "text-anchor": "end",
+        fill: "var(--text-muted)", "font-size": 11.5, "font-variant-numeric": "tabular-nums" }, v + "s"));
+    });
+    ATTEMPTS.forEach(function (a, i) {
+      var cx = M.l + band * i + band / 2;
+      svg.appendChild(txt("text", { x: cx, y: M.t + ih + 20, "text-anchor": "middle",
+        fill: "var(--text-muted)", "font-size": 11.5, "font-variant-numeric": "tabular-nums" }, String(a)));
+
+      var pairs = [
+        { v: FIXED[i], color: S1, name: "Fixed 60s deadline (before)", dx: -(BAR + GAP / 2) },
+        { v: ESCAL[i], color: S2, name: "Escalating deadline (after)", dx: GAP / 2 }
+      ];
+      pairs.forEach(function (p) {
+        if (p.v === undefined) return;
+        var bx = cx + p.dx, by = y(p.v), bh = M.t + ih - by;
+        // 4px rounded data-end, square at the baseline
+        var d = "M" + bx + "," + (M.t + ih) + " V" + (by + 4)
+              + " a4,4 0 0 1 4,-4 H" + (bx + BAR - 4)
+              + " a4,4 0 0 1 4,4 V" + (M.t + ih) + " Z";
+        svg.appendChild(el("path", { d: d, fill: p.color }));
+        // hit target: bigger than the mark, >=24px wide
+        var hit = el("rect", { x: bx - Math.max(0, (24 - BAR) / 2), y: M.t, width: Math.max(24, BAR),
+          height: ih, fill: "transparent", tabindex: "0", role: "img",
+          "aria-label": "Attempt " + a + ", " + p.name + ", " + p.v + " seconds" });
+        function on(ev) {
+          var r = hit.getBoundingClientRect();
+          showTip(ev.clientX || (r.left + r.width / 2), ev.clientY || r.top,
+            "Attempt " + a, [{ color: p.color, value: p.v + "s", name: p.name }]);
+        }
+        hit.addEventListener("pointermove", on);
+        hit.addEventListener("pointerleave", hideTip);
+        hit.addEventListener("focus", on);
+        hit.addEventListener("blur", hideTip);
+        svg.appendChild(hit);
+        void bh;
+      });
+    });
+
+    // Selective direct labels: the extreme of each series, nothing else.
+    svg.appendChild(txt("text", { x: M.l + band * 2 + band / 2 + GAP / 2 + BAR / 2, y: y(240) - 8,
+      "text-anchor": "middle", fill: "var(--text-secondary)", "font-size": 12, "font-weight": 600 }, "240s"));
+    svg.appendChild(txt("text", { x: M.l + band / 2 - (BAR + GAP / 2) + BAR / 2, y: y(60) - 8,
+      "text-anchor": "middle", fill: "var(--text-secondary)", "font-size": 12, "font-weight": 600 }, "60s"));
+
+    // The absence of bars 5-8 is the point; say so above where they would have
+    // been. Sits clear of the 60s bar tops rather than across them.
+    var midEmpty = M.l + band * 6;
+    svg.appendChild(txt("text", { x: midEmpty, y: y(150), "text-anchor": "middle",
+      fill: "var(--text-muted)", "font-size": 12 }, "escalating run is already"));
+    svg.appendChild(txt("text", { x: midEmpty, y: y(150) + 16, "text-anchor": "middle",
+      fill: "var(--text-muted)", "font-size": 12 }, "out of budget by attempt 5"));
+
+    svg.appendChild(txt("text", { x: M.l + iw / 2, y: H - 8, "text-anchor": "middle",
+      fill: "var(--text-muted)", "font-size": 11.5 }, "attempt"));
+  })();
+
+  // ---- chart 2: cumulative line + budget reference ----------------------
+  (function () {
+    var svg = document.getElementById("chart2");
+    var W = 760, H = 300, M = { t: 26, r: 46, b: 52, l: 52 };
+    var iw = W - M.l - M.r, ih = H - M.t - M.b;
+    var yMax = 660;
+    var x = function (a) { return M.l + ((a - 1) / 7) * iw; };
+    var y = function (v) { return M.t + ih - (v / yMax) * ih; };
+
+    [0, 120, 240, 360, 480, 600].forEach(function (v) {
+      svg.appendChild(el("line", { x1: M.l, x2: M.l + iw, y1: y(v), y2: y(v),
+        stroke: v === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }));
+      svg.appendChild(txt("text", { x: M.l - 10, y: y(v) + 4, "text-anchor": "end",
+        fill: "var(--text-muted)", "font-size": 11.5, "font-variant-numeric": "tabular-nums" }, v + "s"));
+    });
+    // Threshold, not a gridline: solid hairline in the axis ink. Labelled at the
+    // left so it stays clear of the series end-labels on the right.
+    svg.appendChild(el("line", { x1: M.l, x2: M.l + iw, y1: y(BUDGET), y2: y(BUDGET),
+      stroke: "var(--axis)", "stroke-width": 1 }));
+    svg.appendChild(txt("text", { x: M.l + 6, y: y(BUDGET) - 7, fill: "var(--text-muted)",
+      "font-size": 11.5 }, "10-minute page budget"));
+
+    ATTEMPTS.forEach(function (a) {
+      svg.appendChild(txt("text", { x: x(a), y: M.t + ih + 20, "text-anchor": "middle",
+        fill: "var(--text-muted)", "font-size": 11.5, "font-variant-numeric": "tabular-nums" }, String(a)));
+    });
+
+    function path(vals, color) {
+      var d = vals.map(function (v, i) { return (i ? "L" : "M") + x(i + 1) + "," + y(v); }).join(" ");
+      svg.appendChild(el("path", { d: d, fill: "none", stroke: color, "stroke-width": 2,
+        "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      vals.forEach(function (v, i) {
+        // 2px surface ring keeps markers legible where they overlap
+        svg.appendChild(el("circle", { cx: x(i + 1), cy: y(v), r: 4, fill: color,
+          stroke: "var(--surface-1)", "stroke-width": 2 }));
+      });
+    }
+    path(CUM_FIX, S1);
+    path(CUM_ESC, S2);
+
+    // Direct-label the line ends only.
+    svg.appendChild(txt("text", { x: x(8), y: y(571) + 20, "text-anchor": "middle",
+      fill: "var(--text-secondary)", "font-size": 12, "font-weight": 600 }, "571s"));
+    svg.appendChild(txt("text", { x: x(4) + 8, y: y(600) - 8, fill: "var(--text-secondary)",
+      "font-size": 12, "font-weight": 600 }, "600s"));
+
+    svg.appendChild(txt("text", { x: M.l + iw / 2, y: H - 8, "text-anchor": "middle",
+      fill: "var(--text-muted)", "font-size": 11.5 }, "attempt"));
+
+    // Crosshair finds the X; one tooltip lists every series at that X.
+    var hair = el("line", { y1: M.t, y2: M.t + ih, stroke: "var(--axis)", "stroke-width": 1, opacity: 0 });
+    svg.appendChild(hair);
+    var overlay = el("rect", { x: M.l, y: M.t, width: iw, height: ih, fill: "transparent" });
+    svg.appendChild(overlay);
+
+    function at(ev) {
+      var r = svg.getBoundingClientRect();
+      var px = (ev.clientX - r.left) / r.width * W;
+      var a = Math.round(((px - M.l) / iw) * 7 + 1);
+      a = Math.max(1, Math.min(8, a));
+      hair.setAttribute("x1", x(a)); hair.setAttribute("x2", x(a)); hair.setAttribute("opacity", 1);
+      var rows = [{ color: S1, value: CUM_FIX[a - 1] + "s", name: "Fixed (before)" }];
+      if (CUM_ESC[a - 1] !== undefined) rows.push({ color: S2, value: CUM_ESC[a - 1] + "s", name: "Escalating (after)" });
+      else rows.push({ color: S2, value: "—", name: "Escalating (out of budget)" });
+      showTip(ev.clientX, ev.clientY, "Attempt " + a, rows);
+    }
+    overlay.addEventListener("pointermove", at);
+    overlay.addEventListener("pointerleave", function () { hair.setAttribute("opacity", 0); hideTip(); });
+
+    // Keyboard parity: the crosshair is pointer-only, so give each X its own
+    // focusable target showing the same readout hover does.
+    ATTEMPTS.forEach(function (a) {
+      var label = "Attempt " + a + ", fixed " + CUM_FIX[a - 1] + " seconds elapsed"
+        + (CUM_ESC[a - 1] !== undefined ? ", escalating " + CUM_ESC[a - 1] + " seconds elapsed"
+                                        : ", escalating run already out of budget");
+      var stop = el("rect", { x: x(a) - 14, y: M.t, width: 28, height: ih, fill: "transparent",
+        tabindex: "0", role: "img", "aria-label": label });
+      stop.addEventListener("focus", function () {
+        var r = stop.getBoundingClientRect();
+        hair.setAttribute("x1", x(a)); hair.setAttribute("x2", x(a)); hair.setAttribute("opacity", 1);
+        var rows = [{ color: S1, value: CUM_FIX[a - 1] + "s", name: "Fixed (before)" }];
+        if (CUM_ESC[a - 1] !== undefined) rows.push({ color: S2, value: CUM_ESC[a - 1] + "s", name: "Escalating (after)" });
+        else rows.push({ color: S2, value: "—", name: "Escalating (out of budget)" });
+        showTip(r.left + r.width / 2, r.top + 40, "Attempt " + a, rows);
+      });
+      stop.addEventListener("blur", function () { hair.setAttribute("opacity", 0); hideTip(); });
+      svg.appendChild(stop);
+    });
+  })();
+
+  // ---- table view -------------------------------------------------------
+  (function () {
+    var tb = document.getElementById("tbody");
+    ATTEMPTS.forEach(function (a, i) {
+      var tr = document.createElement("tr");
+      [String(a),
+       FIXED[i] + "s",
+       ESCAL[i] !== undefined ? ESCAL[i] + "s" : "—",
+       CUM_FIX[i] + "s",
+       CUM_ESC[i] !== undefined ? CUM_ESC[i] + "s" : "—"
+      ].forEach(function (v, j) {
+        var cell = document.createElement(j === 0 ? "th" : "td");
+        if (j === 0) cell.setAttribute("scope", "row");
+        cell.textContent = v;
+        tr.appendChild(cell);
+      });
+      tb.appendChild(tr);
+    });
+  })();
+
+  // ---- theme toggle (must beat the OS setting both ways) ----------------
+  (function () {
+    var btn = document.getElementById("themeBtn");
+    function current() {
+      var stamp = document.documentElement.getAttribute("data-theme");
+      if (stamp) return stamp;
+      return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    function sync() { btn.textContent = current() === "dark" ? "Light" : "Dark"; }
+    btn.addEventListener("click", function () {
+      document.documentElement.setAttribute("data-theme", current() === "dark" ? "light" : "dark");
+      sync();
+    });
+    sync();
+  })();
+})();
+</script>
+</body>
+</html>
