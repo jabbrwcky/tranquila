@@ -55,11 +55,12 @@ type SyncCmd struct {
 	DiscoveryBatchSize  int  `name:"discovery-batch-size" env:"TRANQUILA_DISCOVERY_BATCH_SIZE" default:"100000" help:"Objects to discover per bucket before syncing; next batch starts after sync drains (0 = default 100000)"`
 	MaxWorkersPerBucket int  `name:"max-workers-per-bucket" env:"TRANQUILA_MAX_WORKERS_PER_BUCKET" default:"0" help:"Cap on concurrent transfers for a single bucket, so one large bucket cannot starve others (0 = auto: half of --workers)"`
 
-	ListAttemptTimeout          time.Duration `name:"list-attempt-timeout" env:"TRANQUILA_LIST_ATTEMPT_TIMEOUT" default:"0" help:"Starting timeout for a single ListObjectsV2 attempt, flat or sharded; doubles after each timed-out attempt up to 4x (0 = default 60s)"`
+	ListAttemptTimeout          time.Duration `name:"list-attempt-timeout" env:"TRANQUILA_LIST_ATTEMPT_TIMEOUT" default:"0" help:"Starting timeout for a single ListObjectsV2 attempt, flat or sharded; doubles after each timed-out attempt up to 4x (0 = default 60s). See --list-retry-budget, which bounds how far escalation can actually reach."`
 	ShardedDiscoveryConcurrency int           `name:"sharded-discovery-concurrency" env:"TRANQUILA_SHARDED_DISCOVERY_CONCURRENCY" default:"0" help:"Concurrent prefix listings during sharded discovery (0 = default 4); lower for a source backend whose LIST calls are slow even in isolation"`
 	DiscoveryCheckpoints        bool          `name:"discovery-checkpoints" env:"TRANQUILA_DISCOVERY_CHECKPOINTS" default:"true" help:"Persist a per-prefix resume point during sharded discovery, so a prefix whose listing fails continues where it stopped on the next cycle instead of re-listing from its first page"`
-	DiscoveryPrefixBudget       time.Duration `name:"discovery-prefix-budget" env:"TRANQUILA_DISCOVERY_PREFIX_BUDGET" default:"0" help:"How long one prefix may be listed in a single sharded walk before it yields its slot to other prefixes (0 = default 10m, negative = unbounded)"`
+	DiscoveryPrefixBudget       time.Duration `name:"discovery-prefix-budget" env:"TRANQUILA_DISCOVERY_PREFIX_BUDGET" default:"0" help:"How long one prefix may be listed in a single sharded walk before it yields its slot to other prefixes (0 = default 10m, negative = unbounded); see --list-retry-budget, a different scope (one page, not one prefix) that compounds with this"`
 	DiscoveryCheckpointTTL      time.Duration `name:"discovery-checkpoint-ttl" env:"TRANQUILA_DISCOVERY_CHECKPOINT_TTL" default:"24h" help:"How long a sharded-discovery resume point stays valid without being refreshed; after this the prefix is listed from the start again"`
+	ListRetryBudget             time.Duration `name:"list-retry-budget" env:"TRANQUILA_LIST_RETRY_BUDGET" default:"0" help:"How long listPageWithRetry may keep retrying one ListObjectsV2 page, including escalated per-attempt deadlines (0 = default 10m, negative = unbounded). See --discovery-prefix-budget, a different scope (one prefix's whole walk, not one page)."`
 
 	Watch         bool          `name:"watch" env:"TRANQUILA_WATCH" default:"false" help:"Continuously re-run sync until interrupted"`
 	WatchMode     string        `name:"watch-mode" env:"TRANQUILA_WATCH_MODE" default:"poll" enum:"poll,minio,sqs" help:"Watch backend: poll|minio|sqs"`
@@ -214,6 +215,43 @@ func loadMappingFile(path string) ([]string, error) {
 	return lines, nil
 }
 
+// warnIfListBudgetsBindFirst logs once when a bounded --list-retry-budget or
+// --discovery-prefix-budget sits below the escalated --list-attempt-timeout
+// ceiling, so it — not the attempt timeout — is what actually cuts a slow
+// prefix off. By the time an operator sees a truncated deadline mid-run,
+// they've already lost a cycle diagnosing the wrong knob; this turns it into
+// a config lint at startup instead. Local consts mirror internal/storage's
+// unexported defaults — exporting internal tuning constants across the
+// package boundary for one warning is a bigger surface than the warning
+// itself.
+func warnIfListBudgetsBindFirst(cmd *SyncCmd) {
+	const (
+		defaultListAttemptTimeout    = 60 * time.Second // storage.defaultListAttemptTimeout
+		listAttemptTimeoutMaxFactor  = 4                // storage.listAttemptTimeoutMaxFactor
+		defaultListRetryBudget       = 10 * time.Minute // storage.defaultListRetryBudget
+		defaultDiscoveryPrefixBudget = 10 * time.Minute // storage.defaultDiscoveryPrefixBudget
+	)
+	attemptTimeout := cmd.ListAttemptTimeout
+	if attemptTimeout <= 0 {
+		attemptTimeout = defaultListAttemptTimeout
+	}
+	ceiling := attemptTimeout * listAttemptTimeoutMaxFactor
+
+	warnIfBelow := func(flag string, configured, def time.Duration) {
+		b := configured
+		if b == 0 {
+			b = def
+		}
+		// A negative budget means unbounded, so it never binds first.
+		if b > 0 && b < ceiling {
+			log.Warn().Str("flag", flag).Dur("budget", b).Dur("escalation_ceiling", ceiling).
+				Msg("this budget is lower than the escalated list-attempt-timeout ceiling and will bind first; raising --list-attempt-timeout alone will not avoid truncation")
+		}
+	}
+	warnIfBelow("list-retry-budget", cmd.ListRetryBudget, defaultListRetryBudget)
+	warnIfBelow("discovery-prefix-budget", cmd.DiscoveryPrefixBudget, defaultDiscoveryPrefixBudget)
+}
+
 func (cmd *SyncCmd) Run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -248,6 +286,8 @@ func (cmd *SyncCmd) Run() error {
 		checkpoints = store
 	}
 
+	warnIfListBudgetsBindFirst(cmd)
+
 	log.Debug().Str("endpoint", cmd.Source.Endpoint).Str("region", cmd.Source.Region).Msg("creating source client")
 	src, err := storage.NewClient(ctx, storage.Config{
 		Endpoint:                    cmd.Source.Endpoint,
@@ -262,6 +302,7 @@ func (cmd *SyncCmd) Run() error {
 		ShardedDiscoveryConcurrency: cmd.ShardedDiscoveryConcurrency,
 		DiscoveryCheckpoints:        checkpoints,
 		DiscoveryPrefixBudget:       cmd.DiscoveryPrefixBudget,
+		ListRetryBudget:             cmd.ListRetryBudget,
 	})
 	if err != nil {
 		return fmt.Errorf("create source S3 client: %w", err)
