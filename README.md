@@ -53,6 +53,23 @@ Output columns: `BUCKET | LAST COLLECTED | TOTAL | SYNCED | PENDING | FAILED`
 
 When a sync is actively running, two additional columns are shown: `RATE | ETA`.
 
+### `tranquila completion <bash|zsh|fish>`
+
+Prints a shell completion script to stdout, generated from the live CLI grammar — every flag,
+subcommand and enum is picked up automatically, with nothing to keep in sync by hand.
+
+```shell
+# Load once per shell session
+source <(tranquila completion bash)
+source <(tranquila completion zsh)
+tranquila completion fish | source
+
+# Or install permanently
+tranquila completion bash > /etc/bash_completion.d/tranquila
+tranquila completion zsh > "${fpath[1]}/_tranquila"
+tranquila completion fish > ~/.config/fish/completions/tranquila.fish
+```
+
 ## Configuration
 
 Priority order (highest wins):

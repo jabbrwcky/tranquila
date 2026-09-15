@@ -27,6 +27,7 @@ type CLI struct {
 	Version          kong.VersionFlag `name:"version" short:"V" help:"Show version and exit"`
 	Sync             SyncCmd          `cmd:"" default:"" help:"Synchronize S3 buckets (default)"`
 	Status           StatusCmd        `cmd:"" help:"Show synchronization status"`
+	Completion       CompletionCmd    `cmd:"" help:"Generate a shell completion script"`
 }
 
 // buildParser constructs the kong parser for cli, loading YAML config from cfgPaths in order.
