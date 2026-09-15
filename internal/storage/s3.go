@@ -81,6 +81,13 @@ type Client struct {
 	checkpoints                 DiscoveryCheckpointer // nil = checkpointing disabled
 	discoveryPrefixBudget       time.Duration
 	listRetryBudget             time.Duration
+
+	// parkedMu guards parkedPrefixes: sharded discovery for several buckets can
+	// run concurrently on one Client, and ListObjectsTree writes it from
+	// whichever goroutine called it while the metrics callback and
+	// ParkedPrefixes read it from others.
+	parkedMu       sync.Mutex
+	parkedPrefixes map[string]int64 // bucket -> count as of its last completed cycle
 }
 
 func NewClient(ctx context.Context, cfg Config) (*Client, error) {
@@ -151,6 +158,7 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 		checkpoints:                 cfg.DiscoveryCheckpoints,
 		discoveryPrefixBudget:       discoveryPrefixBudget,
 		listRetryBudget:             defaultListRetryBudget,
+		parkedPrefixes:              make(map[string]int64),
 	}
 	if err := c.initMetrics(cfg); err != nil {
 		return nil, err
@@ -202,6 +210,20 @@ func (c *Client) initMetrics(cfg Config) error {
 				v = 1
 			}
 			o.Observe(v, metric.WithAttributes(m.attrs...))
+			return nil
+		})); err != nil {
+		return fmt.Errorf("init s3 metrics: %w", err)
+	}
+	// Source-only in practice — nothing lists the destination, so its
+	// parkedPrefixes map stays empty and this reports nothing for it.
+	if _, err = meter.Int64ObservableGauge("tranquila.s3.discovery.parked_prefixes",
+		metric.WithDescription("Sharded-discovery prefixes resumed onto a checkpointed page the backend still could not answer, per bucket, as of the most recently completed cycle"),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			c.parkedMu.Lock()
+			defer c.parkedMu.Unlock()
+			for bucket, n := range c.parkedPrefixes {
+				o.Observe(n, metric.WithAttributes(attribute.String("endpoint", name), attribute.String("bucket", bucket)))
+			}
 			return nil
 		})); err != nil {
 		return fmt.Errorf("init s3 metrics: %w", err)
@@ -769,8 +791,33 @@ const defaultDiscoveryPrefixBudget = 10 * time.Minute
 // 2+ minutes with zero response). Sibling prefixes are listed concurrently,
 // bounded by c.shardedDiscoveryConcurrency.
 func (c *Client) ListObjectsTree(ctx context.Context, bucket, rootPrefix string, onPage func([]Object) error) error {
-	return listObjectsTree(ctx, bucket, rootPrefix, c.listDelimitedPage(bucket), onPage,
+	parked, err := listObjectsTree(ctx, bucket, rootPrefix, c.listDelimitedPage(bucket), onPage,
 		c.shardedDiscoveryConcurrency, c.discoveryPrefixBudget, c.checkpointFor(bucket))
+	c.recordParkedPrefixes(bucket, parked)
+	return err
+}
+
+// recordParkedPrefixes stores bucket's parked-prefix count from the cycle that
+// just finished (however it finished — partial counts on a fatal error or
+// cancellation are still the best information available). ParkedPrefixes and
+// the tranquila.s3.discovery.parked_prefixes gauge both read this.
+func (c *Client) recordParkedPrefixes(bucket string, n int) {
+	c.parkedMu.Lock()
+	defer c.parkedMu.Unlock()
+	if c.parkedPrefixes == nil {
+		c.parkedPrefixes = make(map[string]int64)
+	}
+	c.parkedPrefixes[bucket] = int64(n)
+}
+
+// ParkedPrefixes reports how many sharded-discovery prefixes parked — resumed
+// onto a checkpointed page the backend still could not answer, delivering
+// zero pages — during bucket's most recently completed cycle. 0 means either
+// none did, or the bucket has not been sharded-discovered on this Client yet.
+func (c *Client) ParkedPrefixes(bucket string) int64 {
+	c.parkedMu.Lock()
+	defer c.parkedMu.Unlock()
+	return c.parkedPrefixes[bucket]
 }
 
 // maxReportedPrefixErrs caps how many per-prefix failures are retained for the
@@ -793,7 +840,7 @@ const maxReportedPrefixErrs = 10
 // bucket is used for logging only — the listing itself gets it from the closure
 // in list — but without it a per-prefix line is unattributable: several buckets
 // are walked concurrently, so "prefix=20260206/" alone does not say whose.
-func listObjectsTree(ctx context.Context, bucket, rootPrefix string, list listDelimitedFn, onPage func([]Object) error, concurrency int, prefixBudget time.Duration, ckpt prefixCheckpoint) error {
+func listObjectsTree(ctx context.Context, bucket, rootPrefix string, list listDelimitedFn, onPage func([]Object) error, concurrency int, prefixBudget time.Duration, ckpt prefixCheckpoint) (parked int, err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -805,6 +852,7 @@ func listObjectsTree(ctx context.Context, bucket, rootPrefix string, list listDe
 	var fatalErr error
 	var prefixErrs []error
 	var prefixErrCount int
+	var parkedCount int
 
 	// setFatal aborts the whole walk: an onPage failure is the caller's (state
 	// writes, cancellation), so continuing to list would be pointless.
@@ -837,6 +885,17 @@ func listObjectsTree(ctx context.Context, bucket, rootPrefix string, list listDe
 				fmt.Errorf("and %d more prefixes failed", prefixErrCount-len(prefixErrs)))...)
 		}
 		return errors.Join(prefixErrs...)
+	}
+	// markParked records a prefix that resumed onto its checkpointed page and
+	// still could not get past it — the one way checkpointing can stall,
+	// bounded only by the checkpoint's TTL. Counted per walk, not tracked as
+	// persistent state across walks: every cycle re-attempts every prefix from
+	// the root, so a prefix the backend can answer again simply stops being
+	// counted on its next cycle.
+	markParked := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		parkedCount++
 	}
 
 	// enqueue reserves the WaitGroup slot synchronously (so a concurrent
@@ -938,6 +997,7 @@ func listObjectsTree(ctx context.Context, bucket, rootPrefix string, list listDe
 						// unanswerable page is the one way checkpointing can stall
 						// (bounded only by the checkpoint's TTL).
 						ev = log.Error()
+						markParked()
 					}
 					ev.Err(err).Str("bucket", bucket).Str("prefix", prefix).
 						Bool("resumed", resumed).Bool("budget_exhausted", budgetExhausted).
@@ -1046,13 +1106,17 @@ func listObjectsTree(ctx context.Context, bucket, rootPrefix string, list listDe
 		}
 	}
 
+	mu.Lock()
+	parked = parkedCount
+	mu.Unlock()
+
 	if err := getFatal(); err != nil {
-		return err
+		return parked, err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return parked, err
 	}
-	return joinPrefixErrs()
+	return parked, joinPrefixErrs()
 }
 
 func (c *Client) EnsureBucket(ctx context.Context, bucket string) error {

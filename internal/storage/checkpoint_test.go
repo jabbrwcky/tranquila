@@ -144,7 +144,7 @@ func pagedLeaf(pages ...[]string) treePages {
 func collectKeys(t *testing.T, list listDelimitedFn, ckpt prefixCheckpoint, ops *[]string) ([]string, error) {
 	t.Helper()
 	var got []string
-	err := listObjectsTree(context.Background(), "b", "", list, func(objs []Object) error {
+	_, err := listObjectsTree(context.Background(), "b", "", list, func(objs []Object) error {
 		for _, o := range objs {
 			got = append(got, o.Key)
 			if ops != nil {
@@ -245,6 +245,52 @@ func TestListObjectsTreeFailedPrefixRetainsCheckpoint(t *testing.T) {
 	}
 }
 
+// A prefix parks when it RESUMES onto its checkpointed page and that page is
+// still unanswerable — cycle 1's first-ever failure does not count (nothing
+// to resume onto yet), but cycle 2's repeat failure on the same resumed page
+// does. Parked is counted per walk, not carried as state across walks: a
+// prefix that recovers simply stops being counted on its next cycle.
+func TestListObjectsTreeReportsParkedPrefixes(t *testing.T) {
+	pages := pagedLeaf([]string{"a"}, []string{"b"}, []string{"c"}, []string{"d"})
+	failing := pages
+	failing.failPages = []int{2}
+
+	ckpt := newFakeCheckpoint(nil)
+
+	// Cycle 1: first failure ever seen for this prefix. Not resumed (nothing
+	// was loaded from the checkpoint store), so not parked.
+	parked, err := listObjectsTree(context.Background(), "b", "", fakePagedTree(t, map[string]treePages{"": failing}),
+		func([]Object) error { return nil }, 1, 0, ckpt)
+	if err == nil {
+		t.Fatal("expected the prefix failure to be reported")
+	}
+	if parked != 0 {
+		t.Errorf("cycle 1 parked = %d, want 0 (a first failure is not a resume)", parked)
+	}
+
+	// Cycle 2: resumes onto page 2 via the stored checkpoint, which the
+	// backend still cannot answer. Delivers zero pages this cycle — parked.
+	parked, err = listObjectsTree(context.Background(), "b", "", fakePagedTree(t, map[string]treePages{"": failing}),
+		func([]Object) error { return nil }, 1, 0, ckpt)
+	if err == nil {
+		t.Fatal("expected the resumed prefix to fail again")
+	}
+	if parked != 1 {
+		t.Errorf("cycle 2 parked = %d, want 1", parked)
+	}
+
+	// Cycle 3: backend recovers. The prefix completes and is not counted —
+	// parked reflects only the walk that just ran, not accumulated history.
+	parked, err = listObjectsTree(context.Background(), "b", "", fakePagedTree(t, map[string]treePages{"": pages}),
+		func([]Object) error { return nil }, 1, 0, ckpt)
+	if err != nil {
+		t.Fatalf("cycle 3: %v", err)
+	}
+	if parked != 0 {
+		t.Errorf("cycle 3 parked = %d, want 0 (the prefix recovered)", parked)
+	}
+}
+
 // A token may only be persisted once its own page's objects have been accepted.
 // Saving earlier could record a resume point past objects that never reached
 // onPage at all.
@@ -256,7 +302,7 @@ func TestListObjectsTreeCheckpointSavedAfterOnPage(t *testing.T) {
 	ckpt := newFakeCheckpoint(&ops)
 
 	var inOnPage atomic.Bool
-	err := listObjectsTree(context.Background(), "b", "", list, func(objs []Object) error {
+	_, err := listObjectsTree(context.Background(), "b", "", list, func(objs []Object) error {
 		if !inOnPage.CompareAndSwap(false, true) {
 			t.Error("onPage invoked concurrently — must be called from a single goroutine")
 		}
@@ -291,7 +337,7 @@ func TestListObjectsTreeOnPageErrorDoesNotSaveCheckpoint(t *testing.T) {
 	ckpt := newFakeCheckpoint(nil)
 	wantErr := errors.New("mark pending failed")
 
-	err := listObjectsTree(context.Background(), "b", "", list,
+	_, err := listObjectsTree(context.Background(), "b", "", list,
 		func([]Object) error { return wantErr }, 1, 0, ckpt)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("got err %v, want it to wrap %v", err, wantErr)
@@ -434,7 +480,7 @@ func TestListObjectsTreePrefixBudgetYieldsAndBanksProgress(t *testing.T) {
 
 	ckpt := newFakeCheckpoint(nil)
 	var got []string
-	err := listObjectsTree(context.Background(), "b", "", slow, func(objs []Object) error {
+	_, err := listObjectsTree(context.Background(), "b", "", slow, func(objs []Object) error {
 		for _, o := range objs {
 			got = append(got, o.Key)
 		}

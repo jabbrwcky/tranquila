@@ -49,7 +49,14 @@ tranquila status --server https://tranquila.example.svc:8080 bucket1
 `host:port` is assumed `http://` for local/dev use; in a cluster where the
 API is fronted by TLS, pass the full `https://...` URL.
 
-Output columns: `BUCKET | LAST COLLECTED | TOTAL | SYNCED | PENDING | FAILED`
+Output columns: `BUCKET | LAST COLLECTED | TOTAL | SYNCED | PENDING | FAILED | PARKED` (plus
+`RATE | ETA` while a bucket is actively syncing). `PARKED` is how many sharded-discovery prefixes
+resumed onto a checkpointed page the backend still could not answer, as of that bucket's most
+recently completed cycle — `-` means the server has no source client wired to report it (an older
+`tranquila`), distinct from a real `0` (genuinely nothing parked). A nonzero, persistent value here
+is the visible symptom of a bucket discovery cannot make progress on; see
+[Prefix-Sharded Discovery](#prefix-sharded-discovery) for what it means and
+`--discovery-prefix-budget`/`--list-retry-budget` for the knobs that affect it.
 
 When a sync is actively running, two additional columns are shown: `RATE | ETA`.
 
@@ -306,6 +313,13 @@ Details worth knowing:
 - Watch for `sharded discovery: resuming prefix from stored checkpoint` at info level. An `Error`
   line naming a prefix that resumed and listed **zero** pages before failing means that prefix is
   pinned on a page the backend cannot answer at all; it will stay there until the TTL expires.
+- **This count doesn't require grepping logs.** Every such prefix — one that resumed onto its
+  checkpoint and still delivered zero pages — is counted for the cycle that just ran, exposed as
+  the `tranquila.s3.discovery.parked_prefixes` gauge (per bucket) and the `PARKED` column in
+  `tranquila status`. A bucket where this number stays high and steady across cycles has most of
+  its prefixes stuck, not just a slow backend — on a bucket that large, checkpointing alone can no
+  longer make forward progress, and driving the initial backfill from an out-of-band key list
+  instead of sharded discovery is the more honest fix.
 
 **A prefix that keeps failing no longer takes the bucket down with it.** Each prefix is listed independently: one that exhausts its retries is logged (`sharded discovery: prefix listing failed after retries, continuing with other prefixes`), skipped, and retried on the next cycle, while every other prefix still completes and syncs. Discovery reports those failures at the end of the cycle, so the bucket's cycle is still marked failed and retried — but the objects it *could* reach are already synced rather than discarded. On a bucket with hundreds of prefixes, only the first few failures are named in the cycle error, followed by a count of the rest.
 
@@ -502,6 +516,7 @@ tranquila sync --telemetry-exporter=otlp --telemetry-otlp-endpoint=localhost:431
 | `tranquila.s3.rate_limit`          | Gauge ({call}/s)| `endpoint`            | Effective rate limit; 0 when unlimited             |
 | `tranquila.s3.rate_limit.degraded` | Gauge           | `endpoint`            | 1 while congestion control has reduced the limit   |
 | `tranquila.s3.rate_limit.changes`  | Counter         | `endpoint`, `direction` | Rate-limit adjustments; detects oscillation      |
+| `tranquila.s3.discovery.parked_prefixes` | Gauge     | `endpoint`, `bucket`  | Sharded-discovery prefixes stuck on an unanswerable checkpointed page, as of the last completed cycle |
 
 Useful alerts:
 
@@ -511,6 +526,9 @@ tranquila_s3_rate_limit_degraded == 1
 
 # Watch cycles are failing: the process is alive but not making progress
 rate(tranquila_sync_cycle_failures_total[15m]) > 0
+
+# A bucket has prefixes it cannot make progress on
+tranquila_s3_discovery_parked_prefixes > 0
 ```
 
 ### Grafana dashboard

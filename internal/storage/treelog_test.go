@@ -106,7 +106,7 @@ func TestListObjectsTreeLogsNameTheirBucket(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			buf := captureLogs(t)
 
-			_ = listObjectsTree(context.Background(), "events", "", tc.list(t),
+			_, _ = listObjectsTree(context.Background(), "events", "", tc.list(t),
 				func([]Object) error { return nil }, 1, 0, tc.ckpt())
 
 			var found bool
