@@ -60,6 +60,23 @@ is the visible symptom of a bucket discovery cannot make progress on; see
 
 When a sync is actively running, two additional columns are shown: `RATE | ETA`.
 
+### `tranquila completion <bash|zsh|fish>`
+
+Prints a shell completion script to stdout, generated from the live CLI grammar — every flag,
+subcommand and enum is picked up automatically, with nothing to keep in sync by hand.
+
+```shell
+# Load once per shell session
+source <(tranquila completion bash)
+source <(tranquila completion zsh)
+tranquila completion fish | source
+
+# Or install permanently
+tranquila completion bash > /etc/bash_completion.d/tranquila
+tranquila completion zsh > "${fpath[1]}/_tranquila"
+tranquila completion fish > ~/.config/fish/completions/tranquila.fish
+```
+
 ## Configuration
 
 Priority order (highest wins):
@@ -119,6 +136,7 @@ sync:
   discovery-prefix-budget: 0s           # per-prefix listing budget per cycle (0 = default 10m, negative = unbounded)
   discovery-checkpoints: true           # resume a failed prefix where it stopped, not from page 1
   discovery-checkpoint-ttl: 24h         # how long an unrefreshed resume point survives
+  list-retry-budget: 0s                 # per-page retry budget, including escalation (0 = default 10m, negative = unbounded)
 
   # Continuous watch mode
   watch: false
@@ -263,7 +281,7 @@ Like `burn-after-reading`/`propagate-deletes`, this is only available via struct
 - `--discovery-batch-size`'s pause-while-a-batch-drains pacing doesn't apply to sharded discovery — there's no single continuation token for a tree walk to pause on. Backpressure instead comes from the same per-bucket worker cap (`--max-workers-per-bucket`) that already throttles flat discovery, which bounds it identically in practice.
 - A bucket with no `/`-delimited key structure gains nothing from sharding (there's nothing to shard by) but isn't harmed either — it just becomes one listing call at the root, same shape as flat.
 - Every `ListObjectsV2` attempt (flat or sharded) is individually bounded by `--list-attempt-timeout` (default 60s). A healthy call finishes in well under that; a hanging one fails and retries instead of blocking a discovery goroutine forever.
-- The flag sets the timeout for the **first** attempt only. Each attempt that times out doubles the deadline for the next one, up to 4x the configured value, because retrying a deadline with the same deadline cannot succeed — a prefix that genuinely needs 90s to list would otherwise fail identically on every attempt. Failures that are not timeouts (a 504, say) do not extend the deadline. The whole retry loop is capped at 10 minutes per page regardless.
+- The flag sets the timeout for the **first** attempt only. Each attempt that times out doubles the deadline for the next one, up to 4x the configured value, because retrying a deadline with the same deadline cannot succeed — a prefix that genuinely needs 90s to list would otherwise fail identically on every attempt. Failures that are not timeouts (a 504, say) do not extend the deadline. The whole retry loop for one page is capped by `--list-retry-budget` (default 10m, negative = unbounded) regardless of how far the deadline escalated — see below, since raising `--list-attempt-timeout` alone does not help once this budget is what's actually binding.
 - A timed-out attempt counts as endpoint congestion, so it feeds the rate-limit degradation described above. Listings timing out under load will therefore slow tranquila down, which is usually what relieves the pressure causing them.
 
 **Tuning for a slow backend.** Sharding narrows *what* each listing call covers, but if the backend itself is slow per-call — regardless of how narrow the prefix is — narrower scope alone may not be enough once several listings run concurrently. Two knobs:
@@ -278,6 +296,15 @@ tranquila sync --list-attempt-timeout=3m
 ```
 
 Both apply to the source endpoint only (nothing lists the destination). If you also have `--source-rate-limit` set, make sure it's sized for what the backend can actually sustain — a limit far above real capacity does not prevent the contention that pushes individual calls past the attempt timeout.
+
+**Raising `--list-attempt-timeout` alone can stop helping once a budget binds first.** Two separate budgets bound how long tranquila keeps retrying, and both default to 10 minutes: `--list-retry-budget` bounds one *page*'s retry loop (attempt deadlines are `min(escalated timeout, budget remaining)`), and `--discovery-prefix-budget` bounds a whole *prefix*'s multi-page walk in sharded discovery, nested around the page budget. Whichever is smaller in wall-clock terms at any moment wins — so an escalated attempt timeout can get silently truncated to far less than configured once either budget's remaining time runs low, producing a `context deadline exceeded` that looks like a misconfigured `--list-attempt-timeout` but is really the budget expiring. If you deliberately raise `--list-attempt-timeout` past a couple of minutes, raise the relevant budget(s) to match (or set them negative for unbounded, accepting that an unanswerable prefix then holds its slot longer):
+
+```shell
+tranquila sync --list-attempt-timeout=2m --list-retry-budget=20m
+tranquila sync --list-attempt-timeout=2m --discovery-prefix-budget=-1   # unbounded, sharded discovery only
+```
+
+tranquila logs a one-time `Warn` at startup ("this budget is lower than the escalated list-attempt-timeout ceiling and will bind first") when a bounded budget sits below the escalation ceiling (`list-attempt-timeout × 4`), naming which flag is the actual constraint.
 
 **Progress survives a failed cycle.** A prefix that dies partway through its pages used to be
 re-listed from its *first* page on the next cycle, so on a bucket whose pages are already at the

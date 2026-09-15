@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -51,6 +52,13 @@ type Config struct {
 	// defaultDiscoveryPrefixBudget, negative = unbounded). Only meaningful on
 	// the source client.
 	DiscoveryPrefixBudget time.Duration
+	// ListRetryBudget bounds how long listPageWithRetry may keep retrying one
+	// page's ListObjectsV2 call, including escalated per-attempt deadlines
+	// (0 = default defaultListRetryBudget, negative = unbounded). Distinct
+	// scope from DiscoveryPrefixBudget: this bounds one page's retries;
+	// DiscoveryPrefixBudget bounds a whole prefix's multi-page walk. Only
+	// meaningful on the source client.
+	ListRetryBudget time.Duration
 }
 
 type Object struct {
@@ -112,7 +120,17 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 		return retry.AddWithMaxAttempts(retry.NewStandard(), s3MaxAttempts)
 	}
 
-	clientOpts := []func(*s3.Options){}
+	clientOpts := []func(*s3.Options){
+		// The SDK's own default stderr logger bypasses our zerolog pipeline
+		// entirely, with no bucket/key/request context, and warns on every
+		// GetObject response lacking an SDK-recognized checksum header —
+		// benign and expected against non-AWS S3-compatible backends,
+		// tranquila's primary target, which commonly don't echo one. Not
+		// load-bearing: tranquila does its own multi-tier verification
+		// elsewhere (PutObject's CRC32, HeadObject's ChecksumMode,
+		// performVerifyAndDelete's tiered CRC32->ETag->content-hash fallback).
+		func(o *s3.Options) { o.DisableLogOutputChecksumValidationSkipped = true },
+	}
 	if cfg.Endpoint != "" {
 		endpoint := cfg.Endpoint
 		clientOpts = append(clientOpts, func(o *s3.Options) {
@@ -146,6 +164,11 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	if discoveryPrefixBudget == 0 {
 		discoveryPrefixBudget = defaultDiscoveryPrefixBudget
 	}
+	// Same convention as discoveryPrefixBudget above.
+	listRetryBudget := cfg.ListRetryBudget
+	if listRetryBudget == 0 {
+		listRetryBudget = defaultListRetryBudget
+	}
 
 	c := &Client{
 		s3:                          s3c,
@@ -157,7 +180,7 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 		shardedDiscoveryConcurrency: shardedDiscoveryConcurrency,
 		checkpoints:                 cfg.DiscoveryCheckpoints,
 		discoveryPrefixBudget:       discoveryPrefixBudget,
-		listRetryBudget:             defaultListRetryBudget,
+		listRetryBudget:             listRetryBudget,
 		parkedPrefixes:              make(map[string]int64),
 	}
 	if err := c.initMetrics(cfg); err != nil {
@@ -507,11 +530,11 @@ const (
 	// this, a single page is so slow that the answer is a narrower prefix (or
 	// a healthier backend), not more waiting.
 	listAttemptTimeoutMaxFactor = 4
-	// defaultListRetryBudget bounds the whole retry loop. Escalating deadlines
-	// would otherwise let an unanswerable prefix hold a discovery slot far
-	// longer than the fixed-deadline loop this replaces; the budget keeps the
+	// defaultListRetryBudget bounds the whole retry loop, unless
+	// Config.ListRetryBudget overrides it. Escalating deadlines would
+	// otherwise let an unanswerable prefix hold a discovery slot far longer
+	// than the fixed-deadline loop this replaces; the budget keeps the
 	// all-timeouts worst case at roughly what 8 fixed 60s attempts cost.
-	// Overridable per Client only as a test seam; no Config field or flag.
 	defaultListRetryBudget = 10 * time.Minute
 )
 
@@ -547,6 +570,27 @@ func escalateListTimeout(cur, max time.Duration, timedOut bool) time.Duration {
 	return min(cur*2, max)
 }
 
+// unboundedRemaining stands in for "no budget" so callers can feed it straight
+// into min(timeout, remaining) / min(delay, remaining) with no separate branch
+// for the unbounded case — the same no-nil-pointer, no-branch convention this
+// codebase already uses for rate.Inf ("the limiter is always constructed so
+// the pointer is never nil").
+const unboundedRemaining = time.Duration(math.MaxInt64)
+
+// budgetRemaining reports how much of listRetryBudget is left for the next
+// attempt, and whether the budget is exhausted. A non-positive listRetryBudget
+// means unbounded: never exhausted, unboundedRemaining left. Without this
+// gate, a negative budget (the "unbounded" convention shared with
+// discoveryPrefixBudget) would make remaining negative from the very first
+// attempt, breaking the loop immediately — the opposite of "unbounded".
+func budgetRemaining(listRetryBudget time.Duration, began time.Time) (remaining time.Duration, exhausted bool) {
+	if listRetryBudget <= 0 {
+		return unboundedRemaining, false
+	}
+	remaining = listRetryBudget - time.Since(began)
+	return remaining, remaining <= 0
+}
+
 func listErrClass(err error, timedOut bool) ErrClass {
 	if timedOut {
 		return ClassTransient
@@ -579,8 +623,8 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 		}
 		// Escalating deadlines can outrun listMaxRetries, so the budget — not
 		// the attempt count — is what bounds an unanswerable prefix.
-		remaining := c.listRetryBudget - time.Since(began)
-		if remaining <= 0 {
+		remaining, exhausted := budgetRemaining(c.listRetryBudget, began)
+		if exhausted {
 			break
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, min(timeout, remaining))
@@ -601,10 +645,11 @@ func (c *Client) listPageWithRetry(ctx context.Context, input *s3.ListObjectsV2I
 		// Jitter keeps replicas sharing an endpoint from retrying in lockstep.
 		delay += rand.N(delay / 2)
 		// Never sleep past the budget: the next iteration would only break.
+		// A no-op when unbounded, since remaining is then unboundedRemaining.
 		delay = min(delay, remaining)
 		log.Warn().Err(err).Str("bucket", bucket).Str("prefix", prefix).
-			Int("attempt", attempt+1).Dur("retry_in", delay).
-			Dur("next_timeout", timeout).Bool("timed_out", timedOut).
+			Int("attempt", attempt+1).Str("retry_in", delay.String()).
+			Str("next_timeout", timeout.String()).Bool("timed_out", timedOut).
 			Msg("transient list error, retrying")
 		select {
 		case <-time.After(delay):
