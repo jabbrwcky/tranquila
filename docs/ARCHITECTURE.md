@@ -361,14 +361,17 @@ is an interface whose zero value is nil, both packages fall back to
 `noop.Meter{}` rather than panicking.
 
 A Grafana dashboard over these metrics lives in
-[deploy/grafana/](../deploy/grafana/README.md). It is deliberately built only from what is
-instrumented today, which leaves three gaps worth knowing about before reading a panel:
+[deploy/grafana/](../deploy/grafana/README.md). It is deliberately built only from what was
+instrumented when it shipped, which left three gaps worth knowing about before reading a panel:
 `tranquila.s3.operation.duration` uses the OpenTelemetry default bucket boundaries (largest
 finite bucket 10 s, so every escalated list attempt lands in one bucket and no quantile above
 10 s is meaningful); that histogram carries no `endpoint` attribute, so source and destination
-latency are pooled; and there are no discovery metrics at all, so a bucket stuck in a tree walk
-is visible only indirectly. The reasoning, and what instrumentation would close each gap, is in
-[ADR 0004](adr/0004-grafana-dashboard.md).
+latency are pooled; and discovery had no metrics at all, so a bucket stuck in a tree walk was
+visible only indirectly. The reasoning, and what instrumentation would close each gap, is in
+[ADR 0004](adr/0004-grafana-dashboard.md). The third gap is now partly closed —
+`tranquila.s3.discovery.parked_prefixes` (per bucket, see the [metric list](../README.md#metrics))
+reports prefixes stuck on an unanswerable checkpointed page, though the dashboard shipped before
+this metric existed and has no panel for it yet.
 
 ## Testing strategy
 

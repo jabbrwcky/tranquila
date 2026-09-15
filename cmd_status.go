@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -48,6 +49,13 @@ func (cmd *StatusCmd) Run() error {
 		}
 	}
 
+	return renderStatus(os.Stdout, statuses)
+}
+
+// renderStatus writes statuses as a tab-aligned table, factored out of Run so
+// the formatting (which column shows which sentinel for "unknown") is
+// testable without an HTTP round trip or a live management server.
+func renderStatus(out io.Writer, statuses []api.BucketStatus) error {
 	hasProgress := false
 	for _, bs := range statuses {
 		if bs.SyncProgress != nil {
@@ -56,17 +64,24 @@ func (cmd *StatusCmd) Run() error {
 		}
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
 	if hasProgress {
-		fmt.Fprintln(w, "BUCKET\tLAST COLLECTED\tTOTAL\tSYNCED\tPENDING\tFAILED\tRATE\tETA")
+		fmt.Fprintln(w, "BUCKET\tLAST COLLECTED\tTOTAL\tSYNCED\tPENDING\tFAILED\tPARKED\tRATE\tETA")
 	} else {
-		fmt.Fprintln(w, "BUCKET\tLAST COLLECTED\tTOTAL\tSYNCED\tPENDING\tFAILED")
+		fmt.Fprintln(w, "BUCKET\tLAST COLLECTED\tTOTAL\tSYNCED\tPENDING\tFAILED\tPARKED")
 	}
 
 	for _, bs := range statuses {
 		collected := "never"
 		if bs.LastCollected != nil {
 			collected = humanize.Time(*bs.LastCollected)
+		}
+		// "-" means the server has no source client wired to report this
+		// (e.g. an older tranquila), distinct from a real "0" (genuinely
+		// nothing parked).
+		parked := "-"
+		if bs.ParkedPrefixes != nil {
+			parked = strconv.FormatInt(*bs.ParkedPrefixes, 10)
 		}
 		if hasProgress {
 			rate, eta := "-", "-"
@@ -76,14 +91,15 @@ func (cmd *StatusCmd) Run() error {
 					eta = (time.Duration(*p.ETASeconds) * time.Second).String()
 				}
 			}
-			fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\n",
+			fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
 				bs.Name, collected,
 				bs.Stats.Total, bs.Stats.Synced, bs.Stats.Pending, bs.Stats.Failed,
-				rate, eta)
+				parked, rate, eta)
 		} else {
-			fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%d\n",
+			fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%d\t%s\n",
 				bs.Name, collected,
-				bs.Stats.Total, bs.Stats.Synced, bs.Stats.Pending, bs.Stats.Failed)
+				bs.Stats.Total, bs.Stats.Synced, bs.Stats.Pending, bs.Stats.Failed,
+				parked)
 		}
 	}
 	return w.Flush()

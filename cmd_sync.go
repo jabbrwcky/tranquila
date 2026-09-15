@@ -336,6 +336,7 @@ func (cmd *SyncCmd) Run() error {
 		Endpoints: func() (api.EndpointState, api.EndpointState) {
 			return endpointState(src.LimitState()), endpointState(dst.LimitState())
 		},
+		ParkedPrefixes: src.ParkedPrefixes,
 	})
 	go func() {
 		if err := mgmt.ListenAndServe(); err != nil && err != http.ErrServerClosed {

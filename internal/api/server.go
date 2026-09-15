@@ -21,20 +21,33 @@ type Config struct {
 	// Endpoints reports source and destination rate-limit state. Optional;
 	// when nil the fields are omitted from the sync status response.
 	Endpoints func() (source, destination EndpointState)
+	// ParkedPrefixes reports how many sharded-discovery prefixes for bucket
+	// parked (resumed onto a checkpointed page the backend still could not
+	// answer) during its most recently completed cycle. Optional; when nil
+	// the field is omitted from every bucket's response. Source-only in
+	// practice, since nothing lists the destination.
+	ParkedPrefixes func(bucket string) int64
 }
 
 // Server is the HTTP management API server.
 type Server struct {
-	srv       *http.Server
-	state     *state.Store
-	progress  *internalsync.Progress
-	ready     func(ctx context.Context) error
-	endpoints func() (source, destination EndpointState)
+	srv            *http.Server
+	state          *state.Store
+	progress       *internalsync.Progress
+	ready          func(ctx context.Context) error
+	endpoints      func() (source, destination EndpointState)
+	parkedPrefixes func(bucket string) int64
 }
 
 // NewServer creates a Server and registers all routes. Call ListenAndServe to start.
 func NewServer(cfg Config) *Server {
-	s := &Server{state: cfg.State, progress: cfg.Progress, ready: cfg.Ready, endpoints: cfg.Endpoints}
+	s := &Server{
+		state:          cfg.State,
+		progress:       cfg.Progress,
+		ready:          cfg.Ready,
+		endpoints:      cfg.Endpoints,
+		parkedPrefixes: cfg.ParkedPrefixes,
+	}
 	if s.ready == nil && cfg.State != nil {
 		s.ready = cfg.State.Ping
 	}
@@ -89,6 +102,12 @@ type BucketStatus struct {
 	LastCollected *time.Time          `json:"last_collected,omitempty"`
 	Stats         BucketStats         `json:"stats"`
 	SyncProgress  *BucketSyncProgress `json:"sync_progress,omitempty"`
+	// ParkedPrefixes is how many sharded-discovery prefixes resumed onto a
+	// checkpointed page the backend still could not answer, as of this
+	// bucket's most recently completed cycle. Omitted (not just zero) when
+	// no source client is wired to report it, so "0" is only ever a real
+	// observation, never "unknown".
+	ParkedPrefixes *int64 `json:"parked_prefixes,omitempty"`
 }
 
 // EndpointState reports one endpoint's rate-limit pacing. RateLimit and
@@ -140,6 +159,11 @@ func (s *Server) bucketStatus(ctx context.Context, name string, snap internalsyn
 		Synced:  st.Synced,
 		Pending: st.Pending,
 		Failed:  st.Failed,
+	}
+
+	if s.parkedPrefixes != nil {
+		n := s.parkedPrefixes(name)
+		bs.ParkedPrefixes = &n
 	}
 
 	if bp, ok := snap.Buckets[name]; ok {

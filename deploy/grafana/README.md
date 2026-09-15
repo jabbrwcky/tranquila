@@ -116,10 +116,15 @@ panel on the dashboard itself, and the reasoning is in
 * **S3 latency cannot be split by endpoint.** That histogram carries `operation`, `bucket` and
   `status`, but no `endpoint`, so source and destination latency are pooled. Errors, rate limit
   and rate-limit changes are per-endpoint.
-* **There are no discovery metrics.** Nothing reports prefixes walked, pages listed, checkpoints
-  saved or resumed, or a prefix parked on an unanswerable page. A bucket stuck in discovery shows
-  up only indirectly — `ListObjectsV2` in *S3 calls slower than 10 s*, transient errors climbing,
-  and that bucket contributing nothing in *Per-bucket sync detail*. Logs remain the direct source.
+* **Discovery has one metric: parked prefixes, not visualized on this dashboard yet.**
+  `tranquila.s3.discovery.parked_prefixes` (per bucket) counts prefixes that resumed onto a
+  checkpointed page the backend still could not answer, as of the last completed cycle — added
+  after this dashboard shipped, so no panel here reads it yet. Nothing else about discovery is
+  exported: pages listed, checkpoints saved/resumed, and everything else about a struggling
+  bucket still shows up only indirectly — `ListObjectsV2` in *S3 calls slower than 10 s*,
+  transient errors climbing, and that bucket contributing nothing in *Per-bucket sync detail*.
+  `tranquila status` also surfaces the parked count as its `PARKED` column. Logs remain the
+  direct source for everything else.
 * **Queue depth is not exported.** `tranquila.workers.active` shows how many workers are busy, not
   how many objects are waiting, so saturation is visible but backlog is not.
 * **Endpoint pacing reads "Normal" when rate limiting is off.** With `--source-rate-limit=0` (the
