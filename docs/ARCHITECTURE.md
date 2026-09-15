@@ -129,16 +129,22 @@ Three properties are load-bearing:
   locking. Writing it from the producer would let a token be persisted before — or without — the
   objects it skips ever reaching `onPage`.
 
-Each prefix also gets a bounded turn (`--discovery-prefix-budget`, default 10m). `listRetryBudget`
-only bounds one *page*'s retry loop, so before this a prefix with many slow pages could hold a
-worker slot for hours while every other prefix waited — on a bucket with hundreds of prefixes a
-handful of pathological ones monopolised every slot and the rest went unlisted for the whole cycle.
+Each prefix also gets a bounded turn (`--discovery-prefix-budget`, default 10m). That is a
+different scope from `--list-retry-budget` (default 10m, negative = unbounded), which only bounds
+one *page*'s retry loop — so before `--discovery-prefix-budget` existed, a prefix with many slow
+pages could hold a worker slot for hours while every other prefix waited; on a bucket with hundreds
+of prefixes a handful of pathological ones monopolised every slot and the rest went unlisted for
+the whole cycle. The two compound: in sharded discovery, the prefix budget's context wraps the page
+budget's (`processOne` derives `prefixCtx` before calling `list`, which is what feeds
+`listPageWithRetry`), so whichever is smaller in wall-clock terms at a given moment binds first.
 Yielding is cheap precisely because checkpoints exist: the prefix resumes from where it stopped.
 
 For how the two budgets and the escalating per-attempt deadline compose — what each attempt is
 granted, and where the ten minutes actually go — open
 [retry-mechanics.html](retry-mechanics.html) (an interactive chart; values derived from the
-constants in `internal/storage/s3.go`, with a table view for the same numbers).
+constants in `internal/storage/s3.go`, **for the unmodified defaults only** — it has no notion of
+either budget now being configurable via `--list-retry-budget`/`--discovery-prefix-budget`, with a
+table view for the same numbers).
 
 Checkpoint errors are never fatal; they degrade a prefix to the un-checkpointed behaviour. An
 abandoned resume point expires via TTL, which bounds the one new failure mode: a page the backend
