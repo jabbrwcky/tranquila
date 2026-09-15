@@ -99,6 +99,7 @@ for variable discovery on an idle instance.
 | **Is it working?** | Six stat tiles: sync rate, throughput, failure rate, cycle failures in the last hour, whether congestion control has degraded an endpoint, and how many workers are busy. |
 | **Sync progress** | Successful versus failed transfers over time, throughput, and mean transfer duration per bucket. |
 | **S3 endpoint health** | Errors by class, mean S3 call duration per operation, calls past the 10 s histogram ceiling, the effective rate limit, and congestion-control adjustments. |
+| **Discovery** | Parked prefixes per bucket — sharded-discovery prefixes stuck on a checkpointed page the backend still can't answer. |
 | **Per-bucket detail** | The same numbers as text, one row per bucket, sorted by failure rate. |
 | **Reading this dashboard** | The dashboard's own blind spots — read this before trusting a panel. |
 
@@ -116,15 +117,15 @@ panel on the dashboard itself, and the reasoning is in
 * **S3 latency cannot be split by endpoint.** That histogram carries `operation`, `bucket` and
   `status`, but no `endpoint`, so source and destination latency are pooled. Errors, rate limit
   and rate-limit changes are per-endpoint.
-* **Discovery has one metric: parked prefixes, not visualized on this dashboard yet.**
-  `tranquila.s3.discovery.parked_prefixes` (per bucket) counts prefixes that resumed onto a
-  checkpointed page the backend still could not answer, as of the last completed cycle — added
-  after this dashboard shipped, so no panel here reads it yet. Nothing else about discovery is
-  exported: pages listed, checkpoints saved/resumed, and everything else about a struggling
-  bucket still shows up only indirectly — `ListObjectsV2` in *S3 calls slower than 10 s*,
-  transient errors climbing, and that bucket contributing nothing in *Per-bucket sync detail*.
-  `tranquila status` also surfaces the parked count as its `PARKED` column. Logs remain the
-  direct source for everything else.
+* **Discovery has one metric: parked prefixes.** `tranquila.s3.discovery.parked_prefixes` (per
+  bucket, *Discovery → Parked prefixes by bucket*) counts prefixes that resumed onto a
+  checkpointed page the backend still could not answer, as of the last completed cycle. A bucket
+  with no line on that panel has not completed a sharded-discovery cycle yet, not a real zero —
+  the same distinction `tranquila status`'s `PARKED` column draws between `-` and `0`. Nothing
+  else about discovery is exported: pages listed, checkpoints saved/resumed, and everything else
+  about a struggling bucket still shows up only indirectly — `ListObjectsV2` in *S3 calls slower
+  than 10 s*, transient errors climbing, and that bucket contributing nothing in *Per-bucket sync
+  detail*. Logs remain the direct source for everything else.
 * **Queue depth is not exported.** `tranquila.workers.active` shows how many workers are busy, not
   how many objects are waiting, so saturation is visible but backlog is not.
 * **Endpoint pacing reads "Normal" when rate limiting is off.** With `--source-rate-limit=0` (the

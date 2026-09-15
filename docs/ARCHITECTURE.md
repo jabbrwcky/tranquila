@@ -364,8 +364,9 @@ latency are pooled; and discovery had no metrics at all, so a bucket stuck in a 
 visible only indirectly. The reasoning, and what instrumentation would close each gap, is in
 [ADR 0004](adr/0004-grafana-dashboard.md). The third gap is now partly closed —
 `tranquila.s3.discovery.parked_prefixes` (per bucket, see the [metric list](../README.md#metrics))
-reports prefixes stuck on an unanswerable checkpointed page, though the dashboard shipped before
-this metric existed and has no panel for it yet.
+reports prefixes stuck on an unanswerable checkpointed page, and the dashboard's **Discovery** row
+has a panel for it. Everything else about discovery — pages listed, checkpoints saved/resumed —
+remains unexported.
 
 ## Testing strategy
 
