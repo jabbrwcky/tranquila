@@ -20,3 +20,4 @@ Architectural decisions are recorded here, one file per decision, in
 | [0003](0003-dependency-update-policy.md) | Dependency updates are grouped by what must move together | Accepted |
 | [0004](0004-grafana-dashboard.md) | Ship a Grafana dashboard built from the metrics that exist | Accepted |
 | [0005](0005-repository-and-chart-consolidation.md) | Move to pflege-de-labs and bring the Helm chart with it | Accepted |
+| [0006](0006-secobserve-image-scanning.md) | Images are scanned with Trivy and reported to SecObserve | Accepted |

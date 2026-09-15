@@ -660,8 +660,17 @@ docker buildx imagetools inspect ghcr.io/pflege-de-labs/tranquila:1.2.3 --format
 docker buildx imagetools inspect ghcr.io/pflege-de-labs/tranquila:1.2.3 --format '{{ json .Provenance }}'
 ```
 
-CI images (`main`, `pr-<n>`, `<short-sha>`) are signed too, but carry no SBOM or provenance —
-those two commands return nothing for them, which is expected.
+CI images (`main`, `pr-<n>`, `<short-sha>`) are signed and carry an SBOM too, but no provenance —
+the provenance command above returns nothing for them, which is expected; only the release build
+sets `provenance: mode=max`.
+
+### Vulnerability scanning
+
+Every image pushed from `main` or a release is scanned with [Trivy](https://aquasecurity.github.io/trivy)
+and reported to [SecObserve](https://github.com/SecObserve/SecObserve), the org's vulnerability
+management system, along with its SBOM. `pr-<n>` images are built and signed but not scanned —
+see [ADR 0006](docs/adr/0006-secobserve-image-scanning.md) for why. Findings do not fail the
+build; they land in SecObserve for triage.
 
 Release binaries come with an SPDX SBOM each and a signed `checksums.txt`, which covers the
 binaries and their SBOMs:
