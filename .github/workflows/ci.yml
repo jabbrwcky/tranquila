@@ -155,7 +155,10 @@ jobs:
       # provenance: false is deliberate — build-push-action would otherwise
       # attach mode=min provenance, an extra manifest GHCR renders as an
       # unknown/unknown row, asserting only what the cosign signature already
-      # proves cryptographically. Releases do carry full provenance.
+      # proves cryptographically. Releases do carry full provenance. sbom:
+      # true does the same job release.yml already relies on: the SBOM
+      # SecObserve gets below is this attestation, not a second, separately
+      # generated one.
       - name: Build the image
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -169,6 +172,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           provenance: false
+          sbom: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -183,3 +187,43 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      # Scanning and SBOM upload are skipped for pull_request builds entirely
+      # (not just forks): SecObserve auto-creates a "branch" per SO_BRANCH_NAME
+      # on first import, and a transient PR branch has no reason to leave a
+      # permanent-ish trace in a findings tool — main and workflow_dispatch
+      # builds are what actually matters to track over time.
+      - name: Extract the image's SBOM attestation to a file
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{ json .SBOM }}' > sbom.json
+
+      - name: Upload the SBOM to SecObserve
+        if: github.event_name != 'pull_request'
+        uses: SecObserve/secobserve_actions_templates/actions/upload_sbom@0a0f7d0981982a589f2a11c3f05c8e1c628fbd79 # v2026_08
+        with:
+          so_api_base_url: https://webhooks.management.p4e.io/secobserve
+          so_api_token: ${{ secrets.SO_API_TOKEN }}
+          so_product_name: tranquila
+          so_branch_name: ${{ github.ref_name }}
+          so_file_name: sbom.json
+          so_origin_service: tranquila
+
+      # Scans the exact digest that was just signed, not a tag that could move
+      # under it between the build and this step. Vulnerability observations
+      # (CycloneDX, findings embedded) upload as part of the same action call.
+      - name: Scan the image with Trivy and upload results to SecObserve
+        if: github.event_name != 'pull_request'
+        uses: SecObserve/secobserve_actions_templates/actions/SCA/trivy_image@0a0f7d0981982a589f2a11c3f05c8e1c628fbd79 # v2026_08
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        with:
+          target: ${{ env.IMAGE }}@${{ env.DIGEST }}
+          report_name: trivy-image-report.cdx.json
+          so_api_base_url: https://webhooks.management.p4e.io/secobserve
+          so_api_token: ${{ secrets.SO_API_TOKEN }}
+          so_product_name: tranquila
+          so_branch_name: ${{ github.ref_name }}
+          so_origin_service: tranquila
+          so_origin_docker_image_name_tag: ${{ env.IMAGE }}:${{ steps.commit.outputs.short_sha }}
